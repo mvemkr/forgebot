@@ -1,0 +1,41 @@
+# Secrets — NEVER commit these
+.env
+*.env
+*.env.*
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Logs (too large, sensitive)
+logs/
+*.log
+
+# Data (too large)
+data/historical/
+data/orderbook_snapshots/
+data/models/
+data/state/
+backtesting/results/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
