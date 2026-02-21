@@ -39,3 +39,5 @@ backtesting/results/
 .pytest_cache/
 .coverage
 htmlcov/
+.schwab_token.json
+.schwab_state.txt
