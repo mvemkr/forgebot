@@ -35,8 +35,8 @@ logging.basicConfig(
 logger = logging.getLogger('paper_trader')
 
 STARTING_CAPITAL = 1000.0
-POLL_INTERVAL_SECONDS = 60 * 15  # Check every 15 minutes (one candle)
-CANDLE_LOOKBACK_HOURS = 24        # How much history to pull per cycle
+POLL_INTERVAL_SECONDS = 60 * 5   # Check every 5 minutes (one candle)
+CANDLE_LOOKBACK_HOURS = 8         # How much history to pull per cycle
 
 
 class PaperTrader:

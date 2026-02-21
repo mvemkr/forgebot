@@ -23,7 +23,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 PRODUCT_ID = "SLP-20DEC30-CDE"  # SOL perpetual futures
-TIMEFRAME = "FIFTEEN_MINUTE"
+TIMEFRAME = "FIVE_MINUTE"
 CANDLES_NEEDED = 50  # Minimum candles for indicator calculation
 
 
@@ -103,17 +103,15 @@ class SOLMomentumStrategy:
         buy_signal = (
             prev_rsi < self.RSI_MIDLINE and current_rsi >= self.RSI_MIDLINE  # RSI crossing above 50
             and current_rsi < self.RSI_OVERBOUGHT                             # Not overbought
-            and prev_macd_hist < 0 and current_macd_hist >= 0                 # MACD flip positive
+            and current_macd_hist > 0                                          # MACD histogram positive (not requiring fresh flip)
             and current_close > current_ema20                                  # Above 20 EMA
-            and current_ema9 > current_ema20                                   # Short EMA above medium
         )
 
         sell_signal = (
             prev_rsi > self.RSI_MIDLINE and current_rsi <= self.RSI_MIDLINE  # RSI crossing below 50
             and current_rsi > self.RSI_OVERSOLD                               # Not oversold
-            and prev_macd_hist > 0 and current_macd_hist <= 0                 # MACD flip negative
+            and current_macd_hist < 0                                          # MACD histogram negative
             and current_close < current_ema20                                  # Below 20 EMA
-            and current_ema9 < current_ema20                                   # Short EMA below medium
         )
 
         entry_price = current_close
@@ -145,7 +143,7 @@ class SOLMomentumStrategy:
                 confidence=confidence,
                 reason=(
                     f"RSI {prev_rsi:.1f}→{current_rsi:.1f} crossed 50, "
-                    f"MACD hist flipped +, above EMA20"
+                    f"MACD hist={current_macd_hist:.4f}+, above EMA20"
                 ),
                 rsi=current_rsi,
                 macd_hist=current_macd_hist,
