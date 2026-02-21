@@ -1,0 +1,14 @@
+{
+  "expires_in": 1800,
+  "token_type": "Bearer",
+  "scope": "api",
+  "refresh_token": "ZO-d8dz7dZIdB7XbWEa8XkSKBF7C2xPDnCNZoQQwZ4BU7z8B_VUWIgd4gQJuQxywUkz8tG0EjbNyrdU5XFfNqoY86xm50SfzWk9_gnMj5yXwkS2pg46winj9bdMAg54qkvXn2WsMlWw@",
+  "access_token": "I0.b2F1dGgyLmJkYy5zY2h3YWIuY29t.oKkrTTN0OznTcEpq_FGZZ7D5tI-xdme9Vo6MVkQCja8@",
+  "id_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI1NzIwZDE5YjNjNjQ1YWEyYmRjZDFhOTIzZWMzYWNjMGIwMmY0M2NmNjFiNmQ2NzcxYmMzNDNkODA5NjY5MjU4IiwiYXVkIjoicG93TkhtQ292aDZVRkl5NWI0Y3FtcHVGZngzZE12Sm44Mk9OUDNFaUpRdml2MVA5IiwiaXNzIjoidXJuOi8vYXBpLnNjaHdhYmFwaS5jb20iLCJleHAiOjE3NzE2ODMxNzEsImlhdCI6MTc3MTY3OTU3MSwianRpIjoiNDYyMWNlNWMtNzgxZi00NjJhLThlNjQtNDU3MjEzMTFmNDJiIn0.aBc1D-ToB3q1oZ9IVjHl2ykaGXGQ88Ii8C_yLrXHahk",
+  "_accounts": [
+    {
+      "accountNumber": "41006944",
+      "hashValue": "B3D61D0C4AC4C958A1AE2BCC1D4659B0602DAA51CBA58EC246C9CBD369FCCD23"
+    }
+  ]
+}
