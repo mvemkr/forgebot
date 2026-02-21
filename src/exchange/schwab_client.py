@@ -29,6 +29,18 @@ APP_SECRET = os.getenv("SCHWAB_APP_SECRET")
 TOKEN_PATH = _ROOT / ".schwab_token.json"
 
 # Schwab uses its own pair naming convention
+def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample OHLCV dataframe to a higher timeframe (e.g. '1h', '4h')."""
+    resampled = df.resample(rule).agg({
+        'open':   'first',
+        'high':   'max',
+        'low':    'min',
+        'close':  'last',
+        'volume': 'sum',
+    }).dropna()
+    return resampled
+
+
 PAIR_MAP = {
     # Standard → Schwab symbol format
     "EUR/USD": "EUR/USD",
@@ -49,16 +61,25 @@ PAIR_MAP = {
     "AUD/JPY": "AUD/JPY",
 }
 
-# Schwab frequency types for candle requests
+import schwab as _schwab
+_PH = _schwab.client.Client.PriceHistory
+
+# Period enum aliases (values are ints: 1,2,3,4,5,10,6,15,20)
+# When used with PeriodType.DAY  → 1..10 days
+# When used with PeriodType.YEAR → 1..20 years
+_P = _PH.Period
+
+# Maps timeframe → (period_type, period_enum, frequency_type, frequency_enum, resample_rule)
+# resample_rule: if set, fetch 30m data and resample to this pandas offset string
 FREQUENCY_MAP = {
-    "1m":  {"frequencyType": "minute",  "frequency": 1},
-    "5m":  {"frequencyType": "minute",  "frequency": 5},
-    "15m": {"frequencyType": "minute",  "frequency": 15},
-    "30m": {"frequencyType": "minute",  "frequency": 30},
-    "1h":  {"frequencyType": "minute",  "frequency": 60},
-    "4h":  {"frequencyType": "minute",  "frequency": 240},
-    "1D":  {"frequencyType": "daily",   "frequency": 1},
-    "1W":  {"frequencyType": "weekly",  "frequency": 1},
+    "1m":  (_PH.PeriodType.DAY,  _P.THREE_DAYS,   _PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_MINUTE,          None),
+    "5m":  (_PH.PeriodType.DAY,  _P.FIVE_DAYS,    _PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_FIVE_MINUTES,    None),
+    "15m": (_PH.PeriodType.DAY,  _P.TEN_DAYS,     _PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_FIFTEEN_MINUTES, None),
+    "30m": (_PH.PeriodType.DAY,  _P.TEN_DAYS,     _PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_THIRTY_MINUTES,  None),
+    "1h":  (_PH.PeriodType.DAY,  _P.TEN_DAYS,     _PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_THIRTY_MINUTES,  "1h"),
+    "4h":  (_PH.PeriodType.DAY,  _P.TEN_DAYS,     _PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_THIRTY_MINUTES,  "4h"),
+    "1D":  (_PH.PeriodType.YEAR, _P.ONE_DAY,      _PH.FrequencyType.DAILY,  None,                                None),
+    "1W":  (_PH.PeriodType.YEAR, _P.FIVE_DAYS,    _PH.FrequencyType.WEEKLY, None,                                None),
 }
 
 
@@ -129,37 +150,36 @@ class SchwabClient:
         Indexed by datetime (UTC).
         """
         symbol = PAIR_MAP.get(pair, pair)
-        freq_params = FREQUENCY_MAP.get(timeframe)
-        if not freq_params:
+        freq_entry = FREQUENCY_MAP.get(timeframe)
+        if not freq_entry:
             raise ValueError(f"Unknown timeframe: {timeframe}. Use: {list(FREQUENCY_MAP.keys())}")
 
-        # Calculate date range
-        end_dt = datetime.utcnow()
-        if freq_params["frequencyType"] == "weekly":
-            start_dt = end_dt - timedelta(weeks=lookback * 2)
-            period_type = "year"
-            period = max(1, lookback // 52 + 1)
-        elif freq_params["frequencyType"] == "daily":
-            start_dt = end_dt - timedelta(days=lookback * 2)
-            period_type = "month"
-            period = max(1, lookback // 22 + 1)
-        else:
-            start_dt = end_dt - timedelta(minutes=freq_params["frequency"] * lookback * 2)
-            period_type = "day"
-            period = max(1, (freq_params["frequency"] * lookback) // (24 * 60) + 2)
+        period_type, period, freq_type, freq, resample_rule = freq_entry
+
+        is_intraday = (freq is not None)
 
         try:
-            resp = self._client.get_price_history(
-                symbol=symbol,
-                period_type=period_type,
-                period=period,
-                frequency_type=freq_params["frequencyType"],
-                frequency=freq_params["frequency"],
-                need_extended_hours_data=False,
-            )
+            if is_intraday:
+                resp = self._client.get_price_history(
+                    symbol=symbol,
+                    period_type=period_type,
+                    period=period,
+                    frequency_type=freq_type,
+                    frequency=freq,
+                    need_extended_hours_data=False,
+                )
+            else:
+                # Daily/weekly: frequency enum not required
+                resp = self._client.get_price_history(
+                    symbol=symbol,
+                    period_type=period_type,
+                    period=period,
+                    frequency_type=freq_type,
+                    need_extended_hours_data=False,
+                )
 
             if resp.status_code != 200:
-                logger.error(f"Schwab candle request failed: {resp.status_code} {resp.text[:200]}")
+                logger.error(f"Schwab candle request failed {pair} {timeframe}: {resp.status_code} {resp.text[:300]}")
                 return pd.DataFrame()
 
             data = resp.json()
@@ -174,7 +194,10 @@ class SchwabClient:
             df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
             df = df.sort_index()
 
-            # Return last N candles
+            # Resample for 1H / 4H (built from 30m data)
+            if resample_rule:
+                df = _resample_ohlcv(df, resample_rule)
+
             return df.iloc[-lookback:]
 
         except Exception as e:
@@ -240,11 +263,13 @@ class SchwabClient:
         if account_hash is None:
             account_hash = os.getenv("SCHWAB_ACCOUNT_HASH")
 
+        import schwab as _s
+        _Fields = _s.client.Client.Account.Fields
         try:
             if account_hash:
-                resp = self._client.get_account(account_hash, fields=['positions'])
+                resp = self._client.get_account(account_hash, fields=[_Fields.POSITIONS])
             else:
-                resp = self._client.get_accounts(fields=['positions'])
+                resp = self._client.get_accounts(fields=[_Fields.POSITIONS])
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -266,8 +291,10 @@ class SchwabClient:
         """Return list of open positions."""
         if account_hash is None:
             account_hash = os.getenv("SCHWAB_ACCOUNT_HASH")
+        import schwab as _s
+        _Fields = _s.client.Client.Account.Fields
         try:
-            resp = self._client.get_account(account_hash, fields=['positions'])
+            resp = self._client.get_account(account_hash, fields=[_Fields.POSITIONS])
             if resp.status_code == 200:
                 data = resp.json()
                 account = data.get('securitiesAccount', {})
