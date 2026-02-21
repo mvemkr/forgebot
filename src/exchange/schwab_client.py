@@ -1,264 +1,370 @@
 """
-Schwab Advanced Trade API client.
-Handles token auto-refresh, quotes, options chains, account data, and order placement.
-Note: Access token expires every 30min. Refresh token expires every 7 days.
-"""
+Schwab Client — Market data + account management via schwab-py
 
-import os, json, time, base64, logging
-import requests
+Wraps the schwab-py library to provide:
+  - OHLCV candles (multi-timeframe) for Forex and equities
+  - Account balance and positions
+  - Order placement (limit orders only — no market orders)
+  - Token refresh (auto-handled by schwab-py)
+
+Usage:
+    client = SchwabClient()  # loads token from .schwab_token.json
+    df = client.get_candles("EUR/USD", "1D", lookback=200)
+"""
+import os, json, logging
 from pathlib import Path
+from typing import Optional, Dict
+import pandas as pd
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '../../.env'))
 logger = logging.getLogger(__name__)
 
-TOKEN_PATH   = Path(__file__).parent.parent.parent / ".schwab_token.json"
-TRADER_BASE  = "https://api.schwabapi.com/trader/v1"
-MARKET_BASE  = "https://api.schwabapi.com/marketdata/v1"
-TOKEN_URL    = "https://api.schwabapi.com/v1/oauth/token"
+# Load env from trading-bot root
+_ROOT = Path(__file__).parents[2]
+load_dotenv(_ROOT / ".env")
+
+APP_KEY    = os.getenv("SCHWAB_APP_KEY")
+APP_SECRET = os.getenv("SCHWAB_APP_SECRET")
+TOKEN_PATH = _ROOT / ".schwab_token.json"
+
+# Schwab uses its own pair naming convention
+PAIR_MAP = {
+    # Standard → Schwab symbol format
+    "EUR/USD": "EUR/USD",
+    "USD/JPY": "USD/JPY",
+    "GBP/USD": "GBP/USD",
+    "USD/CHF": "USD/CHF",
+    "USD/CAD": "USD/CAD",
+    "AUD/USD": "AUD/USD",
+    "NZD/USD": "NZD/USD",
+    "GBP/JPY": "GBP/JPY",
+    "GBP/CHF": "GBP/CHF",
+    "GBP/NZD": "GBP/NZD",
+    "EUR/GBP": "EUR/GBP",
+    "EUR/AUD": "EUR/AUD",
+    "NZD/JPY": "NZD/JPY",
+    "NZD/CAD": "NZD/CAD",
+    "AUD/CAD": "AUD/CAD",
+    "AUD/JPY": "AUD/JPY",
+}
+
+# Schwab frequency types for candle requests
+FREQUENCY_MAP = {
+    "1m":  {"frequencyType": "minute",  "frequency": 1},
+    "5m":  {"frequencyType": "minute",  "frequency": 5},
+    "15m": {"frequencyType": "minute",  "frequency": 15},
+    "30m": {"frequencyType": "minute",  "frequency": 30},
+    "1h":  {"frequencyType": "minute",  "frequency": 60},
+    "4h":  {"frequencyType": "minute",  "frequency": 240},
+    "1D":  {"frequencyType": "daily",   "frequency": 1},
+    "1W":  {"frequencyType": "weekly",  "frequency": 1},
+}
 
 
 class SchwabClient:
     """
-    Schwab API client with automatic token refresh.
-    Provides quotes, options chains, account balances, and order management.
+    Schwab API client wrapping schwab-py for trading and market data.
     """
 
-    def __init__(self):
-        self.app_key      = os.getenv("SCHWAB_APP_KEY")
-        self.app_secret   = os.getenv("SCHWAB_APP_SECRET")
-        self.account_hash = os.getenv("SCHWAB_ACCOUNT_HASH")
-        self._token       = self._load_token()
-        self._token_expiry = time.time() + self._token.get('expires_in', 1800) - 60
-        logger.info("SchwabClient initialized")
+    def __init__(self, token_path: Optional[str] = None):
+        self.token_path = Path(token_path) if token_path else TOKEN_PATH
+        self._client = None
+        self._connect()
 
-    # ------------------------------------------------------------------ #
-    # Token Management                                                     #
-    # ------------------------------------------------------------------ #
+    def _connect(self):
+        """Load token and initialize schwab-py client."""
+        if not APP_KEY or not APP_SECRET:
+            raise ValueError("SCHWAB_APP_KEY and SCHWAB_APP_SECRET must be set in .env")
 
-    def _load_token(self) -> dict:
-        if not TOKEN_PATH.exists():
+        if not self.token_path.exists():
             raise FileNotFoundError(
-                f"Schwab token not found at {TOKEN_PATH}. Run scripts/schwab_direct_auth.py first."
+                f"Schwab token not found at {self.token_path}. "
+                "Run: python scripts/schwab_auth_manual.py"
             )
-        return json.loads(TOKEN_PATH.read_text())
 
-    def _save_token(self, token: dict):
-        self._token = token
-        TOKEN_PATH.write_text(json.dumps(token, indent=2))
-        TOKEN_PATH.chmod(0o600)
-
-    def _refresh_token(self) -> bool:
-        """Exchange refresh token for a new access token."""
-        rt = self._token.get('refresh_token')
-        if not rt:
-            logger.error("No refresh token available — need to re-authorize")
-            return False
-        creds = base64.b64encode(f"{self.app_key}:{self.app_secret}".encode()).decode()
         try:
-            resp = requests.post(TOKEN_URL, headers={
-                "Authorization": f"Basic {creds}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            }, data={"grant_type": "refresh_token", "refresh_token": rt})
-            if resp.status_code == 200:
-                new_token = resp.json()
-                # Preserve account info
-                new_token['_accounts'] = self._token.get('_accounts', [])
-                self._save_token(new_token)
-                self._token_expiry = time.time() + new_token.get('expires_in', 1800) - 60
-                logger.info("Schwab token refreshed successfully")
-                return True
-            else:
-                logger.error(f"Token refresh failed: {resp.status_code} {resp.text[:200]}")
-                return False
+            import schwab
+            self._client = schwab.auth.client_from_token_file(
+                token_path=str(self.token_path),
+                api_key=APP_KEY,
+                app_secret=APP_SECRET,
+            )
+            logger.info("Schwab client connected")
         except Exception as e:
-            logger.error(f"Token refresh exception: {e}")
+            raise RuntimeError(f"Failed to connect to Schwab: {e}")
+
+    def is_connected(self) -> bool:
+        try:
+            resp = self._client.get_account_numbers()
+            return resp.status_code == 200
+        except:
             return False
 
-    def _headers(self) -> dict:
-        """Return auth headers, refreshing token if needed."""
-        if time.time() >= self._token_expiry:
-            logger.info("Schwab token expiring — refreshing...")
-            self._refresh_token()
-        return {"Authorization": f"Bearer {self._token['access_token']}"}
-
-    def _get(self, base: str, path: str, params: dict = None) -> requests.Response:
-        resp = requests.get(f"{base}{path}", headers=self._headers(), params=params)
-        if resp.status_code == 401:
-            logger.warning("401 Unauthorized — attempting token refresh")
-            self._refresh_token()
-            resp = requests.get(f"{base}{path}", headers=self._headers(), params=params)
-        return resp
-
-    def _post(self, base: str, path: str, json_body: dict) -> requests.Response:
-        resp = requests.post(f"{base}{path}", headers={
-            **self._headers(), "Content-Type": "application/json"
-        }, json=json_body)
-        if resp.status_code == 401:
-            self._refresh_token()
-            resp = requests.post(f"{base}{path}", headers={
-                **self._headers(), "Content-Type": "application/json"
-            }, json=json_body)
-        return resp
-
     # ------------------------------------------------------------------ #
-    # Account                                                              #
+    # Market Data
     # ------------------------------------------------------------------ #
 
-    def get_account(self) -> dict:
-        """Return account balances and positions."""
-        resp = self._get(TRADER_BASE, f"/accounts/{self.account_hash}",
-                         params={"fields": "positions"})
-        if resp.status_code != 200:
-            logger.error(f"get_account: {resp.status_code} {resp.text[:200]}")
-            return {}
-        data = resp.json().get('securitiesAccount', {})
-        bal  = data.get('currentBalances', {})
-        return {
-            'account_number': data.get('accountNumber'),
-            'type':           data.get('type'),
-            'cash':           float(bal.get('cashBalance', 0)),
-            'buying_power':   float(bal.get('buyingPower',
-                                bal.get('cashAvailableForTrading', 0))),
-            'equity':         float(bal.get('liquidationValue',
-                                bal.get('totalCash', 0))),
-            'positions':      data.get('positions', []),
+    def get_candles(
+        self,
+        pair: str,
+        timeframe: str,
+        lookback: int = 200,
+    ) -> pd.DataFrame:
+        """
+        Get OHLCV candles for a Forex pair.
+
+        Parameters
+        ----------
+        pair : str
+            e.g. "EUR/USD", "USD/JPY"
+        timeframe : str
+            "1m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"
+        lookback : int
+            Number of candles to return
+
+        Returns
+        -------
+        pd.DataFrame with columns: open, high, low, close, volume
+        Indexed by datetime (UTC).
+        """
+        symbol = PAIR_MAP.get(pair, pair)
+        freq_params = FREQUENCY_MAP.get(timeframe)
+        if not freq_params:
+            raise ValueError(f"Unknown timeframe: {timeframe}. Use: {list(FREQUENCY_MAP.keys())}")
+
+        # Calculate date range
+        end_dt = datetime.utcnow()
+        if freq_params["frequencyType"] == "weekly":
+            start_dt = end_dt - timedelta(weeks=lookback * 2)
+            period_type = "year"
+            period = max(1, lookback // 52 + 1)
+        elif freq_params["frequencyType"] == "daily":
+            start_dt = end_dt - timedelta(days=lookback * 2)
+            period_type = "month"
+            period = max(1, lookback // 22 + 1)
+        else:
+            start_dt = end_dt - timedelta(minutes=freq_params["frequency"] * lookback * 2)
+            period_type = "day"
+            period = max(1, (freq_params["frequency"] * lookback) // (24 * 60) + 2)
+
+        try:
+            resp = self._client.get_price_history(
+                symbol=symbol,
+                period_type=period_type,
+                period=period,
+                frequency_type=freq_params["frequencyType"],
+                frequency=freq_params["frequency"],
+                need_extended_hours_data=False,
+            )
+
+            if resp.status_code != 200:
+                logger.error(f"Schwab candle request failed: {resp.status_code} {resp.text[:200]}")
+                return pd.DataFrame()
+
+            data = resp.json()
+            candles = data.get("candles", [])
+            if not candles:
+                logger.warning(f"No candles returned for {pair} {timeframe}")
+                return pd.DataFrame()
+
+            df = pd.DataFrame(candles)
+            df['datetime'] = pd.to_datetime(df['datetime'], unit='ms', utc=True)
+            df = df.set_index('datetime')
+            df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+            df = df.sort_index()
+
+            # Return last N candles
+            return df.iloc[-lookback:]
+
+        except Exception as e:
+            logger.error(f"Error fetching candles for {pair} {timeframe}: {e}")
+            return pd.DataFrame()
+
+    def get_multi_timeframe(
+        self, pair: str, lookbacks: Optional[Dict[str, int]] = None
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch all timeframes needed for strategy analysis.
+
+        Returns dict with keys: 'weekly', 'daily', '4h', '1h'
+        """
+        if lookbacks is None:
+            lookbacks = {
+                'weekly': 52,   # 1 year of weekly
+                'daily':  200,  # ~10 months of daily
+                '4h':     200,  # ~33 days of 4H
+                '1h':     100,  # ~4 days of 1H
+            }
+
+        tf_map = {
+            'weekly': '1W',
+            'daily':  '1D',
+            '4h':     '4h',
+            '1h':     '1h',
         }
 
-    # ------------------------------------------------------------------ #
-    # Market Data                                                          #
-    # ------------------------------------------------------------------ #
-
-    def get_quotes(self, symbols: list[str]) -> dict[str, dict]:
-        """Return latest quotes for a list of symbols."""
-        resp = self._get(MARKET_BASE, "/quotes",
-                         params={"symbols": ",".join(symbols), "indicative": "false"})
-        if resp.status_code != 200:
-            logger.error(f"get_quotes: {resp.status_code} {resp.text[:200]}")
-            return {}
         result = {}
-        for sym, data in resp.json().items():
-            q = data.get('quote', {})
-            result[sym] = {
-                'last':   float(q.get('lastPrice', q.get('last', 0))),
-                'bid':    float(q.get('bidPrice', q.get('bid', 0))),
-                'ask':    float(q.get('askPrice', q.get('ask', 0))),
-                'volume': int(q.get('totalVolume', 0)),
-                'change_pct': float(q.get('netPercentChangeInDouble',
-                                q.get('percentChange', 0))),
-                'high':   float(q.get('highPrice', q.get('high52Week', 0))),
-                'low':    float(q.get('lowPrice', q.get('low52Week', 0))),
-            }
+        for key, tf in tf_map.items():
+            lb = lookbacks.get(key, 100)
+            df = self.get_candles(pair, tf, lookback=lb)
+            if df.empty:
+                logger.warning(f"No data for {pair} {key} ({tf})")
+            result[key] = df
+
         return result
 
-    def get_vix(self) -> float:
-        """Return the current VIX level."""
-        quotes = self.get_quotes(['^VIX', 'VIX'])
-        for sym in ['^VIX', 'VIX']:
-            v = quotes.get(sym, {}).get('last', 0)
-            if v > 0:
-                return v
-        # Fallback: use VIXY ETF as proxy
-        quotes2 = self.get_quotes(['VIXY'])
-        return quotes2.get('VIXY', {}).get('last', 0)
-
-    def get_price_history(self, symbol: str, period_type: str = 'day',
-                          period: int = 1, frequency_type: str = 'minute',
-                          frequency: int = 5) -> list[dict]:
-        """Return OHLCV candles for a symbol."""
-        resp = self._get(MARKET_BASE, f"/pricehistory", params={
-            'symbol': symbol,
-            'periodType': period_type,
-            'period': period,
-            'frequencyType': frequency_type,
-            'frequency': frequency,
-            'needExtendedHoursData': 'false',
-        })
-        if resp.status_code != 200:
-            logger.error(f"get_price_history({symbol}): {resp.status_code}")
-            return []
-        candles = resp.json().get('candles', [])
-        return [{
-            'timestamp': c['datetime'] // 1000,
-            'open':   float(c['open']),
-            'high':   float(c['high']),
-            'low':    float(c['low']),
-            'close':  float(c['close']),
-            'volume': float(c['volume']),
-        } for c in candles]
-
-    def get_options_chain(self, symbol: str, contract_type: str = 'ALL',
-                          strike_count: int = 10,
-                          expiration_date: str = None) -> dict:
-        """Return the full options chain for a symbol."""
-        params = {
-            'symbol': symbol,
-            'contractType': contract_type,
-            'strikeCount': strike_count,
-            'includeUnderlyingQuote': 'true',
-        }
-        if expiration_date:
-            params['expirationDate'] = expiration_date
-        resp = self._get(MARKET_BASE, "/chains", params=params)
-        if resp.status_code != 200:
-            logger.error(f"get_options_chain({symbol}): {resp.status_code} {resp.text[:200]}")
-            return {}
-        chain = resp.json()
-        return {
-            'symbol':           chain.get('symbol'),
-            'underlying_price': float(chain.get('underlyingPrice', 0)),
-            'volatility':       float(chain.get('volatility', 0)),
-            'call_exp_map':     chain.get('callExpDateMap', {}),
-            'put_exp_map':      chain.get('putExpDateMap', {}),
-            'status':           chain.get('status'),
-        }
-
-    def get_market_hours(self, markets: list[str] = None) -> dict:
-        """Check if markets are currently open."""
-        markets = markets or ['equity', 'option', 'future']
-        resp = self._get(TRADER_BASE, "/markets",
-                         params={"markets": ",".join(markets)})
-        if resp.status_code != 200:
-            return {}
-        return resp.json()
+    def get_quote(self, pair: str) -> Optional[float]:
+        """Get current bid/ask midpoint for a pair."""
+        symbol = PAIR_MAP.get(pair, pair)
+        try:
+            resp = self._client.get_quote(symbol)
+            if resp.status_code == 200:
+                data = resp.json()
+                quote = data.get(symbol, {}).get('quote', {})
+                bid = quote.get('bidPrice', 0)
+                ask = quote.get('askPrice', 0)
+                return (bid + ask) / 2 if bid and ask else None
+        except Exception as e:
+            logger.error(f"Quote fetch failed for {pair}: {e}")
+        return None
 
     # ------------------------------------------------------------------ #
-    # Cross-Market Signal                                                  #
+    # Account
     # ------------------------------------------------------------------ #
 
-    def get_market_regime(self) -> dict:
+    def get_account_balance(self, account_hash: Optional[str] = None) -> Dict:
         """
-        Assess current market regime using equity signals.
-        Returns context to inform crypto trading decisions.
+        Returns account balance info.
         """
-        quotes = self.get_quotes(['SPY', 'QQQ', 'IWM', 'VIXY'])
-        spy  = quotes.get('SPY', {})
-        qqq  = quotes.get('QQQ', {})
-        vixy = quotes.get('VIXY', {})
+        if account_hash is None:
+            account_hash = os.getenv("SCHWAB_ACCOUNT_HASH")
 
-        # Regime assessment
-        spy_change  = spy.get('change_pct', 0)
-        qqq_change  = qqq.get('change_pct', 0)
-        vixy_change = vixy.get('change_pct', 0)
+        try:
+            if account_hash:
+                resp = self._client.get_account(account_hash, fields=['positions'])
+            else:
+                resp = self._client.get_accounts(fields=['positions'])
 
-        # Risk-off: equities falling + volatility rising
-        risk_off = spy_change < -0.5 and vixy_change > 3.0
-        # Risk-on: equities rising + volatility falling
-        risk_on  = spy_change > 0.3 and vixy_change < -2.0
-        # Choppy: mixed signals
-        choppy   = not risk_off and not risk_on
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                account = data.get('securitiesAccount', {})
+                balance = account.get('currentBalances', {})
+                return {
+                    'cash':        balance.get('cashBalance', 0),
+                    'equity':      balance.get('liquidationValue', 0),
+                    'buying_power': balance.get('buyingPower', 0),
+                    'margin_balance': balance.get('marginBalance', 0),
+                }
+        except Exception as e:
+            logger.error(f"Account balance fetch failed: {e}")
+        return {}
 
-        regime = 'RISK_OFF' if risk_off else ('RISK_ON' if risk_on else 'NEUTRAL')
+    def get_positions(self, account_hash: Optional[str] = None) -> list:
+        """Return list of open positions."""
+        if account_hash is None:
+            account_hash = os.getenv("SCHWAB_ACCOUNT_HASH")
+        try:
+            resp = self._client.get_account(account_hash, fields=['positions'])
+            if resp.status_code == 200:
+                data = resp.json()
+                account = data.get('securitiesAccount', {})
+                return account.get('positions', [])
+        except Exception as e:
+            logger.error(f"Positions fetch failed: {e}")
+        return []
 
-        return {
-            'regime':       regime,
-            'spy_chg_pct':  round(spy_change, 2),
-            'qqq_chg_pct':  round(qqq_change, 2),
-            'vixy_chg_pct': round(vixy_change, 2),
-            'spy_price':    spy.get('last', 0),
-            'avoid_longs':  risk_off,    # Don't buy crypto when equities dumping
-            'avoid_shorts': risk_on,     # Don't short crypto when equities ripping
-            'note': ('Equities selling off — avoid new crypto longs' if risk_off else
-                     'Risk-on environment — crypto longs favored' if risk_on else
-                     'Neutral equity conditions'),
+    # ------------------------------------------------------------------ #
+    # Orders (Forex — limit only)
+    # ------------------------------------------------------------------ #
+
+    def place_forex_limit_order(
+        self,
+        pair: str,
+        direction: str,       # 'long' or 'short'
+        quantity: float,      # lot size
+        limit_price: float,
+        stop_price: float,
+        account_hash: Optional[str] = None,
+        dry_run: bool = True,
+    ) -> Dict:
+        """
+        Place a Forex limit order with attached stop loss.
+        dry_run=True (default) — logs the order but does NOT submit.
+
+        IMPORTANT: dry_run must be explicitly set to False to send live orders.
+        This is a safety feature — live orders require deliberate opt-in.
+        """
+        if account_hash is None:
+            account_hash = os.getenv("SCHWAB_ACCOUNT_HASH")
+
+        symbol = PAIR_MAP.get(pair, pair)
+        instruction = "BUY" if direction == "long" else "SELL"
+
+        order = {
+            "orderType": "LIMIT",
+            "session": "NORMAL",
+            "duration": "GOOD_TILL_CANCEL",
+            "orderStrategyType": "TRIGGER",
+            "price": str(round(limit_price, 5)),
+            "orderLegCollection": [{
+                "instruction": instruction,
+                "quantity": quantity,
+                "instrument": {
+                    "symbol": symbol,
+                    "assetType": "FOREX",
+                },
+            }],
+            "childOrderStrategies": [{
+                "orderType": "STOP",
+                "session": "NORMAL",
+                "duration": "GOOD_TILL_CANCEL",
+                "orderStrategyType": "SINGLE",
+                "stopPrice": str(round(stop_price, 5)),
+                "orderLegCollection": [{
+                    "instruction": "SELL" if direction == "long" else "BUY",
+                    "quantity": quantity,
+                    "instrument": {
+                        "symbol": symbol,
+                        "assetType": "FOREX",
+                    },
+                }],
+            }],
         }
+
+        log_msg = (
+            f"FOREX ORDER: {instruction} {quantity} lots {symbol} "
+            f"@ LIMIT {limit_price:.5f}  SL={stop_price:.5f}"
+        )
+
+        if dry_run:
+            logger.info(f"[DRY RUN] {log_msg}")
+            return {"dry_run": True, "order": order}
+
+        logger.info(f"[LIVE] Submitting: {log_msg}")
+        try:
+            resp = self._client.place_order(account_hash, order)
+            if resp.status_code in (200, 201):
+                logger.info(f"Order placed successfully")
+                return {"success": True, "status": resp.status_code}
+            else:
+                logger.error(f"Order failed: {resp.status_code} {resp.text[:300]}")
+                return {"success": False, "status": resp.status_code, "error": resp.text}
+        except Exception as e:
+            logger.error(f"Order exception: {e}")
+            return {"success": False, "error": str(e)}
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    try:
+        client = SchwabClient()
+        print(f"Connected: {client.is_connected()}")
+        balance = client.get_account_balance()
+        print(f"Balance: {balance}")
+        df = client.get_candles("EUR/USD", "1D", lookback=10)
+        print(f"EUR/USD daily candles:\n{df.tail()}")
+    except Exception as e:
+        print(f"Error: {e}")
