@@ -127,7 +127,7 @@ class LevelDetector:
                     confs.append(eq_label)
                     break
             # Score = unique confluences + bonus for being tested many times
-            score = len(set(confs)) + (1 if test_count >= 3 else 0)
+            score = len(set(confs)) + (1 if test_count >= 2 else 0)  # 3→2: catches USD/CHF 0.884, GBP/CHF 1.12
             if score < self.min_confluence:
                 continue
             dist_pct   = abs(struct_price - current_price) / current_price * 100

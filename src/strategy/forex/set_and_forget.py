@@ -320,7 +320,22 @@ class SetAndForgetStrategy:
             tolerance = 0.0020  # 20 pips
 
         nearest = round(price / increment) * increment
-        return abs(price - nearest) <= tolerance
+        if abs(price - nearest) <= tolerance:
+            return True
+
+        # Secondary: 0.0100-increment psychological levels.
+        # Alex trades levels like USD/CHF 0.880/0.884/0.890, GBP/CHF 1.120/1.130
+        # that fall between the 0.025 grid. These are just as "watched" on real
+        # charts — the 0.025 check was too coarse and blocked valid setups.
+        # JPY pairs already covered by 0.50 increment above.
+        if not is_jpy:
+            fine_increment = 0.0100
+            fine_tolerance = 0.0030   # 30 pips — catches 0.882 near 0.880, 1.132 near 1.130
+            nearest_fine = round(price / fine_increment) * fine_increment
+            if abs(price - nearest_fine) <= fine_tolerance:
+                return True
+
+        return False
 
     @staticmethod
     def _pair_currencies(pair: str) -> set:
@@ -762,9 +777,21 @@ class SetAndForgetStrategy:
         for p in patterns:
             if p.clarity < self.min_pattern_clarity:
                 continue
+            # Proximity window: how far from the neckline can current price be?
+            # Standard:  2.0% — price is near the neckline (break or retest)
+            # Sweep:     3.5% — liquidity sweeps can pull price further
+            # Overext:   5.0% — at price extremes, Alex enters at the RIGHT
+            #            SHOULDER or double-top HIGH (far above the neckline).
+            #            USD/JPY SHORT at 158: neckline ~155, entry at 158 = 1.9%.
+            #            Relaxing to 5% catches these pattern-extreme entries.
+            _is_overext_reversal = (
+                (_ext_high and p.direction == 'bearish') or
+                (_ext_low  and p.direction == 'bullish')
+            )
             max_neckline = (
-                MAX_NECKLINE_PCT_SWEEP if 'sweep' in p.pattern_type
-                else MAX_NECKLINE_PCT_STRUCTURAL
+                MAX_NECKLINE_PCT_SWEEP      if 'sweep'  in p.pattern_type else
+                MAX_NECKLINE_PCT_STRUCTURAL * 2.5 if _is_overext_reversal   else
+                MAX_NECKLINE_PCT_STRUCTURAL
             )
             if abs(p.neckline - current_price) / current_price * 100 > max_neckline:
                 continue
@@ -836,15 +863,16 @@ class SetAndForgetStrategy:
         if nearest_level is None and levels:
             nearest_level = levels[0]
 
-        # A structural level that was tested 4+ times with additional confluence
+        # A structural level that was tested 3+ times with additional confluence
         # (EMA, equal highs/lows, or near a round number) = equivalent to a round number.
-        # Setting high bar intentionally — don't want every swing high to qualify.
+        # Lowered from 4 to 3: many real traded levels (USD/CHF 0.884, GBP/CHF 1.12)
+        # have 3 solid tests but not 4. 4 was blocking legitimate setups Alex took.
         at_structural_level = (
             nearest_level is not None
-            and nearest_level.score >= 4                                            # multiple confluences required
+            and nearest_level.score >= 3                                            # 3+ confluences required
             and any("structural" in c for c in nearest_level.confluences)          # must be a structural level
             and abs(nearest_level.price - matching_pattern.pattern_level)
-                / max(matching_pattern.pattern_level, 0.0001) < 0.01               # within 1% of pattern level
+                / max(matching_pattern.pattern_level, 0.0001) < 0.015              # within 1.5% of pattern level
         )
 
         if not pattern_at_round_number and not at_structural_level:
