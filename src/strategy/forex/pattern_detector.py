@@ -145,10 +145,11 @@ class PatternDetector:
     def detect_all(self, df: pd.DataFrame) -> List[PatternResult]:
         """Detect all patterns, return sorted by clarity descending."""
         results = []
-        results.extend(self._detect_liquidity_sweep(df))   # highest priority — institutional
+        results.extend(self._detect_liquidity_sweep(df))      # institutional sweeps
         results.extend(self._detect_head_and_shoulders(df))
         results.extend(self._detect_double_top_bottom(df))
         results.extend(self._detect_break_retest(df))
+        results.extend(self._detect_engulfing_rejection(df))  # daily/4H candle rejection
         results.sort(key=lambda r: r.clarity, reverse=True)
         return results
 
@@ -608,6 +609,159 @@ class PatternDetector:
                     pattern_level = swing_low,
                 ))
                 break
+
+        return results
+
+    def _detect_engulfing_rejection(self, df: pd.DataFrame) -> List[PatternResult]:
+        """
+        Detect large engulfing / rejection candles at key levels.
+
+        This is Alex's most-used and most-profitable pattern type. It appears
+        in two forms:
+
+        1. CLASSIC ENGULFING: current candle body completely contains the
+           previous candle's body AND closes in opposite direction.
+           Most reliable form. Alex says "no engulfing, no trade" about this.
+
+        2. STRONG REJECTION: current candle body is ≥ 2× average body size
+           and body/range ratio ≥ 0.55 — even without strict engulfing of
+           previous candle. Used for: USD/CAD Week 10 daily bullish engulfing
+           at support that launched him from $44K → $107K.
+
+        Key properties:
+          - Only looks at the 3 most recent closed candles (immediate signal)
+          - Stop: behind the candle's structural extreme (lowest low / highest
+            high of the past 5 bars) rather than just the wick — gives the
+            trade room to breathe like Alex's set-and-forget approach
+          - pattern_level: the candle's open price (the level being tested)
+          - Clarity: combination of body ratio, engulf completeness, size vs ATR
+
+        NOT the same as entry_signal.py which handles 1H confirmation.
+        This is the DAILY or 4H pattern that IS the setup itself.
+        """
+        if len(df) < 10:
+            return []
+
+        opens  = df["open"].values
+        highs  = df["high"].values
+        lows   = df["low"].values
+        closes = df["close"].values
+        n      = len(df)
+
+        # Average body size over last 20 candles (baseline for significance check)
+        avg_body = float(np.mean(np.abs(closes[-20:] - opens[-20:])))
+        if avg_body <= 0:
+            return []
+
+        results = []
+
+        # Check only the last 3 completed candles — this is an IMMEDIATE signal
+        for i in range(max(1, n - 3), n):
+            curr_open  = opens[i]
+            curr_close = closes[i]
+            curr_high  = highs[i]
+            curr_low   = lows[i]
+            prev_open  = opens[i - 1]
+            prev_close = closes[i - 1]
+
+            curr_body  = abs(curr_close - curr_open)
+            prev_body  = abs(prev_close - prev_open)
+            curr_range = curr_high - curr_low
+            if curr_range <= 0:
+                continue
+
+            body_ratio = curr_body / curr_range          # how much of range is body
+            size_ratio = curr_body / avg_body if avg_body > 0 else 1.0
+
+            # ── Bullish engulfing ─────────────────────────────────────────
+            is_bullish = curr_close > curr_open          # green candle
+            if is_bullish:
+                # Classic: current body engulfs previous body (higher close, lower open)
+                classic_engulf = (
+                    curr_open  <= min(prev_open, prev_close) and
+                    curr_close >= max(prev_open, prev_close)
+                )
+                # Strong rejection: body large enough even without full engulf
+                strong_rejection = (
+                    size_ratio >= 2.0 and
+                    body_ratio >= 0.55
+                )
+                if not (classic_engulf or strong_rejection):
+                    continue
+                if body_ratio < 0.40:
+                    continue   # too wick-dominated to be reliable
+
+                # Structural stop: below the lowest low of past 5 bars
+                struct_low   = float(np.min(lows[max(0, i-4):i+1]))
+                stop_loss    = struct_low * (1 - self.tol)
+                target_range = curr_close - struct_low
+
+                # Clarity: weighted combination of quality factors
+                engulf_score  = 1.0 if classic_engulf else 0.6
+                clarity       = min(1.0, (
+                    0.4 * body_ratio
+                  + 0.3 * min(size_ratio / 3.0, 1.0)
+                  + 0.3 * engulf_score
+                ))
+
+                notes = ("Classic bullish engulfing" if classic_engulf
+                         else "Strong bullish rejection candle")
+                results.append(PatternResult(
+                    pattern_type     = 'engulfing_bullish',
+                    direction        = 'bullish',
+                    neckline         = curr_close,          # most recent price
+                    entry_zone_low   = curr_close * (1 - self.tol),
+                    entry_zone_high  = curr_close * (1 + self.tol),
+                    stop_loss        = stop_loss,
+                    target_1         = curr_close + target_range,
+                    target_2         = curr_close + target_range * 1.5,
+                    clarity          = clarity,
+                    pattern_level    = curr_open,           # the level being tested/broken
+                    notes            = f"{notes} (body {body_ratio:.0%}, {size_ratio:.1f}× avg)",
+                ))
+
+            # ── Bearish engulfing ─────────────────────────────────────────
+            is_bearish = curr_close < curr_open           # red candle
+            if is_bearish:
+                classic_engulf = (
+                    curr_open  >= max(prev_open, prev_close) and
+                    curr_close <= min(prev_open, prev_close)
+                )
+                strong_rejection = (
+                    size_ratio >= 2.0 and
+                    body_ratio >= 0.55
+                )
+                if not (classic_engulf or strong_rejection):
+                    continue
+                if body_ratio < 0.40:
+                    continue
+
+                struct_high  = float(np.max(highs[max(0, i-4):i+1]))
+                stop_loss    = struct_high * (1 + self.tol)
+                target_range = struct_high - curr_close
+
+                engulf_score = 1.0 if classic_engulf else 0.6
+                clarity      = min(1.0, (
+                    0.4 * body_ratio
+                  + 0.3 * min(size_ratio / 3.0, 1.0)
+                  + 0.3 * engulf_score
+                ))
+
+                notes = ("Classic bearish engulfing" if classic_engulf
+                         else "Strong bearish rejection candle")
+                results.append(PatternResult(
+                    pattern_type     = 'engulfing_bearish',
+                    direction        = 'bearish',
+                    neckline         = curr_close,
+                    entry_zone_low   = curr_close * (1 - self.tol),
+                    entry_zone_high  = curr_close * (1 + self.tol),
+                    stop_loss        = stop_loss,
+                    target_1         = curr_close - target_range,
+                    target_2         = curr_close - target_range * 1.5,
+                    clarity          = clarity,
+                    pattern_level    = curr_open,
+                    notes            = f"{notes} (body {body_ratio:.0%}, {size_ratio:.1f}× avg)",
+                ))
 
         return results
 

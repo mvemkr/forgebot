@@ -43,6 +43,7 @@ from src.strategy.forex.set_and_forget   import SetAndForgetStrategy, Decision
 from src.strategy.forex.news_filter      import NewsFilter
 from src.execution.risk_manager_forex    import ForexRiskManager
 from src.execution.trade_journal         import TradeJournal
+from src.strategy.forex.currency_strength import CurrencyStrengthAnalyzer, CurrencyTheme, STACK_MAX
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BACKTEST_START  = datetime(2025, 7, 1, tzinfo=timezone.utc)   # ~7 months of history
@@ -376,13 +377,46 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         a, b = pair.split("/")
         return {a, b}
 
-    def _entry_eligible(pair):
-        """3-layer eligibility gate matching live risk_manager_forex logic."""
+    # ── Macro theme detector ──────────────────────────────────────────────────
+    theme_analyzer = CurrencyStrengthAnalyzer()
+    _theme_cache: Dict[str, Optional[CurrencyTheme]] = {}   # "YYYY-MM-DD" → theme
+
+    def _get_theme(ts: pd.Timestamp) -> Optional[CurrencyTheme]:
+        """Compute macro theme from daily data sliced up to ts. Cached per day."""
+        date_key = ts.strftime("%Y-%m-%d")
+        if date_key in _theme_cache:
+            return _theme_cache[date_key]
+        snapshot: Dict[str, dict] = {}
+        for p, pdata in candle_data.items():
+            df_d = pdata.get("d")
+            if df_d is not None:
+                sliced = df_d[df_d.index < ts]
+                if len(sliced) >= 22:    # need at least 20 days of closes for momentum
+                    snapshot[p] = {"d": sliced}
+        theme = theme_analyzer.get_dominant_theme(snapshot) if snapshot else None
+        _theme_cache[date_key] = theme
+        return theme
+
+    def _entry_eligible(pair, macro_theme: Optional[CurrencyTheme] = None):
+        """3-layer eligibility gate matching live risk_manager_forex logic.
+
+        Macro theme exception: when a currency theme is active and this pair
+        is one of the suggested stacked trades, we:
+          (a) raise the concurrent cap to STACK_MAX (default 4), and
+          (b) waive the currency-overlap check — correlated exposure is intentional.
+        This is exactly how Alex stacked 4 JPY shorts in Week 7-8 for $70K.
+        """
+        _is_theme = (
+            macro_theme is not None
+            and pair in [p for p, _ in macro_theme.suggested_trades]
+        )
+        max_concurrent = STACK_MAX if _is_theme else MAX_CONCURRENT_TRADES
+
         # Layer 1: max concurrent
-        if len(open_pos) >= MAX_CONCURRENT_TRADES:
+        if len(open_pos) >= max_concurrent:
             return False, "max_concurrent"
-        # Layer 2: currency overlap
-        if _pair_currencies(pair) & _currencies_in_use():
+        # Layer 2: currency overlap (waived for macro theme pairs — intentionally correlated)
+        if not _is_theme and (_pair_currencies(pair) & _currencies_in_use()):
             return False, "currency_overlap"
         return True, ""
 
@@ -447,6 +481,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     "bars_held": bars_held,
                     "pattern": pos.get("pattern", "?"),
                     "notes": pos.get("notes", ""),
+                    "macro_theme": pos.get("macro_theme"),
                 })
 
                 r_sign = "+" if risk_r >= 0 else ""
@@ -463,12 +498,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 continue
 
         # ── Evaluate new entries ──────────────────────────────────────
+        # Macro theme: computed once per calendar day (daily data doesn't change intraday)
+        active_theme = _get_theme(ts)
+
         for pair, pdata in candle_data.items():
             if pair in open_pos:
                 continue   # already in this pair
 
+            _is_theme_pair = (
+                active_theme is not None
+                and pair in [p for p, _ in active_theme.suggested_trades]
+            )
+
             # Eligibility gate (mirrors live risk_manager_forex)
-            eligible, elig_reason = _entry_eligible(pair)
+            eligible, elig_reason = _entry_eligible(pair, active_theme)
             if not eligible:
                 continue
 
@@ -494,12 +537,13 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             # ── Run real strategy evaluation ──────────────────────────
             try:
                 decision = strat.evaluate(
-                    pair       = pair,
-                    df_weekly  = hist_w  if len(hist_w)  >= 4  else pd.DataFrame(),
-                    df_daily   = hist_d  if len(hist_d)  >= 10 else pd.DataFrame(),
-                    df_4h      = hist_4h,
-                    df_1h      = hist_1h,
-                    current_dt = ts_utc,
+                    pair        = pair,
+                    df_weekly   = hist_w  if len(hist_w)  >= 4  else pd.DataFrame(),
+                    df_daily    = hist_d  if len(hist_d)  >= 10 else pd.DataFrame(),
+                    df_4h       = hist_4h,
+                    df_1h       = hist_1h,
+                    current_dt  = ts_utc,
+                    macro_theme = active_theme if _is_theme_pair else None,
                 )
             except Exception as e:
                 continue
@@ -533,6 +577,25 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     log_gap(ts_utc, pair, v1_action, v2_action, gap_type,
                             f"v2 reason: {decision.reason[:120]}")
 
+            # ── Macro theme direction gate ────────────────────────────
+            # If a macro theme is active and this pair is one of its suggested
+            # trades, block any entry whose direction CONTRADICTS the theme.
+            # E.g. GBP_weak theme → GBP/JPY SHORT is the play.
+            #      If the pattern detector finds a bullish IH&S and wants to go
+            #      LONG, that directly opposes the macro view → skip it.
+            # We only enter if the pattern AGREES with (or is neutral to) the theme.
+            if (decision.decision == Decision.ENTER
+                    and _is_theme_pair and active_theme):
+                theme_dir_map = dict(active_theme.suggested_trades)
+                theme_dir     = theme_dir_map.get(pair)
+                if theme_dir and theme_dir != decision.direction:
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED",
+                            "theme_direction_conflict",
+                            f"Theme={active_theme.currency}_{active_theme.direction} "
+                            f"wants {theme_dir}, pattern wants {decision.direction}. "
+                            f"Blocked to avoid contradicting macro view.")
+                    continue
+
             # ── Confidence gate ───────────────────────────────────────
             if (decision.decision == Decision.ENTER
                     and decision.confidence < MIN_CONFIDENCE):
@@ -564,6 +627,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     and decision.stop_loss):
 
                 rpct  = _risk_pct(balance)
+                # Macro theme stacking: each position gets fraction of normal risk
+                # so TOTAL exposure across all stacked trades = one normal trade.
+                # This is how Alex ran 4 JPY shorts at 1/4 size each = same $ risk as 1 trade.
+                if _is_theme_pair and active_theme:
+                    rpct = rpct * active_theme.position_fraction
                 units = _calc_units(pair, balance, rpct,
                                     decision.entry_price, decision.stop_loss)
                 if units <= 0:
@@ -582,6 +650,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     "pattern":     decision.pattern.pattern_type if decision.pattern else "?",
                     "notes":       decision.reason[:80],
                     "be_moved":    False,
+                    "macro_theme": f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
                 }
                 strat.register_open_position(
                     pair=pair,
@@ -593,11 +662,17 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     risk_pct=rpct,
                 )
 
+                theme_tag = (
+                    f"  🎯 MACRO THEME: {active_theme.currency} {active_theme.direction.upper()}"
+                    f" (score={active_theme.score:.1f}, {active_theme.trade_count} stacked,"
+                    f" size={active_theme.position_fraction:.0%} of normal)"
+                    if _is_theme_pair and active_theme else ""
+                )
                 print(f"  📈 {ts_utc.strftime('%Y-%m-%d %H:%M')} "
                       f"| ENTER {pair} {decision.direction.upper()}"
                       f" @ {decision.entry_price:.5f}  SL={decision.stop_loss:.5f}"
                       f"  conf={decision.confidence:.0%}"
-                      f"  [{decision.reason[:60]}]")
+                      f"  [{decision.reason[:60]}]{theme_tag}")
 
     # ── Close any still-open positions at last bar price ──────────────
     last_ts = all_1h[-1] if all_1h else None
@@ -622,6 +697,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             "bars_held": len(all_1h) - pos["bar_idx"],
             "pattern": pos.get("pattern", "?"),
             "notes": pos.get("notes", ""),
+            "macro_theme": pos.get("macro_theme"),
         })
 
     # ── Results ───────────────────────────────────────────────────────
@@ -646,10 +722,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         r_sign   = "+" if t["r"] >= 0 else ""
         pnl_sign = "+" if t["pnl"] >= 0 else ""
         status   = "✅" if t["pnl"] >= 0 else "❌"
+        theme_tag = f"  🎯 {t['macro_theme']}" if t.get("macro_theme") else ""
         print(f"  {status} {t['pair']:<10} {t['direction']:<6} "
               f"entry={t['entry']:.5f}  exit={t['exit']:.5f}  "
               f"{r_sign}{t['r']:.1f}R  ${pnl_sign}{t['pnl']:,.2f}  "
-              f"[{t['reason']}]  {t['notes'][:40]}")
+              f"[{t['reason']}]  {t['notes'][:40]}{theme_tag}")
 
     # ── Gap summary ───────────────────────────────────────────────────
     print(f"\n{'='*65}")

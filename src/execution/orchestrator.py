@@ -343,9 +343,27 @@ class ForexOrchestrator:
         logger.info("=== Hourly strategy evaluation ===")
         is_overnight = self._is_london_session(now)
 
+        # ── Macro theme detection ─────────────────────────────────────────
+        # Before evaluating individual pairs, check if a dominant currency
+        # theme is active. If JPY is weakening across 4+ pairs, we allow
+        # stacking up to 4 correlated positions at reduced size each.
+        # Alex's Week 7-8: JPY SHORT theme = $70K in one week.
+        macro_theme = self._detect_macro_theme()
+        if macro_theme:
+            logger.info(
+                f"🌊 MACRO THEME ACTIVE: {macro_theme} "
+                f"— stacking up to {macro_theme.trade_count} positions"
+            )
+            self.notifier.send_message(
+                f"🌊 *Macro theme detected:* {macro_theme.currency} "
+                f"{'weak ↓' if macro_theme.direction == 'weak' else 'strong ↑'} "
+                f"(score={macro_theme.score:.1f}) — "
+                f"watching {', '.join(macro_theme.confirming_pairs[:4])}"
+            )
+
         for pair in WATCHLIST:
             try:
-                self._evaluate_pair(pair, overnight=is_overnight)
+                self._evaluate_pair(pair, overnight=is_overnight, macro_theme=macro_theme)
             except Exception as e:
                 logger.error(f"{pair}: Evaluation error: {e}")
 

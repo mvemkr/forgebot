@@ -19,7 +19,7 @@ This is the patience filter encoded in software.
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from enum import Enum
 import logging
 
@@ -243,6 +243,53 @@ class SetAndForgetStrategy:
     # ── Dual-trade currency helpers ───────────────────────────────────
 
     @staticmethod
+    def _price_extension(df_daily: pd.DataFrame) -> Tuple[float, bool, bool]:
+        """
+        Compute how far current price is from its 2-year range using percentile rank.
+
+        Returns (z_score, is_extended_high, is_extended_low) where:
+          is_extended_high = price in TOP 10% of 2-year range → only SHORTs valid
+          is_extended_low  = price in BTM 10% of 2-year range → only LONGs valid
+
+        WHY PERCENTILE RANK, NOT Z-SCORE:
+          Z-score assumes a normal distribution around a mean. For a currency pair
+          in a sustained multi-year trend (e.g. USD/JPY 110→160 over 3 years),
+          the 1-year mean moves with the trend, so Z stays low even at extreme prices.
+          USD/JPY at 158 in July 2024 (a 40-year high) had a 1-year Z ≈ +1.0
+          because the whole year trended up. Z-score completely missed the extreme.
+
+          Percentile rank over 2 years answers the right question:
+          "Is this price near the top/bottom of where it's traded recently?"
+          USD/JPY at 158 → 97th percentile of 2-year range → EXTENDED HIGH. Correct.
+
+          Alex's exact reasoning: "It's at a 30-year high, I'm only taking shorts."
+          Percentile rank captures this. Z-score doesn't.
+
+        Threshold: 90th / 10th percentile over 504 trading days (~2 years).
+        Also returns Z-score for display/bonus calculations (less critical now).
+        """
+        if len(df_daily) < 60:
+            return 0.0, False, False
+
+        lookback = min(504, len(df_daily))   # 2 years of daily data
+        closes   = df_daily["close"].values[-lookback:]
+        current  = float(df_daily["close"].iloc[-1])
+
+        # Percentile rank: fraction of bars where close was BELOW current price
+        pct_rank = float(np.mean(closes <= current))
+
+        # Z-score retained for confidence bonus display (not for block logic)
+        mean = float(np.mean(closes))
+        std  = float(np.std(closes))
+        z    = (current - mean) / std if std > 0 else 0.0
+
+        # Extended = top or bottom 10% of 2-year price range
+        is_extended_high = pct_rank >= 0.90   # top 10% → reckless to go long
+        is_extended_low  = pct_rank <= 0.10   # btm 10% → reckless to go short
+
+        return z, is_extended_high, is_extended_low
+
+    @staticmethod
     def _is_major_level(price: float, pair: str) -> bool:
         """
         Return True if price is at (or very near) a MAJOR psychological round number.
@@ -298,6 +345,7 @@ class SetAndForgetStrategy:
         df_1h: pd.DataFrame,
         current_price: Optional[float] = None,
         current_dt=None,          # override for backtesting; live uses datetime.now()
+        macro_theme=None,         # CurrencyTheme object if a macro theme is active
     ) -> TradeDecision:
         """
         Run the complete strategy evaluation for a pair.
@@ -322,7 +370,17 @@ class SetAndForgetStrategy:
         #   c) Book exposure budget ≥ MIN_SECOND_TRADE_PCT (5%)
         #      (enforced at executor level using get_book_risk_pct)
         # ─────────────────────────────────────────────
-        MAX_CONCURRENT = 1   # Alex's rule: one trade at a time, no exceptions
+        # Alex's standard rule: 1 trade at a time.
+        # EXCEPTION: when a macro currency theme is detected (e.g. JPY weakness
+        # across all pairs in Sep 2024), allow stacking up to STACK_MAX positions
+        # on that theme. Each position gets reduced size (normal / n_positions).
+        # This is how Alex made $70K in one week — 4 JPY shorts as one theme.
+        from .currency_strength import STACK_MAX
+        _is_macro_theme_pair = (
+            macro_theme is not None
+            and pair in [p for p, _ in macro_theme.suggested_trades]
+        )
+        MAX_CONCURRENT = STACK_MAX if _is_macro_theme_pair else 1
 
         if len(self.open_positions) >= MAX_CONCURRENT:
             open_pairs = list(self.open_positions.keys())
@@ -333,6 +391,7 @@ class SetAndForgetStrategy:
                 reason=(
                     f"⛔ MAX POSITIONS: {len(open_pairs)} trades open "
                     f"({', '.join(open_pairs)}). Waiting for one to close."
+                    + (f" [Macro theme: {macro_theme}]" if macro_theme else "")
                 ),
                 confidence=0.0,
                 failed_filters=["max_concurrent"],
@@ -485,7 +544,7 @@ class SetAndForgetStrategy:
             logger.debug(f"{pair}: Trends not aligned. W={trend_w.value} D={trend_d.value} 4H={trend_4.value}")
 
         # ─────────────────────────────────────────────────────────────────
-        # EMA computation — pre-calculate for use in scoring below
+        # EMA + price extension — pre-calculate for use in scoring below
         # ─────────────────────────────────────────────────────────────────
         _ema_confluence = False
         _ema21 = _ema50 = 0.0
@@ -496,6 +555,12 @@ class SetAndForgetStrategy:
             _near_ema21 = abs(current_price - _ema21) / current_price < 0.005
             _near_ema50 = abs(current_price - _ema50) / current_price < 0.005
             _ema_confluence = _near_ema21 or _near_ema50
+
+        # Price extension Z-score — how far is current price from 1-year mean?
+        # Used in _mtf_context() to hard-block wrong-direction trades at extremes
+        # and add a confidence bonus to correct-direction trades (e.g., short
+        # at Z>2 = price at extreme high = ideal reversal short setup).
+        _ext_z, _ext_high, _ext_low = self._price_extension(df_daily)
 
         # ─────────────────────────────────────────────────────────────────
         # FILTER 3: Pattern detection — PATTERN SETS DIRECTION
@@ -603,26 +668,45 @@ class SetAndForgetStrategy:
                                    ('head_and_shoulders', 'double_top', 'double_bottom',
                                     'inverted_head_and_shoulders'))
 
+            # ── OVEREXTENSION BLOCK / BONUS (Feature #1) ──────────────────
+            # When price is >2 SD from its 1-year mean, only reversals AGAINST
+            # the extension direction are valid.
+            #
+            # USD/JPY at 157 (30-year high, Z≈+3.5): LONG is reckless.
+            # Alex went SHORT and made 13× his money. Our bot went LONG and
+            # stopped out. This single check fixes that.
+            #
+            # Bonus: being at an extreme and taking the CORRECT reversal direction
+            # gets a confidence boost (+0.08) — extreme reversals are Alex's
+            # highest-quality setups.
+            if _ext_high and is_long:
+                return False, 0.0, False   # price at extreme HIGH — no new longs
+            if _ext_low  and is_short:
+                return False, 0.0, False   # price at extreme LOW  — no new shorts
+            _ext_bonus = 0.08 if (
+                (_ext_high and is_short) or (_ext_low and is_long)
+            ) else 0.0
+
             # ── HARD BLOCK: 2+ TFs actively oppose the pattern direction ──
             # Alex's Week 4 losses: shorting/buying against confirmed trends.
-            if is_short and bullish_count >= 2:
+            if is_short and bullish_count >= 2 and not _ext_high:
                 return False, 0.0, False
-            if is_long  and bearish_count >= 2:
+            if is_long  and bearish_count >= 2 and not _ext_low:
                 return False, 0.0, False
 
             # ── TIER 1: Trend continuation (2/3 aligned) ──────────────────
             if is_short and bearish_count >= 2:
-                return True, +0.05, False
+                return True, +0.05 + _ext_bonus, False
             if is_long  and bullish_count >= 2:
-                return True, +0.05, False
+                return True, +0.05 + _ext_bonus, False
 
             # ── TIER 2: Reversal confirmed — weekly opposing + D/4H turning ─
             # Price was driven to the level by the weekly trend, now reversing.
             # D or 4H must actively show the reversal has begun.
             if is_short and w_bullish and (d_bearish or h4_bearish):
-                return True, 0.0, True
+                return True, 0.0 + _ext_bonus, True
             if is_long  and w_bearish and (d_bullish or h4_bullish):
-                return True, 0.0, True
+                return True, 0.0 + _ext_bonus, True
 
             # ── TIER 3: Reversal early — weekly opposing + daily stalling ──
             # Only for structural reversal patterns (H&S, DT, DB, IH&S).
@@ -630,9 +714,9 @@ class SetAndForgetStrategy:
             # GBP/CHF Aug 2024: weekly=bullish, daily=neutral, double top at high.
             # Break-retest is EXCLUDED — it requires trend confirmation to enter.
             if is_reversal_type and is_short and w_bullish and not d_bullish:
-                return True, -0.05, True
+                return True, -0.05 + _ext_bonus, True
             if is_reversal_type and is_long  and w_bearish and not d_bearish:
-                return True, -0.05, True
+                return True, -0.05 + _ext_bonus, True
 
             # ── TIER 4: Range reversal — weekly neutral + local push exhausted ──
             # When the weekly trend is neutral (ranging), price bounces between
@@ -647,9 +731,20 @@ class SetAndForgetStrategy:
             _w_neutral = not w_bullish and not w_bearish
             _d_neutral = not d_bullish and not d_bearish
             if is_reversal_type and is_short and _w_neutral and h4_bullish:
-                return True, -0.05, True   # same penalty as early reversal
+                return True, -0.05 + _ext_bonus, True
             if is_reversal_type and is_long  and _w_neutral and h4_bearish:
-                return True, -0.05, True
+                return True, -0.05 + _ext_bonus, True
+
+            # ── TIER 5: Overextension reversal — Z > 2, pattern agrees ────
+            # Even when no standard tier fires (e.g. all trends neutral but
+            # price is at a 2-year extreme), a clear reversal pattern at an
+            # extreme IS a valid setup. Alex's USD/JPY Week 8 shorts happened
+            # precisely when daily/weekly trends were all "bullish" — but Z was
+            # ~+3.5. The overextension IS the signal.
+            if _ext_high and is_short and is_reversal_type:
+                return True, +0.10, True   # high confidence — extreme + pattern
+            if _ext_low  and is_long  and is_reversal_type:
+                return True, +0.10, True
 
             # ── BLOCK: insufficient context for all other cases ────────────
             return False, 0.0, False
@@ -907,7 +1002,19 @@ class SetAndForgetStrategy:
           + _4h_penalty                            # 4H-source pattern (less mature than daily)
         )))
 
-        risk_dollars = self.account_balance * (self.risk_pct / 100)
+        # Macro theme position sizing: if this is a stacked macro theme trade,
+        # divide the normal risk % by the number of positions in the theme.
+        # Total exposure stays the same — just spread across correlated pairs.
+        _effective_risk_pct = self.risk_pct
+        _macro_note = ""
+        if macro_theme and _is_macro_theme_pair:
+            _effective_risk_pct = self.risk_pct * macro_theme.position_fraction
+            _macro_note = (f" | 📊 MACRO THEME: {macro_theme.currency} "
+                          f"{macro_theme.direction.upper()} (score={macro_theme.score:.1f}, "
+                          f"{macro_theme.trade_count} trades, "
+                          f"{_effective_risk_pct:.1f}% risk each)")
+
+        risk_dollars = self.account_balance * (_effective_risk_pct / 100)
         rr_1 = abs(entry_price - target_1) / max(abs(entry_price - stop_loss), 0.000001)
         _level_desc = (
             f"Level {nearest_level.price:.5f} score={nearest_level.score}"
@@ -928,13 +1035,14 @@ class SetAndForgetStrategy:
                 f"Session: {session} | "
                 f"R:R (T1) = 1:{rr_1:.1f} | "
                 f"Risk: ${risk_dollars:.2f}"
+                f"{_macro_note}"
             ),
             confidence=confidence,
             entry_price=entry_price,
             stop_loss=stop_loss,
             target_1=target_1,
             target_2=target_2,
-            risk_pct=self.risk_pct,
+            risk_pct=_effective_risk_pct,
             lot_size=lot_size,
             nearest_level=nearest_level,
             pattern=matching_pattern,
