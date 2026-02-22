@@ -694,10 +694,14 @@ class SetAndForgetStrategy:
             if is_long  and bearish_count >= 2 and not _ext_low:
                 return False, 0.0, False
 
-            # ── TIER 1: Trend continuation (2/3 aligned) ──────────────────
-            if is_short and bearish_count >= 2:
+            # ── TIER 1: Trend continuation (2/3 aligned, weekly not opposing) ──
+            # Weekly is the master timeframe. D+4H bullish in a weekly downtrend
+            # is a short-term bounce — NOT a continuation trade. Alex's rule:
+            # "trade WITH the weekly or at a confirmed extreme." If weekly opposes,
+            # the trade must fall to TIER 2/3 which properly gates reversals.
+            if is_short and bearish_count >= 2 and not w_bullish:
                 return True, +0.05 + _ext_bonus, False
-            if is_long  and bullish_count >= 2:
+            if is_long  and bullish_count >= 2 and not w_bearish:
                 return True, +0.05 + _ext_bonus, False
 
             # ── TIER 2: Reversal confirmed — weekly opposing + D/4H turning ─
@@ -1016,6 +1020,29 @@ class SetAndForgetStrategy:
 
         risk_dollars = self.account_balance * (_effective_risk_pct / 100)
         rr_1 = abs(entry_price - target_1) / max(abs(entry_price - stop_loss), 0.000001)
+
+        # ── Minimum R:R quality gate ───────────────────────────────────────
+        # If the pattern's measured move (T1 amplitude) is less than 1.0× the
+        # stop distance, the pattern is geometrically weak — either stop is
+        # too wide or the measured move is tiny. Both are quality failures.
+        # Alex's trades all had measured moves well beyond their stop distances.
+        # 1:0.4 R:R (like AUD/CAD IH&S Jul 2024) = clear junk setup.
+        MIN_RR = 1.0
+        if rr_1 < MIN_RR:
+            return TradeDecision(
+                decision=Decision.WAIT,
+                pair=pair,
+                direction=trade_direction,
+                reason=(
+                    f"R:R too low ({rr_1:.2f} < {MIN_RR:.1f} minimum). "
+                    f"Pattern amplitude too small vs stop distance. "
+                    f"{matching_pattern.pattern_type.upper()} at {entry_price:.5f} "
+                    f"SL={stop_loss:.5f} T1={target_1:.5f}"
+                ),
+                confidence=confidence * 0.5,
+                failed_filters=["rr_minimum"],
+            )
+
         _level_desc = (
             f"Level {nearest_level.price:.5f} score={nearest_level.score}"
             if nearest_level else

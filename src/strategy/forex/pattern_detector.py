@@ -303,13 +303,18 @@ class PatternDetector:
             if abs(t1 - t2) / t1 > self.tol:
                 continue
 
-            top_level = (t1 + t2) / 2
-            valley = min(lows[t1_idx:t2_idx+1])
+            top_level  = (t1 + t2) / 2
+            peak_high  = max(t1, t2)          # highest of the two tops
+            valley     = min(lows[t1_idx:t2_idx+1])
 
             clarity = 1.0 - abs(t1 - t2) / t1 * 10
             clarity = max(0.1, min(1.0, clarity))
 
-            stop = top_level * (1 + self.tol * 2)
+            # Stop behind the HIGHEST peak + 0.5% buffer.
+            # Old: top_level * (1 + tol * 2) = only ~0.6% above average — too tight,
+            #      produces 9-pip stops when current price is near the tops.
+            # New: above the actual peak high so price must breach both tops to stop us.
+            stop = peak_high * (1 + self.tol * 5)
             measured_move = top_level - valley
 
             results.append(PatternResult(
@@ -342,12 +347,14 @@ class PatternDetector:
                 continue
 
             bottom_level = (b1 + b2) / 2
-            peak = max(highs[b1_idx:b2_idx+1])
+            trough_low   = min(b1, b2)        # lowest of the two bottoms
+            peak         = max(highs[b1_idx:b2_idx+1])
 
             clarity = 1.0 - abs(b1 - b2) / b1 * 10
             clarity = max(0.1, min(1.0, clarity))
 
-            stop = bottom_level * (1 - self.tol * 2)
+            # Stop below the LOWEST trough - 0.5% buffer (mirror of double top fix).
+            stop = trough_low * (1 - self.tol * 5)
             measured_move = peak - bottom_level
 
             results.append(PatternResult(

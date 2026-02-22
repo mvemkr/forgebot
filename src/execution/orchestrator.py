@@ -354,8 +354,8 @@ class ForexOrchestrator:
                 f"🌊 MACRO THEME ACTIVE: {macro_theme} "
                 f"— stacking up to {macro_theme.trade_count} positions"
             )
-            self.notifier.send_message(
-                f"🌊 *Macro theme detected:* {macro_theme.currency} "
+            self.notifier.send(
+                f"🌊 <b>Macro theme detected:</b> {macro_theme.currency} "
                 f"{'weak ↓' if macro_theme.direction == 'weak' else 'strong ↑'} "
                 f"(score={macro_theme.score:.1f}) — "
                 f"watching {', '.join(macro_theme.confirming_pairs[:4])}"
@@ -367,7 +367,29 @@ class ForexOrchestrator:
             except Exception as e:
                 logger.error(f"{pair}: Evaluation error: {e}")
 
-    def _evaluate_pair(self, pair: str, overnight: bool = False):
+    def _detect_macro_theme(self):
+        """
+        Scan all watchlist pairs for a dominant macro currency theme.
+        Uses the same CurrencyStrengthAnalyzer as the backtester so
+        live bot and backtest behave identically.
+        Returns a CurrencyTheme if one is found, else None.
+        """
+        from ..strategy.forex.currency_strength import CurrencyStrengthAnalyzer, CurrencyTheme
+        try:
+            analyzer     = CurrencyStrengthAnalyzer()
+            candle_data  = {}
+            for pair in WATCHLIST:
+                df_d = self._fetch_oanda_candles(pair, "D", count=220)
+                if df_d is not None and len(df_d) >= 22:
+                    candle_data[pair] = {"d": df_d}
+            if not candle_data:
+                return None
+            return analyzer.get_dominant_theme(candle_data)
+        except Exception as e:
+            logger.warning(f"Macro theme detection failed: {e}")
+            return None
+
+    def _evaluate_pair(self, pair: str, overnight: bool = False, macro_theme=None):
         df_w  = self._fetch_oanda_candles(pair, "W",  count=100)
         df_d  = self._fetch_oanda_candles(pair, "D",  count=200)
         df_4h = self._fetch_oanda_candles(pair, "H4", count=200)
@@ -383,6 +405,7 @@ class ForexOrchestrator:
             df_daily=df_d,
             df_4h=df_4h,
             df_1h=df_1h,
+            macro_theme=macro_theme,
         )
 
         if decision.decision.value == "ENTER":
