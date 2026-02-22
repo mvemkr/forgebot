@@ -50,6 +50,8 @@ INSTRUMENT_MAP = {
     "AUD/JPY": "AUD_JPY",
     "EUR/CAD": "EUR_CAD",
     "EUR/CHF": "EUR_CHF",
+    "EUR/NZD": "EUR_NZD",
+    "AUD/NZD": "AUD_NZD",
 }
 
 

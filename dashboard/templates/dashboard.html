@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Forge Bot — Forex Dashboard</title>
+
+<!-- Tailwind + DaisyUI -->
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- Alpine.js -->
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+
+<!-- Phosphor Icons -->
+<script src="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/index.js"></script>
+
+<style>
+  body { background: #0a0e1a; }
+  .glow-green { box-shadow: 0 0 15px rgba(74, 222, 128, 0.15); }
+  .glow-red   { box-shadow: 0 0 15px rgba(248, 113, 113, 0.15); }
+  .glow-blue  { box-shadow: 0 0 15px rgba(96, 165, 250, 0.12); }
+  .pair-card:hover { border-color: #3b82f6; transform: translateY(-1px); transition: all 0.2s; }
+  .trend-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+  .pulse-green { animation: pulseGreen 2s infinite; }
+  @keyframes pulseGreen { 0%,100%{opacity:1} 50%{opacity:.4} }
+  ::-webkit-scrollbar { width:6px; } ::-webkit-scrollbar-track { background:#0a0e1a; }
+  ::-webkit-scrollbar-thumb { background:#334155; border-radius:3px; }
+  .stat-up { color: #4ade80; } .stat-down { color: #f87171; } .stat-neutral { color: #94a3b8; }
+  [x-cloak] { display: none !important; }
+</style>
+</head>
+
+<body class="min-h-screen text-base-content" x-data="dashboard()" x-init="init()" x-cloak>
+
+<!-- ── TOP NAV ─────────────────────────────────────────── -->
+<div class="navbar bg-base-200 border-b border-base-300 px-6 sticky top-0 z-50">
+  <div class="flex-1 gap-3 items-center">
+    <span class="text-2xl">⚔️</span>
+    <div>
+      <div class="font-bold text-lg leading-tight">Forge Bot</div>
+      <div class="text-xs text-base-content/50">Set & Forget Forex Strategy</div>
+    </div>
+    <div class="badge ml-2" :class="state.dry_run === false ? 'badge-error' : 'badge-success'">
+      <span x-text="state.dry_run === false ? '⚠️ LIVE' : '🧪 DRY RUN'"></span>
+    </div>
+    <div x-show="state.halted" class="badge badge-error gap-1 ml-1">
+      <i class="ph ph-warning"></i> HALTED
+    </div>
+  </div>
+  <div class="flex-none gap-4 items-center">
+    <div class="text-right">
+      <div class="text-xs text-base-content/50">Account Balance</div>
+      <div class="font-mono font-bold text-success text-lg" x-text="'$' + fmt(state.account_balance)">—</div>
+    </div>
+    <div class="text-right">
+      <div class="text-xs text-base-content/50">Risk/trade</div>
+      <div class="font-mono font-bold" x-text="(state.risk_pct || '—') + '%'">—</div>
+    </div>
+    <div class="divider divider-horizontal m-0"></div>
+    <div class="flex items-center gap-2">
+      <div class="w-2 h-2 rounded-full pulse-green" :class="botOnline ? 'bg-success' : 'bg-error'"></div>
+      <div class="text-xs">
+        <div :class="botOnline ? 'text-success' : 'text-error'" x-text="botOnline ? 'Bot Online' : 'Bot Offline'"></div>
+        <div class="text-base-content/40" x-text="lastSeen">—</div>
+      </div>
+    </div>
+    <div class="countdown font-mono text-sm opacity-40">
+      <span x-text="refreshIn + 's'"></span>
+    </div>
+  </div>
+</div>
+
+<!-- ── HALT BANNER ────────────────────────────────────────── -->
+<!-- Regroup mode banner -->
+<div x-show="state.mode === 'regroup'" class="alert alert-warning rounded-none">
+  <i class="ph ph-pause-circle ph-bold text-xl"></i>
+  <span>🟡 <strong>REGROUP MODE</strong> — Observing only, no new trades.
+    <span x-show="state.regroup_ends"> Auto-resumes: <strong x-text="state.regroup_ends ? state.regroup_ends.slice(0,10) : ''"></strong></span>
+    — <span x-text="state.halted ? (state.halt_reason || '') : ''"></span>
+  </span>
+</div>
+<!-- Paused banner -->
+<div x-show="state.mode === 'paused'" class="alert alert-error rounded-none">
+  <i class="ph ph-warning-diamond ph-bold text-xl"></i>
+  <span>⏸ <strong>BOT PAUSED</strong> — No new trades. Tell Forge "resume trading" to restart.</span>
+</div>
+
+<!-- ── MAIN GRID ──────────────────────────────────────────── -->
+<div class="p-6 grid grid-cols-12 gap-5">
+
+  <!-- ── ACCOUNT STATS ROW ────────────────────────────── -->
+  <div class="col-span-12 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+    <div class="stat bg-base-200 rounded-2xl border border-base-300">
+      <div class="stat-figure text-success"><i class="ph ph-currency-dollar ph-bold text-3xl"></i></div>
+      <div class="stat-title">Balance</div>
+      <div class="stat-value text-success font-mono text-2xl" x-text="'$' + fmt(state.account_balance || acct.balance)">—</div>
+      <div class="stat-desc" x-text="'NAV: $' + fmt(acct.nav)">—</div>
+    </div>
+    <div class="stat bg-base-200 rounded-2xl border border-base-300">
+      <div class="stat-figure" :class="(acct.unrealized_pnl||0) >= 0 ? 'text-success' : 'text-error'">
+        <i class="ph ph-trend-up ph-bold text-3xl" x-show="(acct.unrealized_pnl||0) >= 0"></i>
+        <i class="ph ph-trend-down ph-bold text-3xl" x-show="(acct.unrealized_pnl||0) < 0"></i>
+      </div>
+      <div class="stat-title">Unrealized P&L</div>
+      <div class="stat-value font-mono text-2xl" :class="(acct.unrealized_pnl||0)>=0?'text-success':'text-error'"
+           x-text="((acct.unrealized_pnl||0)>=0?'+':'') + '$' + Math.abs(acct.unrealized_pnl||0).toFixed(2)">—</div>
+      <div class="stat-desc" x-text="(acct.open_trades||0) + ' open trade(s)'"></div>
+    </div>
+    <div class="stat bg-base-200 rounded-2xl border border-base-300">
+      <div class="stat-figure text-info"><i class="ph ph-chart-line-up ph-bold text-3xl"></i></div>
+      <div class="stat-title">All-Time P&L</div>
+      <div class="stat-value font-mono text-2xl" :class="(state.total_pnl||0)>=0?'text-success':'text-error'"
+           x-text="((state.total_pnl||0)>=0?'+':'') + '$' + fmt(Math.abs(state.total_pnl||0))">—</div>
+      <div class="stat-desc" x-text="(state.total_trades||0) + ' trades'"></div>
+    </div>
+    <div class="stat bg-base-200 rounded-2xl border border-base-300">
+      <div class="stat-figure text-accent"><i class="ph ph-target ph-bold text-3xl"></i></div>
+      <div class="stat-title">Win Rate</div>
+      <div class="stat-value text-2xl font-mono"
+           :class="(state.win_rate||0) >= 60 ? 'text-success' : (state.win_rate||0) >= 55 ? 'text-warning' : 'text-error'"
+           x-text="(state.total_trades||0) > 0 ? (state.win_rate||0) + '%' : '—'">—</div>
+      <div class="stat-desc" :class="(state.win_rate||0)>=55?'text-success':'text-error'"
+           x-text="(state.total_trades||0) > 0 ? ((state.win_rate||0) >= 55 ? '↑ above baseline' : '↓ below 55% baseline') : 'No trades yet'"></div>
+    </div>
+    <div class="stat bg-base-200 rounded-2xl border border-base-300">
+      <div class="stat-figure" :class="(state.drawdown_pct||0) > 20 ? 'text-error' : 'text-warning'">
+        <i class="ph ph-shield-warning ph-bold text-3xl"></i>
+      </div>
+      <div class="stat-title">Drawdown</div>
+      <div class="stat-value font-mono text-2xl"
+           :class="(state.drawdown_pct||0) > 30 ? 'text-error' : (state.drawdown_pct||0) > 15 ? 'text-warning' : 'text-success'"
+           x-text="(state.drawdown_pct||0) > 0 ? (state.drawdown_pct||0) + '%' : '✓ Peak'">—</div>
+      <div class="stat-desc" x-text="'KS trigger: 40% | Peak: $' + fmt(state.peak_balance||0)"></div>
+    </div>
+    <div class="stat bg-base-200 rounded-2xl border border-base-300"
+         :class="state.mode==='regroup' ? 'border-warning/50' : state.mode==='paused' ? 'border-error/50' : 'border-success/20'">
+      <div class="stat-figure"
+           :class="state.mode==='active'?'text-success':state.mode==='regroup'?'text-warning':'text-error'">
+        <i class="ph ph-brain ph-bold text-3xl"></i>
+      </div>
+      <div class="stat-title">Mode / Risk</div>
+      <div class="stat-value text-xl font-bold"
+           :class="state.mode==='active'?'text-success':state.mode==='regroup'?'text-warning':'text-error'"
+           x-text="(state.mode||'—').toUpperCase()">—</div>
+      <div class="stat-desc" x-text="(state.tier_label||'—') + ' · ' + (state.pattern_memory_count||0) + ' patterns locked'"></div>
+    </div>
+  </div>
+
+  <!-- ── OPEN POSITIONS ────────────────────────────────── -->
+  <div class="col-span-12 lg:col-span-5">
+    <div class="card bg-base-200 border border-base-300 h-full">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold uppercase tracking-widest text-base-content/60 mb-3">
+          <i class="ph ph-currency-circle-dollar text-success"></i> Open Positions
+        </h2>
+        <div x-show="openTrades.length === 0" class="text-base-content/40 text-center py-8">
+          <i class="ph ph-hourglass ph-bold text-4xl block mb-2"></i>
+          No open positions — waiting for setup
+        </div>
+        <template x-for="t in openTrades" :key="t.instrument">
+          <div class="rounded-xl p-4 mb-3 border" :class="t.direction==='long' ? 'border-success/30 bg-success/5 glow-green' : 'border-error/30 bg-error/5 glow-red'">
+            <div class="flex justify-between items-start mb-3">
+              <div>
+                <span class="font-bold text-lg" x-text="t.instrument.replace('_','/')"></span>
+                <span class="badge ml-2 badge-sm" :class="t.direction==='long'?'badge-success':'badge-error'"
+                      x-text="t.direction.toUpperCase()"></span>
+                <span x-show="t.stop_loss === t.entry" class="badge badge-info badge-sm ml-1">🛡️ BREAKEVEN</span>
+              </div>
+              <div class="text-right">
+                <div class="font-mono font-bold text-lg" :class="(t.current||0)>=0?'text-success':'text-error'"
+                     x-text="((t.current||0)>=0?'+':'') + '$' + Math.abs(t.current||0).toFixed(2)"></div>
+                <div class="text-xs text-base-content/50" x-text="t.units?.toLocaleString() + ' units'"></div>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-2 text-sm">
+              <div><span class="opacity-50">Entry</span> <span class="font-mono ml-1" x-text="(t.entry||0).toFixed(5)"></span></div>
+              <div><span class="opacity-50">Stop</span> <span class="font-mono ml-1" :class="t.stop_loss===t.entry?'text-info':''" x-text="(t.stop_loss||0).toFixed(5)"></span></div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── BOT BRAIN: WHAT IT'S THINKING ──────────────────── -->
+  <div class="col-span-12 lg:col-span-7">
+    <div class="card bg-base-200 border border-base-300 h-full">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold uppercase tracking-widest text-base-content/60 mb-3">
+          <i class="ph ph-brain text-warning"></i> What The Bot Is Thinking
+        </h2>
+        <div x-show="pairAnalysis.length === 0" class="text-base-content/40 text-center py-8">
+          <i class="ph ph-magnifying-glass ph-bold text-4xl block mb-2"></i>
+          No active analysis yet — run a scan or wait for London session
+        </div>
+        <div class="overflow-x-auto">
+          <table class="table table-sm" x-show="pairAnalysis.length > 0">
+            <thead>
+              <tr class="text-base-content/40 text-xs uppercase">
+                <th>Pair</th><th>State</th><th>Dir</th><th>Trends W/D/4H</th><th>Pattern</th><th>When</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="s in pairAnalysis" :key="s.pair">
+                <tr class="hover">
+                  <td class="font-bold" x-text="s.pair"></td>
+                  <td>
+                    <span class="badge badge-sm" :class="{
+                      'badge-success': s.event==='TRADE_ENTERED',
+                      'badge-warning': s.event==='SETUP_DETECTED',
+                      'badge-error': s.event==='EXIT_SIGNAL',
+                      'badge-info': s.event==='BREAKEVEN_MOVED',
+                      'badge-ghost': s.event==='BLOCKED'
+                    }" x-text="evtLabel(s.event)"></span>
+                  </td>
+                  <td>
+                    <span x-show="s.direction && s.direction!=='?'" class="badge badge-xs"
+                          :class="s.direction==='long'?'badge-success':'badge-error'"
+                          x-text="s.direction?.toUpperCase()"></span>
+                  </td>
+                  <td>
+                    <div class="flex gap-1 items-center">
+                      <span class="trend-dot" :class="trendColor(s.trend_weekly)"></span>
+                      <span class="trend-dot" :class="trendColor(s.trend_daily)"></span>
+                      <span class="trend-dot" :class="trendColor(s.trend_4h)"></span>
+                      <span class="text-xs opacity-40 ml-1" x-text="shortTrend(s.trend_weekly)"></span>
+                    </div>
+                  </td>
+                  <td class="text-xs opacity-70" x-text="(s.pattern||'—').replace('_',' ')"></td>
+                  <td class="text-xs opacity-40" x-text="timeAgo(s.timestamp)"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── ACTIVE SETUPS (WAITING FOR ENTRY) ─────────────── -->
+  <div class="col-span-12" x-show="topSetups.length > 0">
+    <div class="card bg-base-200 border border-warning/30 glow-blue">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold uppercase tracking-widest text-warning mb-3">
+          <i class="ph ph-crosshair text-warning"></i> 🎯 Prime Setups — Watching For Entry Signal
+        </h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <template x-for="s in topSetups" :key="s.pair">
+            <div class="rounded-xl border border-warning/20 bg-warning/5 p-4 pair-card">
+              <div class="flex justify-between items-start mb-2">
+                <span class="font-bold text-base" x-text="s.pair"></span>
+                <span class="badge badge-xs" :class="s.direction==='long'?'badge-success':'badge-error'"
+                      x-text="(s.direction||'?').toUpperCase()"></span>
+              </div>
+              <div class="text-xs opacity-60 mb-2" x-text="s.notes||s.status"></div>
+              <div class="flex gap-2 text-xs">
+                <span>Alert @ <span class="font-mono text-warning" x-text="(s.key_level||0).toFixed(5)"></span></span>
+                <span class="opacity-40" x-text="'score=' + (s.key_level_score||'?')"></span>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── RECENT DECISIONS FEED ─────────────────────────── -->
+  <div class="col-span-12 lg:col-span-6">
+    <div class="card bg-base-200 border border-base-300 h-full">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold uppercase tracking-widest text-base-content/60 mb-3">
+          <i class="ph ph-activity text-info"></i> Decision Feed
+        </h2>
+        <div class="space-y-2 max-h-80 overflow-y-auto pr-1">
+          <div x-show="recentDecisions.length === 0" class="text-base-content/40 text-sm text-center py-4">
+            No decisions logged yet
+          </div>
+          <template x-for="(d, i) in recentDecisions" :key="i">
+            <div class="flex gap-3 items-start text-sm">
+              <div class="w-2 h-2 rounded-full mt-1.5 flex-shrink-0" :class="{
+                'bg-success': d.event==='TRADE_ENTERED'||d.event==='BREAKEVEN_MOVED',
+                'bg-error': d.event==='STOP_HIT'||d.event==='KILL_SWITCH',
+                'bg-warning': d.event==='EXIT_SIGNAL'||d.event==='SETUP_DETECTED',
+                'bg-base-content/20': d.event==='BLOCKED'
+              }"></div>
+              <div class="flex-1 min-w-0">
+                <div class="flex gap-2">
+                  <span class="font-bold text-xs" x-text="d.pair||'—'"></span>
+                  <span class="opacity-50 text-xs" x-text="evtLabel(d.event)"></span>
+                  <span class="opacity-30 text-xs ml-auto" x-text="timeAgo(d.ts||d.timestamp)"></span>
+                </div>
+                <div class="opacity-50 text-xs truncate" x-text="d.notes||d.reason||d.direction||''"></div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── P&L CHART ──────────────────────────────────────── -->
+  <div class="col-span-12 lg:col-span-6">
+    <div class="card bg-base-200 border border-base-300 h-full">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold uppercase tracking-widest text-base-content/60 mb-3">
+          <i class="ph ph-chart-bar text-success"></i> Weekly P&L
+        </h2>
+        <div x-show="!weeklyPnlHasData" class="text-base-content/40 text-center py-8">
+          <i class="ph ph-chart-bar ph-bold text-4xl block mb-2"></i>
+          No completed trades yet
+        </div>
+        <canvas id="pnlChart" height="180" x-show="weeklyPnlHasData"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TRADE HISTORY ──────────────────────────────────── -->
+  <div class="col-span-12">
+    <div class="card bg-base-200 border border-base-300">
+      <div class="card-body p-5">
+        <div class="flex justify-between items-center mb-3">
+          <h2 class="card-title text-sm font-bold uppercase tracking-widest text-base-content/60">
+            <i class="ph ph-list-checks text-base-content/50"></i> Trade History
+          </h2>
+          <div class="flex gap-3 text-sm opacity-60">
+            <span x-show="stats.trades > 0">
+              <span class="text-success" x-text="stats.wins + 'W'"></span> /
+              <span class="text-error" x-text="stats.losses + 'L'"></span>
+              <span class="ml-2 opacity-50">avg R:R <span class="font-mono" x-text="(stats.avg_rr||0) > 0 ? '+'+stats.avg_rr : stats.avg_rr"></span></span>
+            </span>
+          </div>
+        </div>
+        <div x-show="recentTrades.length === 0" class="text-base-content/40 text-center py-8">
+          <i class="ph ph-clock-countdown ph-bold text-4xl block mb-2"></i>
+          No completed trades yet — the bot is watching for setups
+        </div>
+        <div class="overflow-x-auto" x-show="recentTrades.length > 0">
+          <table class="table table-sm">
+            <thead>
+              <tr class="text-base-content/40 text-xs uppercase">
+                <th>Pair</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Stop</th><th>R:R</th><th>P&L</th><th>Reason</th><th>Pattern</th><th>When</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="(t, i) in recentTrades" :key="i">
+                <tr class="hover">
+                  <td class="font-bold" x-text="t.pair"></td>
+                  <td><span class="badge badge-xs" :class="t.direction==='long'?'badge-success':'badge-error'" x-text="(t.direction||'?').toUpperCase()"></span></td>
+                  <td class="font-mono text-xs" x-text="(t.entry_price||0).toFixed(5)"></td>
+                  <td class="font-mono text-xs" x-text="(t.exit_price||0).toFixed(5)"></td>
+                  <td class="font-mono text-xs opacity-50" x-text="(t.stop_loss||0).toFixed(5)"></td>
+                  <td class="font-mono font-bold" :class="(t.rr_achieved||0)>0?'text-success':'text-error'"
+                      x-text="((t.rr_achieved||0)>0?'+':'') + (t.rr_achieved||0).toFixed(1) + 'R'"></td>
+                  <td class="font-mono font-bold" :class="(t.pnl_dollars||0)>=0?'text-success':'text-error'"
+                      x-text="((t.pnl_dollars||0)>=0?'+':'') + '$' + Math.abs(t.pnl_dollars||0).toFixed(2)"></td>
+                  <td class="text-xs opacity-60" x-text="t.exit_reason||'—'"></td>
+                  <td class="text-xs opacity-60" x-text="(t.pattern||'—').replace(/_/g,' ')"></td>
+                  <td class="text-xs opacity-40" x-text="timeAgo(t.timestamp)"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SYSTEM STATUS ─────────────────────────────────── -->
+  <div class="col-span-12">
+    <div class="collapse collapse-arrow bg-base-200 border border-base-300">
+      <input type="checkbox">
+      <div class="collapse-title text-sm font-bold uppercase tracking-widest text-base-content/40">
+        <i class="ph ph-gear"></i> System Status
+      </div>
+      <div class="collapse-content">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 pt-2">
+          <div class="text-sm"><span class="opacity-50">Bot status</span><br><span x-text="state.mode||'—'"></span></div>
+          <div class="text-sm"><span class="opacity-50">Last heartbeat</span><br><span x-text="lastSeen"></span></div>
+          <div class="text-sm"><span class="opacity-50">Margin avail</span><br><span class="font-mono" x-text="'$'+fmt(acct.margin_avail)"></span></div>
+          <div class="text-sm"><span class="opacity-50">Leverage</span><br><span x-text="acct.leverage||'—'"></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- end grid -->
+
+<!-- ── Progress bar ─────────────────────────────────────── -->
+<div class="fixed bottom-0 left-0 right-0 h-0.5 bg-base-300">
+  <div class="h-full bg-primary transition-all duration-1000" :style="'width:' + progressPct + '%'"></div>
+</div>
+
+<script>
+const REFRESH_SECS = 15;
+
+function dashboard() {
+  return {
+    state: {}, acct: {}, stats: {}, openTrades: [],
+    pairAnalysis: [], recentDecisions: [], recentTrades: [],
+    topSetups: [], weeklyPnl: {}, weeklyPnlHasData: false,
+    botOnline: false, lastSeen: '—', refreshIn: REFRESH_SECS,
+    progressPct: 100, chart: null,
+    newsEvents: [],
+
+    async init() {
+      await this.refresh();
+      await this.fetchNews();
+      setInterval(() => this.refresh(), REFRESH_SECS * 1000);
+      setInterval(() => this.fetchNews(), 5 * 60 * 1000);  // refresh news every 5 min
+      setInterval(() => {
+        this.refreshIn = Math.max(0, this.refreshIn - 1);
+        this.progressPct = (this.refreshIn / REFRESH_SECS) * 100;
+      }, 1000);
+    },
+
+    async fetchNews() {
+      try {
+        const r = await fetch('/api/news');
+        const d = await r.json();
+        this.newsEvents = d.events || [];
+      } catch(e) { this.newsEvents = []; }
+    },
+
+    newsTimeLabel(evt) {
+      if (evt.is_past) return 'Released';
+      const m = evt.mins_away;
+      if (m < 60)  return `in ${m}m`;
+      return `in ${Math.floor(m/60)}h ${m%60}m`;
+    },
+
+    async refresh() {
+      this.refreshIn = REFRESH_SECS;
+      this.progressPct = 100;
+      try {
+        const [status, weekly] = await Promise.all([
+          fetch('/api/status').then(r => r.json()),
+          fetch('/api/weekly_pnl').then(r => r.json()),
+        ]);
+
+        this.state    = status.heartbeat || {};
+        this.acct     = status.account   || {};
+        this.stats    = status.stats     || {};
+        this.openTrades    = status.open_trades || [];
+        this.pairAnalysis  = status.scan_state  || [];
+        this.recentDecisions = status.recent_decisions || [];
+        this.recentTrades  = (status.recent_trades || []).slice().reverse();
+        this.topSetups     = status.top_setups || [];
+
+        // Bot online check
+        const ts = this.state.timestamp;
+        if (ts) {
+          const age = (Date.now() - new Date(ts).getTime()) / 1000;
+          this.botOnline = age < 180;
+          this.lastSeen = this.timeAgo(ts);
+        }
+
+        // Weekly P&L chart
+        this.weeklyPnl = weekly || {};
+        this.weeklyPnlHasData = Object.keys(this.weeklyPnl).length > 0;
+        if (this.weeklyPnlHasData) {
+          this.$nextTick(() => this.drawChart());
+        }
+
+      } catch(e) {
+        console.error('Refresh failed:', e);
+        this.botOnline = false;
+      }
+    },
+
+    drawChart() {
+      const labels = Object.keys(this.weeklyPnl);
+      const values = Object.values(this.weeklyPnl);
+      const colors = values.map(v => v >= 0 ? 'rgba(74,222,128,0.8)' : 'rgba(248,113,113,0.8)');
+      const ctx = document.getElementById('pnlChart');
+      if (!ctx) return;
+      if (this.chart) this.chart.destroy();
+      this.chart = new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets: [{ data: values, backgroundColor: colors, borderRadius: 4 }] },
+        options: {
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#1e293b' } },
+            y: {
+              ticks: { color: '#64748b', font: { size: 11 }, callback: v => '$' + v.toFixed(0) },
+              grid: { color: '#1e293b' }
+            }
+          },
+          responsive: true, maintainAspectRatio: false,
+        }
+      });
+    },
+
+    fmt(n) { return (n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
+
+    evtLabel(e) {
+      return { TRADE_ENTERED:'IN TRADE', SETUP_DETECTED:'SETUP', EXIT_SIGNAL:'⚠️ EXIT',
+               BREAKEVEN_MOVED:'BREAKEVEN', BLOCKED:'BLOCKED', STOP_HIT:'STOP HIT',
+               KILL_SWITCH:'🛑 HALTED', SCAN_COMPLETE:'SCAN DONE' }[e] || e;
+    },
+
+    trendColor(t) {
+      return { strong_bullish:'bg-success', bullish:'bg-success/60',
+               strong_bearish:'bg-error', bearish:'bg-error/60',
+               neutral:'bg-base-content/20' }[t] || 'bg-base-content/20';
+    },
+
+    shortTrend(t) {
+      return { strong_bullish:'↑↑', bullish:'↑', neutral:'→', bearish:'↓', strong_bearish:'↓↓' }[t] || '?';
+    },
+
+    timeAgo(ts) {
+      if (!ts) return '—';
+      const diff = (Date.now() - new Date(ts).getTime()) / 1000;
+      if (diff < 60)   return Math.floor(diff) + 's ago';
+      if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+      if (diff < 86400)return Math.floor(diff/3600) + 'h ago';
+      return new Date(ts).toLocaleDateString();
+    }
+  };
+}
+</script>
+</body>
+</html>

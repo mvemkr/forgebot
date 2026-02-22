@@ -1,24 +1,41 @@
 """
 Pattern Detector
 
-Detects the three core patterns from the Set & Forget strategy:
+Detects institutional price action patterns used by smart money:
+
   1. Head & Shoulders / Inverted H&S
   2. Double Top / Double Bottom
-  3. Break & Retest (the backbone of every trade)
+  3. Break & Retest / SR Flip
+  4. Liquidity Sweep (QM / Stop Hunt / Fakeout)
+     — The core institutional play: price wicks above a swing high
+       (or below a swing low) to trigger retail stops, then reverses.
+       This is the QM pattern, Fakeout V1/V2, and stop hunt from the
+       CMS institutional price action framework.
+  5. Equal Highs / Equal Lows detection (stop pool identification)
 
-Also handles:
-  - Structure shift detection (higher high/lower low series)
-  - Trend identification across timeframes
+The institutional insight: round numbers attract retail stop orders.
+Institutions know this. They sweep those levels (trigger the stops,
+fill their own orders in the opposite direction), then move away.
+The liquidity sweep IS the entry signal — not a candle pattern to avoid.
 
-All patterns are scored by clarity (0.0–1.0).
+All patterns output a pattern_level: the structural price to validate
+against major round numbers. Patterns at round numbers = institutional.
+Patterns at random swing levels = noise.
+
 A pattern by itself is NOT an entry signal — it identifies the setup zone.
-The engulfing candle (entry_signal.py) is required to enter.
+The engulfing candle (entry_signal.py) is required to confirm entry.
 """
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from enum import Enum
+
+try:
+    from scipy.signal import find_peaks as _scipy_find_peaks
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
 
 
 class Trend(Enum):
@@ -41,6 +58,12 @@ class PatternResult:
     target_2: float          # extended target (1:4+ R:R)
     clarity: float           # 0.0–1.0 (1.0 = textbook pattern)
     notes: str = ""
+    pattern_level: float = 0.0  # the structural price to validate against round numbers:
+                                 #   double_bottom → average of the two lows (the support floor)
+                                 #   double_top    → average of the two highs (the resistance ceiling)
+                                 #   H&S / IH&S   → neckline (the level everyone is watching)
+                                 #   break_retest  → the broken level (same as neckline)
+                                 # Round-number check fires on THIS price, not on current price.
 
     @property
     def risk(self) -> float:
@@ -122,6 +145,7 @@ class PatternDetector:
     def detect_all(self, df: pd.DataFrame) -> List[PatternResult]:
         """Detect all patterns, return sorted by clarity descending."""
         results = []
+        results.extend(self._detect_liquidity_sweep(df))   # highest priority — institutional
         results.extend(self._detect_head_and_shoulders(df))
         results.extend(self._detect_double_top_bottom(df))
         results.extend(self._detect_break_retest(df))
@@ -200,6 +224,7 @@ class PatternDetector:
                 target_2=neckline - (h - neckline) * 1.5,
                 clarity=clarity,
                 notes=notes,
+                pattern_level=neckline,   # neckline is THE level everyone watches on H&S
             ))
 
         # Bullish Inverted H&S (mirror logic)
@@ -243,6 +268,7 @@ class PatternDetector:
                 target_2=neckline + abs(neckline - h) * 1.5,
                 clarity=clarity,
                 notes="Inverted H&S — bullish reversal setup",
+                pattern_level=neckline,   # neckline is THE level everyone watches on IH&S
             ))
 
         return results
@@ -296,6 +322,7 @@ class PatternDetector:
                 target_2=valley - measured_move * 1.5,
                 clarity=clarity,
                 notes=f"Double top at {top_level:.5f}",
+                pattern_level=top_level,  # the tops are what formed at the round number
             ))
 
         # Double bottom (mirror)
@@ -333,6 +360,7 @@ class PatternDetector:
                 target_2=peak + measured_move * 1.5,
                 clarity=clarity,
                 notes=f"Double bottom at {bottom_level:.5f}",
+                pattern_level=bottom_level,  # the bottoms are what formed at the round number
             ))
 
         return results
@@ -388,6 +416,7 @@ class PatternDetector:
                     target_2=current_close - consol_range * 2,
                     clarity=clarity,
                     notes=f"Break of {consol_low:.5f} — price retesting from below",
+                    pattern_level=consol_low,  # the broken level is the round number
                 ))
 
         # Bullish break: price broke above consolidation and is retesting from above
@@ -407,7 +436,178 @@ class PatternDetector:
                     target_2=current_close + consol_range * 2,
                     clarity=clarity,
                     notes=f"Break of {consol_high:.5f} — price retesting from above",
+                    pattern_level=consol_high,  # the broken level is the round number
                 ))
+
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Liquidity Sweep / QM / Stop Hunt
+    # ------------------------------------------------------------------ #
+
+    def _detect_liquidity_sweep(self, df: pd.DataFrame) -> List[PatternResult]:
+        """
+        Detect liquidity sweeps — the core institutional reversal pattern.
+
+        What this detects (from the CMS cheat sheet):
+          • QM Quick Retest / QM Late Retest
+          • Fakeout V1 (Default) / Fakeout V2 (SR Flip)
+          • Any candle that wicks beyond a swing high/low but closes back inside
+
+        The institutional mechanism:
+          1. Retail traders place stops just beyond swing highs/lows
+          2. Institutions push price past that level (triggers stops → fills their orders)
+          3. Price snaps back — the stop hunt candle CLOSES back inside
+          4. If that swept level is at a round number → institutions were defending it
+
+        Entry logic:
+          Bearish: wick above swing high (close back below) → sell the reversal
+          Bullish: wick below swing low (close back above) → buy the reversal
+
+        pattern_level = the swept swing high/low
+          → validated against round numbers in set_and_forget.py
+        """
+        results = []
+        if len(df) < self.min_bars:
+            return results
+
+        highs  = df['high'].values
+        lows   = df['low'].values
+        opens  = df['open'].values
+        closes = df['close'].values
+        n = len(df)
+
+        # Find swing points in the historical data (not including the sweep candle itself)
+        swing_h_idx = self._find_swing_indices(highs, 'high')
+        swing_l_idx = self._find_swing_indices(lows,  'low')
+
+        # Scan the last 20 candles for sweeps
+        scan_start = max(self.swing_window + 1, n - 20)
+
+        for i in range(scan_start, n):
+            bar_high  = highs[i]
+            bar_low   = lows[i]
+            bar_open  = opens[i]
+            bar_close = closes[i]
+            bar_range = bar_high - bar_low
+            if bar_range == 0:
+                continue
+
+            # ── Bearish sweep: wick above swing high, close back below ──────
+            for sh_idx in reversed(swing_h_idx):
+                if sh_idx >= i:
+                    continue
+                if i - sh_idx > 35:
+                    break   # swing too old
+
+                swing_high = highs[sh_idx]
+
+                # Must wick above and CLOSE back below
+                if not (bar_high > swing_high and bar_close < swing_high):
+                    continue
+
+                wick_above = bar_high - swing_high
+                sweep_ratio = wick_above / bar_range
+
+                # High-quality sweep: wick must be ≥50% of candle range.
+                # This filters out noise — we want a DECISIVE rejection candle,
+                # not a small doji that happened to poke above a level.
+                # Alex is watching for the big stop hunt candle, not micro wicks.
+                if sweep_ratio < 0.50:
+                    continue
+
+                # Bearish close is ideal (candle turned back down)
+                bearish_body = bar_close < bar_open
+
+                # Clarity: how decisive the rejection was
+                body_size = abs(bar_close - bar_open)
+                body_ratio = body_size / bar_range
+                clarity = min(1.0,
+                    0.40 * sweep_ratio           # how far above it swept
+                  + 0.40 * body_ratio            # how strong the close-back was
+                  + (0.20 if bearish_body else 0)
+                )
+                if clarity < self.min_bars / 100:
+                    clarity = max(0.30, clarity)
+
+                # Stop: above the sweep wick
+                stop = bar_high * (1 + self.tol * 2)
+
+                # Target: measured from sweep high, minimum 3R
+                sweep_height = bar_high - swing_high
+                target_dist  = max(sweep_height * 3, swing_high - bar_close)
+
+                results.append(PatternResult(
+                    pattern_type  = 'liquidity_sweep_bearish',
+                    direction     = 'bearish',
+                    neckline      = swing_high,
+                    entry_zone_low  = bar_close * (1 - self.tol),
+                    entry_zone_high = swing_high,
+                    stop_loss     = stop,
+                    target_1      = swing_high - target_dist,
+                    target_2      = swing_high - target_dist * 1.5,
+                    clarity       = clarity,
+                    notes         = (
+                        f"Bearish sweep above {swing_high:.5f} — "
+                        f"wick {wick_above / 0.0001:.0f}p, closed back at {bar_close:.5f}. "
+                        f"Retail stops triggered. Institutional supply."
+                    ),
+                    pattern_level = swing_high,   # this is the round number to validate
+                ))
+                break   # one sweep per scan candle is enough
+
+            # ── Bullish sweep: wick below swing low, close back above ────────
+            for sl_idx in reversed(swing_l_idx):
+                if sl_idx >= i:
+                    continue
+                if i - sl_idx > 35:
+                    break
+
+                swing_low = lows[sl_idx]
+
+                if not (bar_low < swing_low and bar_close > swing_low):
+                    continue
+
+                wick_below = swing_low - bar_low
+                sweep_ratio = wick_below / bar_range
+
+                # Same quality filter — wick must be dominant (≥50% of bar range)
+                if sweep_ratio < 0.50:
+                    continue
+
+                bullish_body = bar_close > bar_open
+
+                body_size  = abs(bar_close - bar_open)
+                body_ratio = body_size / bar_range
+                clarity = min(1.0,
+                    0.40 * sweep_ratio
+                  + 0.40 * body_ratio
+                  + (0.20 if bullish_body else 0)
+                )
+                clarity = max(0.30, clarity)
+
+                stop = bar_low * (1 - self.tol * 2)
+                sweep_height = swing_low - bar_low
+                target_dist  = max(sweep_height * 3, bar_close - swing_low)
+
+                results.append(PatternResult(
+                    pattern_type  = 'liquidity_sweep_bullish',
+                    direction     = 'bullish',
+                    neckline      = swing_low,
+                    entry_zone_low  = swing_low,
+                    entry_zone_high = bar_close * (1 + self.tol),
+                    stop_loss     = stop,
+                    target_1      = swing_low + target_dist,
+                    target_2      = swing_low + target_dist * 1.5,
+                    clarity       = clarity,
+                    notes         = (
+                        f"Bullish sweep below {swing_low:.5f} — "
+                        f"wick {wick_below / 0.0001:.0f}p, closed back at {bar_close:.5f}. "
+                        f"Retail stops triggered. Institutional demand."
+                    ),
+                    pattern_level = swing_low,
+                ))
+                break
 
         return results
 
@@ -416,17 +616,21 @@ class PatternDetector:
     # ------------------------------------------------------------------ #
 
     def _find_swings(self, values: np.ndarray, kind: str) -> List[float]:
-        n = self.swing_window
-        swings = []
-        for i in range(n, len(values) - n):
-            window = values[i-n:i+n+1]
-            if kind == 'high' and values[i] == max(window):
-                swings.append(values[i])
-            elif kind == 'low' and values[i] == min(window):
-                swings.append(values[i])
-        return swings
+        return [values[i] for i in self._find_swing_indices(values, kind)]
 
     def _find_swing_indices(self, values: np.ndarray, kind: str) -> List[int]:
+        """
+        Find swing high/low indices using fixed sliding window.
+
+        Simple and reliable: a swing high is the highest value in a ±swing_window
+        bar window. Produces clean, predictable pattern detection without the
+        noise amplification that scipy prominence can introduce during volatile
+        market periods (elections, major news events).
+
+        scipy prominence is architecturally superior but requires volatility
+        regime detection to avoid finding patterns in every choppy period.
+        Keeping the controlled version until we add volatility regime filtering.
+        """
         n = self.swing_window
         idxs = []
         for i in range(n, len(values) - n):
