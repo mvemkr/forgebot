@@ -61,7 +61,7 @@ MAX_CONCURRENT_TRADES: int = 2
 #
 # Rule: winner running → no new entries. Full stop.
 # No exceptions for high-confidence setups — the whole point is simplicity.
-BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = True
+BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = False
 
 # Unrealized-R threshold that defines a "winner running."
 # A position must be THIS many R's in profit RIGHT NOW (at current price)
