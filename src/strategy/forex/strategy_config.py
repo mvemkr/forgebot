@@ -45,62 +45,62 @@ ATR_LOOKBACK: int = 14
 # Macro theme stacking bypasses this — 4 JPY shorts = 1 theme = allowed.
 MAX_CONCURRENT_TRADES: int = 2
 
-# ── Progressive confluence gate ────────────────────────────────────────────
-# The bar to enter a second concurrent trade is higher than the first.
-# Rationale: you're already deployed — the second trade has to EARN its way in.
-# Alex was very selective about adding positions while already in a trade.
+# ── Winner rule ("don't compete with your winner") ────────────────────────
+# When an open position is past breakeven (≥1R in profit), block all new entries.
 #
-# Trade 1: standard MIN_CONFIDENCE (65%) — any qualifying setup
-# Trade 2: SECOND_TRADE_MIN_CONFIDENCE (75%) + structural pattern only
-#          Break-retests are mid-trend entries that don't carry enough
-#          reversal evidence to justify opening alongside an existing position.
-#          H&S, double top/bottom, IH&S required — clear pattern structure.
+# Rationale: Alex's behaviour — once a trade is running and safe (stop at BE),
+# he's not opening new positions. Every second-trade loss in the Jan 2026
+# backtest happened while NZD/CAD was already past breakeven and running.
+# The progressive confluence gate raised the confidence bar but didn't ask
+# the right question: SHOULD we even be adding a position right now?
 #
-# Future: Trade 3+ (stacking) — 85% + confirmed macro theme score ≥ 6.0.
-#         Not implemented yet — requires theme carve-out in currency overlap check.
-SECOND_TRADE_MIN_CONFIDENCE: float = 0.75
-SECOND_TRADE_STRUCTURAL_ONLY: bool = True   # break-retests blocked as 2nd entry
+# "Winner" definition: any open position whose stop has been moved to breakeven.
+# In the backtester: pos["be_moved"] == True
+# In the live bot:   pos["stop"] == pos["entry"]
+# Both conditions mean exactly the same thing — price traveled ≥1R in our favor.
+#
+# Rule: winner running → no new entries. Full stop.
+# No exceptions for high-confidence setups — the whole point is simplicity.
+BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = True
+
+# Unrealized-R threshold that defines a "winner running."
+# A position must be THIS many R's in profit RIGHT NOW (at current price)
+# to trigger the winner rule and block new entries.
+#
+# Why not use be_moved (stop at breakeven)?
+# be_moved fires at 1R then stays True even if price drifts back to entry
+# and the position sits there for months making $0 unrealized.
+# A position coasting at 0R unrealized is NOT a winner — it's a free trade.
+# A position actively up 2R right now IS a winner worth protecting.
+#
+# 2.0R means: risk $800, position must be up $1,600+ unrealized to block new entries.
+WINNER_THRESHOLD_R: float = 2.0
 
 
-def progressive_confluence_check(
+def winner_rule_check(
     n_open: int,
-    confidence: float,
-    pattern_type: str,
+    max_unrealized_r: float,
 ) -> tuple:
     """
-    Progressive gate for concurrent positions.
+    "Don't compete with your winner" gate.
     Returns (blocked: bool, reason: str).
 
     Called by both the backtester and the live orchestrator — same logic,
-    same thresholds. Constants defined above; change them once, both inherit.
+    same threshold. Constants defined above; change them once, both inherit.
 
-    n_open       : number of currently open positions BEFORE this entry
-    confidence   : signal confidence from strategy.evaluate()
-    pattern_type : pattern type string from PatternResult
+    n_open           : number of currently open positions BEFORE this entry
+    max_unrealized_r : highest current unrealized R across all open positions
+                       (computed from live price vs entry/stop, NOT be_moved flag)
     """
-    if n_open == 0:
-        return False, ""   # first trade — standard MIN_CONFIDENCE gate handles it
+    if n_open == 0 or not BLOCK_ENTRY_WHILE_WINNER_RUNNING:
+        return False, ""
 
-    if n_open >= 1:
-        # ── Second trade: higher confidence required ───────────────────
-        if confidence < SECOND_TRADE_MIN_CONFIDENCE:
-            return True, (
-                f"progressive_confluence: 2nd trade requires "
-                f"{SECOND_TRADE_MIN_CONFIDENCE:.0%} confidence "
-                f"(got {confidence:.0%}). Bar rises when already in a position."
-            )
-        # ── Second trade: structural pattern required ──────────────────
-        if SECOND_TRADE_STRUCTURAL_ONLY:
-            _structural = (
-                "head_and_shoulders", "double_top",
-                "double_bottom", "inverted_head_and_shoulders",
-            )
-            if not any(k in pattern_type for k in _structural):
-                return True, (
-                    f"progressive_confluence: 2nd trade requires structural pattern "
-                    f"(H&S / DT / DB / IH&S). Got '{pattern_type}' — "
-                    f"break-retest lacks reversal evidence needed alongside open position."
-                )
+    if max_unrealized_r >= WINNER_THRESHOLD_R:
+        return True, (
+            f"winner_rule: open position at {max_unrealized_r:.1f}R unrealized — "
+            f"don't compete with your winner (threshold={WINNER_THRESHOLD_R:.1f}R). "
+            f"Let it run uncontested."
+        )
 
     return False, ""
 

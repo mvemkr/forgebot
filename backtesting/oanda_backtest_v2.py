@@ -58,7 +58,7 @@ from src.strategy.forex.strategy_config import (
     LONDON_SESSION_START_UTC,
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
-    progressive_confluence_check,
+    winner_rule_check,
     NECKLINE_CLUSTER_PCT,
     DRY_RUN_PAPER_BALANCE,
 )
@@ -516,6 +516,30 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         # Macro theme: computed once per calendar day (daily data doesn't change intraday)
         active_theme = _get_theme(ts)
 
+        # ── Max unrealized R across all open positions (for winner rule) ──
+        # Computed once per bar using current 1H close — NOT the be_moved flag.
+        # be_moved is set at 1R and stays True forever even if price drifts back
+        # to entry. We want "actively up X R right now", not "was once at 1R".
+        _max_open_r = 0.0
+        for _wp, _wpos in open_pos.items():
+            if _wp not in candle_data:
+                continue
+            _wdf = candle_data[_wp]["1h"]
+            if ts not in _wdf.index:
+                continue
+            _wclose    = float(_wdf.loc[ts]["close"])
+            _wentry    = _wpos["entry_price"]
+            _wstop     = _wpos["stop_loss"]
+            _wrisk     = abs(_wentry - _wstop)
+            if _wrisk == 0:
+                continue
+            if _wpos["direction"] == "long":
+                _wr = (_wclose - _wentry) / _wrisk
+            else:
+                _wr = (_wentry - _wclose) / _wrisk
+            if _wr > _max_open_r:
+                _max_open_r = _wr
+
         for pair, pdata in candle_data.items():
             if pair in open_pos:
                 continue   # already in this pair
@@ -620,21 +644,19 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                         f"entry={decision.entry_price:.5f}  reason={decision.reason[:60]}")
                 continue  # skip silently (high-frequency; print only on debug)
 
-            # ── Progressive confluence gate ───────────────────────────
-            # Second trade must clear a higher bar: 75%+ confidence,
-            # structural pattern required (no break-retests as 2nd entry).
+            # ── Winner rule: don't compete with your winner ───────────
+            # Block new entries only when an open position is genuinely
+            # WINNING right now (≥WINNER_THRESHOLD_R unrealized at current
+            # price). Computed from _max_open_r above — live price check,
+            # not the be_moved flag (which stays True after price drifts back).
             if decision.decision == Decision.ENTER:
-                pattern_type = (
-                    decision.pattern.pattern_type if decision.pattern else ""
-                )
-                prog_blocked, prog_reason = progressive_confluence_check(
+                win_blocked, win_reason = winner_rule_check(
                     n_open=len(open_pos),
-                    confidence=decision.confidence,
-                    pattern_type=pattern_type,
+                    max_unrealized_r=_max_open_r,
                 )
-                if prog_blocked:
+                if win_blocked:
                     log_gap(ts_utc, pair, "ENTER", "BLOCKED",
-                            "progressive_confluence", prog_reason)
+                            "winner_rule", win_reason)
                     continue
 
             # ── Stop-distance guard ───────────────────────────────────

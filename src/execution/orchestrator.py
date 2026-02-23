@@ -75,7 +75,7 @@ WATCHLIST = [
 # To change any threshold, edit strategy_config.py. Never hardcode here.
 from ..strategy.forex.strategy_config import (
     MIN_CONFIDENCE,
-    SECOND_TRADE_MIN_CONFIDENCE,
+    BLOCK_ENTRY_WHILE_WINNER_RUNNING,
     ATR_STOP_MULTIPLIER,
     ATR_MIN_MULTIPLIER,
     ATR_LOOKBACK,
@@ -84,7 +84,7 @@ from ..strategy.forex.strategy_config import (
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
     DRY_RUN_PAPER_BALANCE,
-    progressive_confluence_check,
+    winner_rule_check,
 )
 
 
@@ -470,7 +470,9 @@ class ForexOrchestrator:
         news_ok      = "news_blackout" not in ff
         conf_val     = decision.confidence
         n_open       = len(self.strategy.open_positions)
-        conf_req     = SECOND_TRADE_MIN_CONFIDENCE if n_open >= 1 else MIN_CONFIDENCE
+        # Winner rule: confidence bar doesn't rise for 2nd trade — it's a
+        # binary block (winner running = door closed entirely, not higher bar).
+        conf_req     = MIN_CONFIDENCE
         conf_ok      = conf_val >= conf_req
 
         # ── Derive "waiting for" — ordered by what needs to happen first
@@ -493,8 +495,8 @@ class ForexOrchestrator:
             waiting.append("Open position to close first")
         if "currency_overlap" in ff:
             waiting.append("Currency exposure to free up")
-        if "progressive_confluence" in ff:
-            waiting.append("Higher confluence for 2nd trade")
+        if "winner_rule" in ff:
+            waiting.append("Winner running — door closed until it stops")
         if not waiting and decision.decision.value == "ENTER":
             waiting.append("Nothing — ready to enter")
         elif not waiting:
@@ -562,19 +564,39 @@ class ForexOrchestrator:
                 )
                 return
 
-            # ── Progressive confluence gate ───────────────────────────────
-            # Second trade must clear a higher bar: 75%+ confidence,
-            # structural pattern only (no break-retests alongside open position).
-            pattern_type = (
-                decision.pattern.pattern_type if decision.pattern else ""
-            )
-            prog_blocked, prog_reason = progressive_confluence_check(
+            # ── Winner rule: don't compete with your winner ───────────────
+            # Block new entries only when any open position is ACTIVELY up
+            # ≥WINNER_THRESHOLD_R in unrealized profit at current price.
+            # Uses live price fetch — NOT the be_moved flag (which stays True
+            # even after price drifts back to entry and sits there for months).
+            _max_open_r = 0.0
+            for _open_pair, _open_pos in self.strategy.open_positions.items():
+                _open_entry = _open_pos.get("entry", 0)
+                _open_stop  = _open_pos.get("stop", 0)
+                _open_dir   = _open_pos.get("direction", "long")
+                _open_risk  = abs(_open_entry - _open_stop)
+                if _open_risk == 0:
+                    continue
+                # Reuse already-fetched df_1h for same pair; otherwise fetch
+                if _open_pair == pair:
+                    _open_price = float(df_1h["close"].iloc[-1])
+                else:
+                    _open_df = self._fetch_oanda_candles(_open_pair, "H1", count=2)
+                    if _open_df is None or len(_open_df) == 0:
+                        continue
+                    _open_price = float(_open_df["close"].iloc[-1])
+                _wr = ((_open_price - _open_entry) / _open_risk
+                       if _open_dir == "long"
+                       else (_open_entry - _open_price) / _open_risk)
+                if _wr > _max_open_r:
+                    _max_open_r = _wr
+
+            win_blocked, win_reason = winner_rule_check(
                 n_open=len(self.strategy.open_positions),
-                confidence=decision.confidence,
-                pattern_type=pattern_type,
+                max_unrealized_r=_max_open_r,
             )
-            if prog_blocked:
-                logger.info(f"⚠ {pair}: ENTER BLOCKED — {prog_reason}")
+            if win_blocked:
+                logger.info(f"⚠ {pair}: ENTER BLOCKED — {win_reason}")
                 return
 
             # ── Session gate — only auto-execute during London session ────
