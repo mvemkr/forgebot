@@ -376,7 +376,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             return True
         dist = abs(entry - stop)
         max_dist = atr * ATR_STOP_MULTIPLIER
-        min_dist = atr * 0.15
+        min_dist = atr * ATR_MIN_MULTIPLIER
         return min_dist <= dist <= max_dist
 
     def _currencies_in_use():
@@ -619,20 +619,24 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                         f"entry={decision.entry_price:.5f}  reason={decision.reason[:60]}")
                 continue  # skip silently (high-frequency; print only on debug)
 
-            # ── Stop-distance guard (log wide-stop rejections) ────────
+            # ── Stop-distance guard ───────────────────────────────────
             if (decision.decision == Decision.ENTER
                     and decision.entry_price and decision.stop_loss
                     and not _stop_ok(pair, decision.entry_price, decision.stop_loss)):
-                atr = _daily_atr(pair)
+                atr  = _daily_atr(pair)
                 dist = abs(decision.entry_price - decision.stop_loss)
                 pip  = 0.01 if "JPY" in pair else 0.0001
-                log_gap(ts_utc, pair, "ENTER", "BLOCKED",
-                        "stop_too_wide",
-                        f"Stop {dist/pip:.0f}p > {ATR_STOP_MULTIPLIER}×ATR({atr/pip:.0f}p) [max={atr*ATR_STOP_MULTIPLIER/pip:.0f}p]  "
-                        f"entry={decision.entry_price:.5f}  sl={decision.stop_loss:.5f}")
-                print(f"  ⚠ {ts_utc.strftime('%Y-%m-%d %H:%M')} "
-                      f"| SKIP {pair} — stop too wide: {dist/pip:.0f}p > max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p ({ATR_STOP_MULTIPLIER:.0f}×ATR)  "
-                      f"sl={decision.stop_loss:.5f}")
+                too_wide  = atr is not None and dist > atr * ATR_STOP_MULTIPLIER
+                gap_type  = "stop_too_wide" if too_wide else "stop_too_tight"
+                if too_wide:
+                    msg = (f"Stop too wide: {dist/pip:.0f}p > max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p "
+                           f"({ATR_STOP_MULTIPLIER:.0f}×ATR={atr/pip:.0f}p)")
+                else:
+                    msg = (f"Stop too tight: {dist/pip:.0f}p < min {atr*ATR_MIN_MULTIPLIER/pip:.0f}p "
+                           f"({ATR_MIN_MULTIPLIER:.2f}×ATR={atr/pip:.0f}p) — micro-stop, noise will hit it")
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", gap_type,
+                        f"{msg}  entry={decision.entry_price:.5f}  sl={decision.stop_loss:.5f}")
+                print(f"  ⚠ {ts_utc.strftime('%Y-%m-%d %H:%M')} | SKIP {pair} — {msg}  sl={decision.stop_loss:.5f}")
                 continue
 
             # ── Execute entry ─────────────────────────────────────────

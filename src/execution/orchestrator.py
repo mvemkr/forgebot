@@ -460,6 +460,34 @@ class ForexOrchestrator:
                 )
                 return
 
+            # ── ATR stop check (matches backtester _stop_ok logic) ────────
+            # Stop must be ≤ ATR_STOP_MULTIPLIER × ATR (rejects ancient levels)
+            # Stop must be ≥ ATR_MIN_MULTIPLIER × ATR (rejects micro-stop noise)
+            if decision.entry_price and decision.stop_loss and len(df_d) >= ATR_LOOKBACK + 1:
+                import numpy as np
+                recent   = df_d.tail(ATR_LOOKBACK + 1)
+                hl       = (recent["high"] - recent["low"]).values
+                hc       = np.abs(recent["high"].values[1:] - recent["close"].values[:-1])
+                lc       = np.abs(recent["low"].values[1:]  - recent["close"].values[:-1])
+                tr       = np.maximum(hl[1:], np.maximum(hc, lc))
+                atr      = float(np.mean(tr))
+                dist     = abs(decision.entry_price - decision.stop_loss)
+                pip      = 0.01 if "JPY" in pair else 0.0001
+                if dist > atr * ATR_STOP_MULTIPLIER:
+                    logger.info(
+                        f"⚠ {pair}: ENTER BLOCKED — stop too wide: "
+                        f"{dist/pip:.0f}p > max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p "
+                        f"({ATR_STOP_MULTIPLIER:.0f}×ATR)"
+                    )
+                    return
+                if dist < atr * ATR_MIN_MULTIPLIER:
+                    logger.info(
+                        f"⚠ {pair}: ENTER BLOCKED — stop too tight: "
+                        f"{dist/pip:.0f}p < min {atr*ATR_MIN_MULTIPLIER/pip:.0f}p "
+                        f"({ATR_MIN_MULTIPLIER:.2f}×ATR) — micro-stop, daily noise will hit it"
+                    )
+                    return
+
             logger.info(f"🎯 {pair}: ENTER signal! overnight={overnight} conf={decision.confidence:.0%}")
             result = self.executor.execute(decision, self.account_balance)
 
