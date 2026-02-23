@@ -70,16 +70,20 @@ WATCHLIST = [
     "AUD/USD", "NZD/JPY",
 ]
 
-# London session in UTC (3AM–8AM ET = 08:00–13:00 UTC)
-LONDON_SESSION_START_UTC = 8
-LONDON_SESSION_END_UTC   = 13
-
-# Minimum confidence to execute a trade (matches backtester threshold)
-MIN_CONFIDENCE = 0.65
-
-# Paper trading balance used in dry_run when OANDA account is unfunded ($0)
-# Ensures kill-switch math and risk sizing work correctly without real capital.
-DRY_RUN_PAPER_BALANCE = 8000.0
+# ── Shared execution config (single source of truth) ─────────────────────────
+# Imported from strategy_config — same values used by the backtester.
+# To change any threshold, edit strategy_config.py. Never hardcode here.
+from ..strategy.forex.strategy_config import (
+    MIN_CONFIDENCE,
+    ATR_STOP_MULTIPLIER,
+    ATR_MIN_MULTIPLIER,
+    ATR_LOOKBACK,
+    MAX_CONCURRENT_TRADES,
+    LONDON_SESSION_START_UTC,
+    LONDON_SESSION_END_UTC,
+    STOP_COOLDOWN_DAYS,
+    DRY_RUN_PAPER_BALANCE,
+)
 
 
 class ForexOrchestrator:

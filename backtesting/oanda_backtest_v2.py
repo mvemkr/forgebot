@@ -45,7 +45,24 @@ from src.execution.risk_manager_forex    import ForexRiskManager
 from src.execution.trade_journal         import TradeJournal
 from src.strategy.forex.currency_strength import CurrencyStrengthAnalyzer, CurrencyTheme, STACK_MAX
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Shared execution config (single source of truth) ─────────────────────────
+# These constants are also used by the live orchestrator. Change them here,
+# they apply everywhere. Do NOT hardcode these values anywhere else.
+from src.strategy.forex.strategy_config import (
+    MIN_CONFIDENCE,
+    MIN_RR,
+    ATR_STOP_MULTIPLIER,
+    ATR_MIN_MULTIPLIER,
+    ATR_LOOKBACK,
+    MAX_CONCURRENT_TRADES,
+    LONDON_SESSION_START_UTC,
+    LONDON_SESSION_END_UTC,
+    STOP_COOLDOWN_DAYS,
+    NECKLINE_CLUSTER_PCT,
+    DRY_RUN_PAPER_BALANCE,
+)
+
+# ── Backtest-only config ──────────────────────────────────────────────────────
 BACKTEST_START  = datetime(2025, 7, 1, tzinfo=timezone.utc)   # ~7 months of history
 STARTING_BAL    = 8_000.0
 MAX_HOLD_BARS   = 365 * 24         # effectively no cap — strategy has no TP or hold limit
@@ -64,13 +81,6 @@ WATCHLIST = [
     # Commodity crosses (no USD/GBP/JPY/CHF — survive most lockout scenarios)
     "AUD/CAD", "AUD/NZD", "NZD/CAD", "NZD/JPY",
 ]
-
-# ── Trade eligibility limits ───────────────────────────────────────────────────
-MAX_CONCURRENT_TRADES = 2        # hard cap — same as live risk manager
-ATR_STOP_MULTIPLIER   = 8.0      # stop must be ≤ 8×daily-ATR — raised from 5x to allow wider structural stops
-                                  # Alex's USD/CHF trade had a 265-391 pip stop vs 52-pip ATR (5-7.5x) — was blocked at 5x
-ATR_LOOKBACK          = 14       # days for ATR calculation
-MIN_CONFIDENCE        = 0.65     # minimum signal confidence — filters marginal setups
 
 # ── Disable-news-filter sentinel ──────────────────────────────────────────────
 class _NoOpNewsFilter(NewsFilter):
@@ -355,14 +365,18 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         """
         Return True if stop distance is within acceptable ATR range.
         Max: ≤ ATR_STOP_MULTIPLIER × 14-day ATR (rejects ancient structural stops)
-        Min: ≥ 0.75 × 14-day ATR (rejects 4H stops too tight for daily noise)
+        Min: ≥ 0.15 × 14-day ATR — lowered from 0.75 to allow Alex's 4H H&S stops.
+             Original 0.75× was blocking valid 87-307 pip stops on 200-pip-ATR pairs.
+             0.15× still blocks sub-20-pip micro-stops (noise entries) while
+             allowing any stop that genuinely places behind a pattern extreme.
+             Example: GBP/JPY ATR=214p → min=32p; passes 87p+ H&S stops.
         """
         atr = _daily_atr(pair)
         if atr is None:
             return True
         dist = abs(entry - stop)
         max_dist = atr * ATR_STOP_MULTIPLIER
-        min_dist = atr * 0.75   # must survive at least 75% of a typical daily range
+        min_dist = atr * 0.15
         return min_dist <= dist <= max_dist
 
     def _currencies_in_use():
@@ -614,10 +628,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 pip  = 0.01 if "JPY" in pair else 0.0001
                 log_gap(ts_utc, pair, "ENTER", "BLOCKED",
                         "stop_too_wide",
-                        f"Stop {dist/pip:.0f}p > {ATR_STOP_MULTIPLIER}×ATR({atr/pip:.0f}p)  "
+                        f"Stop {dist/pip:.0f}p > {ATR_STOP_MULTIPLIER}×ATR({atr/pip:.0f}p) [max={atr*ATR_STOP_MULTIPLIER/pip:.0f}p]  "
                         f"entry={decision.entry_price:.5f}  sl={decision.stop_loss:.5f}")
                 print(f"  ⚠ {ts_utc.strftime('%Y-%m-%d %H:%M')} "
-                      f"| SKIP {pair} — stop {dist/pip:.0f}p > {ATR_STOP_MULTIPLIER:.0f}×ATR({atr/pip:.0f}p)  "
+                      f"| SKIP {pair} — stop too wide: {dist/pip:.0f}p > max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p ({ATR_STOP_MULTIPLIER:.0f}×ATR)  "
                       f"sl={decision.stop_loss:.5f}")
                 continue
 
