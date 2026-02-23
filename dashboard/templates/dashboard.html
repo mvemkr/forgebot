@@ -268,6 +268,100 @@
     </div>
   </div>
 
+  <!-- ── CONFLUENCE RADAR ──────────────────────────────── -->
+  <div class="col-span-12" x-show="confluence.length > 0">
+    <div class="card bg-base-200 border border-info/30">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold uppercase tracking-widest text-base-content/60 mb-4">
+          <i class="ph ph-radar text-info"></i> Confluence Radar — What's it waiting for?
+        </h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          <template x-for="c in confluence" :key="c.pair">
+            <div class="rounded-xl border p-4 pair-card" :class="{
+              'border-success/40 bg-success/5':  c.decision === 'ENTER',
+              'border-warning/30 bg-warning/5':  c.decision === 'WAIT' && c.confidence >= 0.60,
+              'border-base-300 bg-base-300/30':  c.decision === 'NO_TRADE' || c.confidence < 0.60
+            }">
+
+              <!-- Header row -->
+              <div class="flex justify-between items-center mb-3">
+                <div class="flex items-center gap-2">
+                  <span class="font-bold text-sm" x-text="c.pair"></span>
+                  <span x-show="c.direction" class="badge badge-xs"
+                        :class="c.direction==='long'?'badge-success':'badge-error'"
+                        x-text="(c.direction||'').toUpperCase()"></span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <span class="text-xs font-mono font-bold"
+                        :class="c.confidence >= c.conf_required ? 'text-success' : 'text-warning'"
+                        x-text="Math.round(c.confidence*100)+'%'"></span>
+                  <span class="badge badge-xs" :class="{
+                    'badge-success': c.decision==='ENTER',
+                    'badge-warning': c.decision==='WAIT',
+                    'badge-ghost':   c.decision==='NO_TRADE'
+                  }" x-text="c.decision"></span>
+                </div>
+              </div>
+
+              <!-- Pattern + level -->
+              <div class="text-xs opacity-60 mb-3 space-y-1">
+                <div x-show="c.pattern">
+                  📐 <span class="font-mono" x-text="(c.pattern||'').replace(/_/g,' ')"></span>
+                  <span x-show="c.pattern_clarity" class="opacity-40" x-text="' · ' + Math.round((c.pattern_clarity||0)*100)+'% clarity'"></span>
+                </div>
+                <div x-show="c.level_price">
+                  🎯 Level <span class="font-mono" x-text="(c.level_price||0).toFixed(5)"></span>
+                  <span class="opacity-40" x-text="' score=' + (c.level_score||'?')"></span>
+                </div>
+                <div x-show="c.macro_theme">
+                  🌊 Theme: <span class="font-mono" x-text="(c.macro_theme||'').replace('_',' ')"></span>
+                </div>
+              </div>
+
+              <!-- Confluence checklist -->
+              <div class="grid grid-cols-2 gap-x-3 gap-y-1 mb-3">
+                <template x-for="[key, label] in [
+                  ['pattern',      'Pattern'],
+                  ['key_level',    'Key Level'],
+                  ['trend',        'Trend Align'],
+                  ['confidence',   'Confidence'],
+                  ['entry_signal', 'Entry Signal'],
+                  ['session',      'Session'],
+                  ['news',         'No News Block']
+                ]" :key="key">
+                  <div class="flex items-center gap-1 text-xs">
+                    <span x-text="(c.checks||{})[key] ? '✅' : (key==='entry_signal' ? '⏳' : '❌')"></span>
+                    <span :class="(c.checks||{})[key] ? 'opacity-60' : 'opacity-90 font-medium'"
+                          x-text="label"></span>
+                  </div>
+                </template>
+              </div>
+
+              <!-- Trend dots -->
+              <div class="flex gap-1 items-center mb-3">
+                <span class="text-xs opacity-40 mr-1">Trends:</span>
+                <span class="trend-dot" :class="trendColor(c.trend_weekly)"></span>
+                <span class="trend-dot" :class="trendColor(c.trend_daily)"></span>
+                <span class="trend-dot" :class="trendColor(c.trend_4h)"></span>
+                <span class="text-xs opacity-40 ml-1"
+                      x-text="'W:'+shortTrend(c.trend_weekly)+' D:'+shortTrend(c.trend_daily)+' 4H:'+shortTrend(c.trend_4h)">
+                </span>
+              </div>
+
+              <!-- Waiting for -->
+              <div class="text-xs" x-show="c.waiting_for && c.waiting_for.length > 0">
+                <span class="opacity-40">Waiting for: </span>
+                <span class="text-warning font-medium" x-text="(c.waiting_for||[]).join(' · ')"></span>
+              </div>
+
+              <div class="text-xs opacity-30 mt-2" x-text="timeAgo(c.timestamp)"></div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── RECENT DECISIONS FEED ─────────────────────────── -->
   <div class="col-span-12 lg:col-span-6">
     <div class="card bg-base-200 border border-base-300 h-full">
@@ -401,7 +495,7 @@ function dashboard() {
   return {
     state: {}, acct: {}, stats: {}, openTrades: [],
     pairAnalysis: [], recentDecisions: [], recentTrades: [],
-    topSetups: [], weeklyPnl: {}, weeklyPnlHasData: false,
+    topSetups: [], confluence: [], weeklyPnl: {}, weeklyPnlHasData: false,
     botOnline: false, lastSeen: '—', refreshIn: REFRESH_SECS,
     progressPct: 100, chart: null,
     newsEvents: [],
@@ -449,6 +543,7 @@ function dashboard() {
         this.recentDecisions = status.recent_decisions || [];
         this.recentTrades  = (status.recent_trades || []).slice().reverse();
         this.topSetups     = status.top_setups || [];
+        this.confluence    = status.confluence  || [];
 
         // Bot online check
         const ts = this.state.timestamp;

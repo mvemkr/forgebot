@@ -53,6 +53,7 @@ class BotState:
         top_setups: List = None,
         watching: List = None,
         stats: Dict = None,
+        confluence_state: Dict = None,
         mode: str = "running",
     ):
         state = {
@@ -69,6 +70,7 @@ class BotState:
             "watching": watching or [],
             "last_scan_time": last_scan_time,
             "stats": stats or {},
+            "confluence_state": confluence_state or {},
             "recent_decisions": recent_decisions[-20:],  # last 20 decisions
         }
         self._state = state

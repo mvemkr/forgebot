@@ -75,6 +75,7 @@ WATCHLIST = [
 # To change any threshold, edit strategy_config.py. Never hardcode here.
 from ..strategy.forex.strategy_config import (
     MIN_CONFIDENCE,
+    SECOND_TRADE_MIN_CONFIDENCE,
     ATR_STOP_MULTIPLIER,
     ATR_MIN_MULTIPLIER,
     ATR_LOOKBACK,
@@ -175,6 +176,10 @@ class ForexOrchestrator:
         self._last_regroup_obs:    Optional[datetime] = None
         self._last_monthly_report: Optional[datetime] = None
         self._prev_mode:           Optional[str]      = None
+
+        # Per-pair confluence state — written every scan, read by dashboard.
+        # Shows what each pair is waiting for before the bot will enter.
+        self._confluence_state:    Dict[str, dict]   = {}
 
         # ── Crash recovery — restore full state from last save ───────────
         # Reconciles saved state with OANDA live data:
@@ -447,6 +452,83 @@ class ForexOrchestrator:
             logger.warning(f"Macro theme detection failed: {e}")
             return None
 
+    def _capture_confluence(self, pair: str, decision, macro_theme) -> None:
+        """
+        Build a structured confluence snapshot for one pair and store it.
+        The dashboard reads this to show what the bot is waiting for.
+        Called after every strategy.evaluate() — ENTER, WAIT, or NO_TRADE.
+        """
+        from datetime import datetime, timezone
+        ff = set(decision.failed_filters or [])
+
+        # ── Derive each check ─────────────────────────────────────────
+        has_pattern  = decision.pattern is not None
+        has_level    = decision.nearest_level is not None
+        trend_ok     = "trend_alignment" not in ff
+        has_signal   = decision.entry_signal is not None
+        session_ok   = "session" not in ff
+        news_ok      = "news_blackout" not in ff
+        conf_val     = decision.confidence
+        n_open       = len(self.strategy.open_positions)
+        conf_req     = SECOND_TRADE_MIN_CONFIDENCE if n_open >= 1 else MIN_CONFIDENCE
+        conf_ok      = conf_val >= conf_req
+
+        # ── Derive "waiting for" — ordered by what needs to happen first
+        waiting = []
+        if not has_pattern:
+            waiting.append("Pattern to form")
+        if not has_level:
+            waiting.append("Price near key level")
+        if not trend_ok:
+            waiting.append("Multi-TF trend alignment")
+        if has_pattern and has_level and trend_ok and not conf_ok:
+            waiting.append(f"Confidence {conf_val:.0%} → {conf_req:.0%}")
+        if has_pattern and has_level and trend_ok and conf_ok and not has_signal:
+            waiting.append("Engulfing candle / entry signal")
+        if not session_ok:
+            waiting.append("London session (3–8 AM ET)")
+        if not news_ok:
+            waiting.append("News blackout to clear")
+        if "max_concurrent" in ff:
+            waiting.append("Open position to close first")
+        if "currency_overlap" in ff:
+            waiting.append("Currency exposure to free up")
+        if "progressive_confluence" in ff:
+            waiting.append("Higher confluence for 2nd trade")
+        if not waiting and decision.decision.value == "ENTER":
+            waiting.append("Nothing — ready to enter")
+        elif not waiting:
+            waiting.append("Building setup")
+
+        self._confluence_state[pair] = {
+            "pair":        pair,
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
+            "decision":    decision.decision.value,
+            "direction":   decision.direction,
+            "confidence":  round(conf_val, 3),
+            "conf_required": conf_req,
+            "pattern":     decision.pattern.pattern_type if has_pattern else None,
+            "pattern_clarity": round(decision.pattern.clarity, 2) if has_pattern else None,
+            "level_price": round(decision.nearest_level.price, 5) if has_level else None,
+            "level_score": decision.nearest_level.score if has_level else None,
+            "trend_weekly": decision.trend_weekly.value if decision.trend_weekly else "?",
+            "trend_daily":  decision.trend_daily.value  if decision.trend_daily  else "?",
+            "trend_4h":     decision.trend_4h.value     if decision.trend_4h     else "?",
+            "entry_signal": decision.entry_signal.signal_type if has_signal else None,
+            "macro_theme":  f"{macro_theme.currency}_{macro_theme.direction}" if macro_theme else None,
+            "checks": {
+                "pattern":       has_pattern,
+                "key_level":     has_level,
+                "trend":         trend_ok,
+                "confidence":    conf_ok,
+                "entry_signal":  has_signal,
+                "session":       session_ok,
+                "news":          news_ok,
+            },
+            "failed_filters": list(ff),
+            "waiting_for":    waiting,
+        }
+
     def _evaluate_pair(self, pair: str, overnight: bool = False, macro_theme=None):
         df_w  = self._fetch_oanda_candles(pair, "W",  count=100)
         df_d  = self._fetch_oanda_candles(pair, "D",  count=200)
@@ -465,6 +547,11 @@ class ForexOrchestrator:
             df_1h=df_1h,
             macro_theme=macro_theme,
         )
+
+        # ── Capture confluence state for dashboard ────────────────────────
+        # Runs for EVERY pair, EVERY scan — dashboard shows what each pair
+        # is waiting for before the bot will enter.
+        self._capture_confluence(pair, decision, macro_theme)
 
         if decision.decision.value == "ENTER":
             # ── Confidence gate (matches backtester MIN_CONFIDENCE=65%) ──
@@ -825,6 +912,7 @@ class ForexOrchestrator:
                 pair_analysis    = {},
                 recent_decisions = [],
                 mode             = risk_status["mode"],
+                confluence_state = self._confluence_state,
                 stats            = {
                     "traded_patterns": len(self.strategy.traded_patterns),
                     "mode":            risk_status["mode"],

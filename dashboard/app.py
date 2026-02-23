@@ -155,6 +155,17 @@ def api_status():
     bal = account.get("balance", 0) if isinstance(account, dict) else 0
     dd_pct = round((peak_bal - bal) / peak_bal * 100, 1) if peak_bal > 0 and bal < peak_bal else 0.0
 
+    # Confluence state: dict keyed by pair, sorted by decision priority
+    raw_confluence = bot_state.get("confluence_state", {})
+    confluence_sorted = sorted(
+        raw_confluence.values(),
+        key=lambda x: (
+            0 if x.get("decision") == "ENTER" else
+            1 if x.get("decision") == "WAIT"  else 2,
+            -x.get("confidence", 0),
+        )
+    )
+
     return jsonify({
         "heartbeat":          merged_hb,
         "account":            account,
@@ -164,6 +175,7 @@ def api_status():
         "scan_state":         scan_state,
         "recent_decisions":   recent_decs,
         "top_setups":         bot_state.get("top_setups", []),
+        "confluence":         confluence_sorted,
         "server_time":        datetime.now(timezone.utc).isoformat(),
         # enriched fields for dashboard display
         "mode":               mode,
