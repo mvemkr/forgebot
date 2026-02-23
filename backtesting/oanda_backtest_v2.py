@@ -59,6 +59,8 @@ from src.strategy.forex.strategy_config import (
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
     winner_rule_check,
+    BLOCK_ENTRY_WHILE_WINNER_RUNNING,
+    WINNER_THRESHOLD_R,
     NECKLINE_CLUSTER_PCT,
     DRY_RUN_PAPER_BALANCE,
 )
@@ -824,6 +826,76 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
 
     print(f"\n  Decision log: {DECISION_LOG}")
     print(f"  Gap log:      {GAP_LOG_PATH}")
+
+    # ── Backtest results log (append) ─────────────────────────────────
+    # Every run appends one JSON line to logs/backtest_results.jsonl.
+    # Includes git commit + dirty flag so we always know EXACTLY what code
+    # produced a given result. No more "where did +66% come from?" mysteries.
+    import subprocess as _sp
+    try:
+        _commit = _sp.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).parent.parent,
+            stderr=_sp.DEVNULL).decode().strip()
+        _dirty  = bool(_sp.check_output(
+            ["git", "status", "--porcelain"], cwd=Path(__file__).parent.parent,
+            stderr=_sp.DEVNULL).decode().strip())
+    except Exception:
+        _commit, _dirty = "unknown", False
+
+    _result_record = {
+        "run_dt":       datetime.now(timezone.utc).isoformat(),
+        "commit":       _commit + ("-dirty" if _dirty else ""),
+        "window_start": start_dt.isoformat(),
+        "window_end":   (end_dt or datetime.now(timezone.utc)).isoformat(),
+        "config": {
+            "starting_bal":                   starting_bal,
+            "ATR_MIN_MULTIPLIER":             ATR_MIN_MULTIPLIER,
+            "ATR_STOP_MULTIPLIER":            ATR_STOP_MULTIPLIER,
+            "MIN_CONFIDENCE":                 MIN_CONFIDENCE,
+            "MAX_CONCURRENT_TRADES":          MAX_CONCURRENT_TRADES,
+            "BLOCK_ENTRY_WHILE_WINNER_RUNNING": BLOCK_ENTRY_WHILE_WINNER_RUNNING,
+            "WINNER_THRESHOLD_R":             WINNER_THRESHOLD_R,
+        },
+        "results": {
+            "n_trades":   len(trades),
+            "n_wins":     len(wins),
+            "n_losses":   len(losses),
+            "win_rate":   round(wr, 1),
+            "net_pnl":    round(net_pnl, 2),
+            "final_bal":  round(balance, 2),
+            "return_pct": round(ret_pct, 2),
+        },
+        "trades": [
+            {
+                "pair":        t["pair"],
+                "direction":   t["direction"],
+                "entry":       t["entry"],
+                "exit":        t["exit"],
+                "r":           round(t["r"], 2),
+                "pnl":         round(t["pnl"], 2),
+                "reason":      t["reason"],
+                "pattern":     t.get("pattern", ""),
+                "macro_theme": t.get("macro_theme", ""),
+                "entry_ts":    t.get("entry_ts", ""),
+                "exit_ts":     t.get("exit_ts", ""),
+            }
+            for t in trades
+        ],
+        "gap_summary": {
+            gt: len(items)
+            for gt, items in {
+                g["gap_type"]: [x for x in gap_log if x["gap_type"] == g["gap_type"]]
+                for g in gap_log
+            }.items()
+        },
+    }
+
+    _results_log = Path(__file__).parent.parent / "logs" / "backtest_results.jsonl"
+    _results_log.parent.mkdir(parents=True, exist_ok=True)
+    with open(_results_log, "a") as _f:
+        _f.write(json.dumps(_result_record) + "\n")
+
+    print(f"  Results log:  {_results_log}  [{_commit}{'-dirty' if _dirty else ''}]")
 
     return trades, balance, gap_log
 
