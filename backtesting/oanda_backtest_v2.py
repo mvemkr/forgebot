@@ -48,6 +48,12 @@ from src.strategy.forex.currency_strength import CurrencyStrengthAnalyzer, Curre
 # ── Shared execution config (single source of truth) ─────────────────────────
 # These constants are also used by the live orchestrator. Change them here,
 # they apply everywhere. Do NOT hardcode these values anywhere else.
+#
+# LEVER SYSTEM: import the module by reference (_sc) so that apply_levers()
+# patches propagate to every _sc.X access in this file.  The flat imports
+# below provide IDE auto-complete and defaults; in the hot loop we read
+# through _sc so overrides take effect.
+import src.strategy.forex.strategy_config as _sc
 from src.strategy.forex.strategy_config import (
     MIN_CONFIDENCE,
     MIN_RR,
@@ -354,9 +360,9 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     def _daily_atr(pair) -> Optional[float]:
         """14-day ATR for the pair (in price terms, not pips)."""
         df_d = candle_data[pair].get("d")
-        if df_d is None or len(df_d) < ATR_LOOKBACK + 1:
+        if df_d is None or len(df_d) < _sc.ATR_LOOKBACK + 1:
             return None
-        recent = df_d.tail(ATR_LOOKBACK + 1)
+        recent = df_d.tail(_sc.ATR_LOOKBACK + 1)
         tr_list = []
         for i in range(1, len(recent)):
             h = float(recent["high"].iloc[i])
@@ -369,18 +375,15 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         """
         Return True if stop distance is within acceptable ATR range.
         Max: ≤ ATR_STOP_MULTIPLIER × 14-day ATR (rejects ancient structural stops)
-        Min: ≥ 0.15 × 14-day ATR — lowered from 0.75 to allow Alex's 4H H&S stops.
-             Original 0.75× was blocking valid 87-307 pip stops on 200-pip-ATR pairs.
-             0.15× still blocks sub-20-pip micro-stops (noise entries) while
-             allowing any stop that genuinely places behind a pattern extreme.
-             Example: GBP/JPY ATR=214p → min=32p; passes 87p+ H&S stops.
+        Min: ≥ ATR_MIN_MULTIPLIER × 14-day ATR (blocks micro-stops from noise entries).
+        Both thresholds read live from _sc so --lever overrides propagate.
         """
         atr = _daily_atr(pair)
         if atr is None:
             return True
         dist = abs(entry - stop)
-        max_dist = atr * ATR_STOP_MULTIPLIER
-        min_dist = atr * ATR_MIN_MULTIPLIER
+        max_dist = atr * _sc.ATR_STOP_MULTIPLIER
+        min_dist = atr * _sc.ATR_MIN_MULTIPLIER
         return min_dist <= dist <= max_dist
 
     def _currencies_in_use():
@@ -428,7 +431,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             macro_theme is not None
             and pair in [p for p, _ in macro_theme.suggested_trades]
         )
-        max_concurrent = STACK_MAX if _is_theme else MAX_CONCURRENT_TRADES
+        max_concurrent = STACK_MAX if _is_theme else _sc.MAX_CONCURRENT_TRADES
 
         # Layer 1: max concurrent
         if len(open_pos) >= max_concurrent:
@@ -626,7 +629,9 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             #      If the pattern detector finds a bullish IH&S and wants to go
             #      LONG, that directly opposes the macro view → skip it.
             # We only enter if the pattern AGREES with (or is neutral to) the theme.
-            if (decision.decision == Decision.ENTER
+            # Controlled by REQUIRE_THEME_GATE lever (default True).
+            if (_sc.REQUIRE_THEME_GATE
+                    and decision.decision == Decision.ENTER
                     and _is_theme_pair and active_theme):
                 theme_dir_map = dict(active_theme.suggested_trades)
                 theme_dir     = theme_dir_map.get(pair)
@@ -640,10 +645,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
 
             # ── Confidence gate ───────────────────────────────────────
             if (decision.decision == Decision.ENTER
-                    and decision.confidence < MIN_CONFIDENCE):
+                    and decision.confidence < _sc.MIN_CONFIDENCE):
                 log_gap(ts_utc, pair, "ENTER", "BLOCKED",
                         "low_confidence",
-                        f"Confidence {decision.confidence:.0%} < {MIN_CONFIDENCE:.0%} threshold  "
+                        f"Confidence {decision.confidence:.0%} < {_sc.MIN_CONFIDENCE:.0%} threshold  "
                         f"entry={decision.entry_price:.5f}  reason={decision.reason[:60]}")
                 continue  # skip silently (high-frequency; print only on debug)
 
@@ -669,14 +674,14 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 atr  = _daily_atr(pair)
                 dist = abs(decision.entry_price - decision.stop_loss)
                 pip  = 0.01 if "JPY" in pair else 0.0001
-                too_wide  = atr is not None and dist > atr * ATR_STOP_MULTIPLIER
+                too_wide  = atr is not None and dist > atr * _sc.ATR_STOP_MULTIPLIER
                 gap_type  = "stop_too_wide" if too_wide else "stop_too_tight"
                 if too_wide:
-                    msg = (f"Stop too wide: {dist/pip:.0f}p > max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p "
-                           f"({ATR_STOP_MULTIPLIER:.0f}×ATR={atr/pip:.0f}p)")
+                    msg = (f"Stop too wide: {dist/pip:.0f}p > max {atr*_sc.ATR_STOP_MULTIPLIER/pip:.0f}p "
+                           f"({_sc.ATR_STOP_MULTIPLIER:.0f}×ATR={atr/pip:.0f}p)")
                 else:
-                    msg = (f"Stop too tight: {dist/pip:.0f}p < min {atr*ATR_MIN_MULTIPLIER/pip:.0f}p "
-                           f"({ATR_MIN_MULTIPLIER:.2f}×ATR={atr/pip:.0f}p) — micro-stop, noise will hit it")
+                    msg = (f"Stop too tight: {dist/pip:.0f}p < min {atr*_sc.ATR_MIN_MULTIPLIER/pip:.0f}p "
+                           f"({_sc.ATR_MIN_MULTIPLIER:.2f}×ATR={atr/pip:.0f}p) — micro-stop, noise will hit it")
                 log_gap(ts_utc, pair, "ENTER", "BLOCKED", gap_type,
                         f"{msg}  entry={decision.entry_price:.5f}  sl={decision.stop_loss:.5f}")
                 print(f"  ⚠ {ts_utc.strftime('%Y-%m-%d %H:%M')} | SKIP {pair} — {msg}  sl={decision.stop_loss:.5f}")
@@ -847,17 +852,26 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         "run_dt":       datetime.now(timezone.utc).isoformat(),
         "commit":       _commit + ("-dirty" if _dirty else ""),
         "notes":        notes,
-        "model_tags":   get_model_tags(),
+        "model_tags":   _sc.get_model_tags(),   # reads live module state → captures lever overrides
         "window_start": start_dt.isoformat(),
         "window_end":   (end_dt or datetime.now(timezone.utc)).isoformat(),
         "config": {
-            "starting_bal":                   starting_bal,
-            "ATR_MIN_MULTIPLIER":             ATR_MIN_MULTIPLIER,
-            "ATR_STOP_MULTIPLIER":            ATR_STOP_MULTIPLIER,
-            "MIN_CONFIDENCE":                 MIN_CONFIDENCE,
-            "MAX_CONCURRENT_TRADES":          MAX_CONCURRENT_TRADES,
-            "BLOCK_ENTRY_WHILE_WINNER_RUNNING": BLOCK_ENTRY_WHILE_WINNER_RUNNING,
-            "WINNER_THRESHOLD_R":             WINNER_THRESHOLD_R,
+            "starting_bal":                      starting_bal,
+            "ATR_MIN_MULTIPLIER":                _sc.ATR_MIN_MULTIPLIER,
+            "ATR_STOP_MULTIPLIER":               _sc.ATR_STOP_MULTIPLIER,
+            "MIN_CONFIDENCE":                    _sc.MIN_CONFIDENCE,
+            "MIN_RR":                            _sc.MIN_RR,
+            "MAX_CONCURRENT_TRADES":             _sc.MAX_CONCURRENT_TRADES,
+            "BLOCK_ENTRY_WHILE_WINNER_RUNNING":  _sc.BLOCK_ENTRY_WHILE_WINNER_RUNNING,
+            "WINNER_THRESHOLD_R":                _sc.WINNER_THRESHOLD_R,
+            "ENGULFING_ONLY":                    _sc.ENGULFING_ONLY,
+            "LEVEL_ALLOW_FINE_INCREMENT":        _sc.LEVEL_ALLOW_FINE_INCREMENT,
+            "STRUCTURAL_LEVEL_MIN_SCORE":        _sc.STRUCTURAL_LEVEL_MIN_SCORE,
+            "ALLOW_BREAK_RETEST":                _sc.ALLOW_BREAK_RETEST,
+            "OVEREXTENSION_CHECK":               _sc.OVEREXTENSION_CHECK,
+            "OVEREXTENSION_THRESHOLD":           _sc.OVEREXTENSION_THRESHOLD,
+            "ALLOW_TIER3_REVERSALS":             _sc.ALLOW_TIER3_REVERSALS,
+            "REQUIRE_THEME_GATE":                _sc.REQUIRE_THEME_GATE,
         },
         "results": {
             "n_trades":   len(trades),
@@ -904,13 +918,80 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OANDA Backtest v2 — Real Strategy Code")
+    parser = argparse.ArgumentParser(
+        description="OANDA Backtest v2 — Real Strategy Code",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Lever system — override any strategy_config constant without editing source:
+
+  --lever KEY=VALUE       Set one lever (repeat for multiple)
+  --profile NAME          Load profiles/<name>.json (applied before --lever flags)
+
+Built-in window shortcuts:
+  --window alex           2024-07-01 → 2024-10-31  (Alex's $100→$1M challenge)
+  --window jan            2026-01-01 → 2026-01-31  (Jan 2026 live window)
+
+Examples:
+  python3 -m backtesting.oanda_backtest_v2 --window alex
+  python3 -m backtesting.oanda_backtest_v2 --window alex --lever LEVEL_ALLOW_FINE_INCREMENT=False
+  python3 -m backtesting.oanda_backtest_v2 --window jan  --profile core_reversals
+  python3 -m backtesting.oanda_backtest_v2 --window alex --lever ALLOW_BREAK_RETEST=False --lever MIN_CONFIDENCE=0.70
+""")
     parser.add_argument("--start",   default="2025-07-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--end",     default=None,         help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--balance", type=float, default=STARTING_BAL, help="Starting balance")
     parser.add_argument("--notes",   default="",           help="Description of what changed (logged with results)")
+    parser.add_argument("--window",  default=None,         help="Shortcut: alex=Jul-Oct 2024 | jan=Jan 2026")
+    parser.add_argument("--profile", default=None,         help="Load profiles/<name>.json lever profile")
+    parser.add_argument("--lever",   action="append",      default=[],
+                        metavar="KEY=VALUE",
+                        help="Override a strategy_config lever (e.g. --lever MIN_CONFIDENCE=0.70)")
     args = parser.parse_args()
+
+    # ── Window shortcuts ──────────────────────────────────────────────────────
+    if args.window == "alex":
+        args.start = "2024-07-01"
+        args.end   = "2024-10-31"
+    elif args.window == "jan":
+        args.start = "2026-01-01"
+        args.end   = "2026-01-31"
+    elif args.window is not None:
+        parser.error(f"Unknown --window '{args.window}'. Use: alex | jan")
+
+    # ── Apply lever profile (before individual --lever flags) ─────────────────
+    if args.profile:
+        try:
+            applied = _sc.load_profile(args.profile)
+            print(f"  📋 Profile '{args.profile}' loaded: {applied}")
+        except FileNotFoundError as e:
+            parser.error(str(e))
+
+    # ── Apply individual --lever overrides ────────────────────────────────────
+    if args.lever:
+        overrides = {}
+        for kv in args.lever:
+            if "=" not in kv:
+                parser.error(f"--lever must be KEY=VALUE, got: '{kv}'")
+            k, v = kv.split("=", 1)
+            overrides[k.strip()] = v.strip()
+        try:
+            applied = _sc.apply_levers(overrides)
+            print(f"  🔧 Levers applied: {applied}")
+        except ValueError as e:
+            parser.error(str(e))
 
     start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end   = datetime.strptime(args.end,   "%Y-%m-%d").replace(tzinfo=timezone.utc) if args.end else None
-    run_backtest(start_dt=start, end_dt=end, starting_bal=args.balance, notes=args.notes)
+
+    # Build notes string that captures any lever overrides
+    notes = args.notes
+    if args.lever or args.profile:
+        lever_summary = []
+        if args.profile:
+            lever_summary.append(f"profile={args.profile}")
+        if args.lever:
+            lever_summary.extend(args.lever)
+        suffix = " [levers: " + ", ".join(lever_summary) + "]"
+        notes = (notes + suffix).strip()
+
+    run_backtest(start_dt=start, end_dt=end, starting_bal=args.balance, notes=notes)

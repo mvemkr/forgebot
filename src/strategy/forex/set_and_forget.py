@@ -27,6 +27,7 @@ from .session_filter import SessionFilter
 from .level_detector import LevelDetector, KeyLevel
 from .pattern_detector import PatternDetector, PatternResult, Trend
 from .entry_signal import EntrySignalDetector, EntrySignal
+from . import strategy_config as _cfg   # module-ref import so apply_levers() patches propagate
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,11 @@ class TradeDecision:
 
     # Pattern memory — needed to mark formation exhausted when trade closes
     neckline_ref: Optional[float]          = None   # key level price used as pattern key
+
+    # Macro theme stacking flag — set True when this is a theme-driven stacked trade.
+    # Passed to trade_executor so check_entry_eligibility can apply STACK_MAX + waive
+    # currency overlap (matching backtester _entry_eligible() logic exactly).
+    is_macro_theme_pair: bool              = False
 
     def __str__(self):
         lines = [
@@ -167,7 +173,7 @@ class SetAndForgetStrategy:
         # after a loss on a slightly different neckline that pattern memory
         # doesn't cluster (e.g. NZD/JPY break-retest at 94 → stops → re-enters
         # at 93 within 3 days on the same broad setup).
-        self.STOP_COOLDOWN_DAYS: float = 5.0
+        self.STOP_COOLDOWN_DAYS: float = _cfg.STOP_COOLDOWN_DAYS
         self._stop_out_times: Dict[str, object] = {}   # pair → datetime of last stop
 
         # Pattern memory — prevent re-entering the same formation
@@ -283,9 +289,11 @@ class SetAndForgetStrategy:
         std  = float(np.std(closes))
         z    = (current - mean) / std if std > 0 else 0.0
 
-        # Extended = top or bottom 10% of 2-year price range
-        is_extended_high = pct_rank >= 0.90   # top 10% → reckless to go long
-        is_extended_low  = pct_rank <= 0.10   # btm 10% → reckless to go short
+        # Extended = top or bottom N% of 2-year price range.
+        # Threshold controlled by OVEREXTENSION_THRESHOLD lever (default 0.90 = top/bottom 10%).
+        _ext_thr = _cfg.OVEREXTENSION_THRESHOLD
+        is_extended_high = pct_rank >= _ext_thr          # top (1-thr)% → reckless to go long
+        is_extended_low  = pct_rank <= (1.0 - _ext_thr)  # btm (1-thr)% → reckless to go short
 
         return z, is_extended_high, is_extended_low
 
@@ -328,7 +336,8 @@ class SetAndForgetStrategy:
         # that fall between the 0.025 grid. These are just as "watched" on real
         # charts — the 0.025 check was too coarse and blocked valid setups.
         # JPY pairs already covered by 0.50 increment above.
-        if not is_jpy:
+        # Controlled by LEVEL_ALLOW_FINE_INCREMENT lever (default True).
+        if not is_jpy and _cfg.LEVEL_ALLOW_FINE_INCREMENT:
             fine_increment = 0.0100
             fine_tolerance = 0.0030   # 30 pips — catches 0.882 near 0.880, 1.132 near 1.130
             nearest_fine = round(price / fine_increment) * fine_increment
@@ -684,22 +693,23 @@ class SetAndForgetStrategy:
                                     'inverted_head_and_shoulders'))
 
             # ── OVEREXTENSION BLOCK / BONUS (Feature #1) ──────────────────
-            # When price is >2 SD from its 1-year mean, only reversals AGAINST
-            # the extension direction are valid.
+            # When price is in the top/bottom OVEREXTENSION_THRESHOLD % of its
+            # 2-year range, only reversals AGAINST the extension are valid.
             #
-            # USD/JPY at 157 (30-year high, Z≈+3.5): LONG is reckless.
-            # Alex went SHORT and made 13× his money. Our bot went LONG and
-            # stopped out. This single check fixes that.
+            # USD/JPY at 157 (30-year high): LONG is reckless. SHORT is the trade.
+            # Alex went SHORT and made 13× his money.
             #
-            # Bonus: being at an extreme and taking the CORRECT reversal direction
-            # gets a confidence boost (+0.08) — extreme reversals are Alex's
-            # highest-quality setups.
-            if _ext_high and is_long:
-                return False, 0.0, False   # price at extreme HIGH — no new longs
-            if _ext_low  and is_short:
-                return False, 0.0, False   # price at extreme LOW  — no new shorts
+            # Controlled by OVEREXTENSION_CHECK lever (default True).
+            # Disabled → overextension analysis is advisory only (no blocks).
+            if _cfg.OVEREXTENSION_CHECK:
+                if _ext_high and is_long:
+                    return False, 0.0, False   # price at extreme HIGH — no new longs
+                if _ext_low  and is_short:
+                    return False, 0.0, False   # price at extreme LOW  — no new shorts
             _ext_bonus = 0.08 if (
-                (_ext_high and is_short) or (_ext_low and is_long)
+                _cfg.OVEREXTENSION_CHECK and (
+                    (_ext_high and is_short) or (_ext_low and is_long)
+                )
             ) else 0.0
 
             # ── HARD BLOCK: 2+ TFs actively oppose the pattern direction ──
@@ -732,10 +742,12 @@ class SetAndForgetStrategy:
             # The pattern forming IS the reversal signal — daily hasn't turned yet.
             # GBP/CHF Aug 2024: weekly=bullish, daily=neutral, double top at high.
             # Break-retest is EXCLUDED — it requires trend confirmation to enter.
-            if is_reversal_type and is_short and w_bullish and not d_bullish:
-                return True, -0.05 + _ext_bonus, True
-            if is_reversal_type and is_long  and w_bearish and not d_bearish:
-                return True, -0.05 + _ext_bonus, True
+            # Controlled by ALLOW_TIER3_REVERSALS lever (default True).
+            if _cfg.ALLOW_TIER3_REVERSALS:
+                if is_reversal_type and is_short and w_bullish and not d_bullish:
+                    return True, -0.05 + _ext_bonus, True
+                if is_reversal_type and is_long  and w_bearish and not d_bearish:
+                    return True, -0.05 + _ext_bonus, True
 
             # ── TIER 4: Range reversal — weekly neutral + local push exhausted ──
             # When the weekly trend is neutral (ranging), price bounces between
@@ -776,6 +788,10 @@ class SetAndForgetStrategy:
 
         for p in patterns:
             if p.clarity < self.min_pattern_clarity:
+                continue
+            # Lever: ALLOW_BREAK_RETEST — skip break_retest patterns when disabled.
+            # Default True (Alex uses them). False = core reversal patterns only.
+            if not _cfg.ALLOW_BREAK_RETEST and 'break_retest' in p.pattern_type:
                 continue
             # Proximity window: how far from the neckline can current price be?
             # Standard:  2.0% — price is near the neckline (break or retest)
@@ -863,16 +879,16 @@ class SetAndForgetStrategy:
         if nearest_level is None and levels:
             nearest_level = levels[0]
 
-        # A structural level that was tested 3+ times with additional confluence
+        # A structural level that was tested N+ times with additional confluence
         # (EMA, equal highs/lows, or near a round number) = equivalent to a round number.
-        # Lowered from 4 to 3: many real traded levels (USD/CHF 0.884, GBP/CHF 1.12)
-        # have 3 solid tests but not 4. 4 was blocking legitimate setups Alex took.
+        # Score threshold controlled by STRUCTURAL_LEVEL_MIN_SCORE lever (default 3).
+        # Max distance controlled by STRUCTURAL_LEVEL_MAX_DIST_PCT lever (default 1.5%).
         at_structural_level = (
             nearest_level is not None
-            and nearest_level.score >= 3                                            # 3+ confluences required
+            and nearest_level.score >= _cfg.STRUCTURAL_LEVEL_MIN_SCORE
             and any("structural" in c for c in nearest_level.confluences)          # must be a structural level
             and abs(nearest_level.price - matching_pattern.pattern_level)
-                / max(matching_pattern.pattern_level, 0.0001) < 0.015              # within 1.5% of pattern level
+                / max(matching_pattern.pattern_level, 0.0001) < _cfg.STRUCTURAL_LEVEL_MAX_DIST_PCT
         )
 
         if not pattern_at_round_number and not at_structural_level:
@@ -1050,19 +1066,19 @@ class SetAndForgetStrategy:
         rr_1 = abs(entry_price - target_1) / max(abs(entry_price - stop_loss), 0.000001)
 
         # ── Minimum R:R quality gate ───────────────────────────────────────
-        # If the pattern's measured move (T1 amplitude) is less than 1.0× the
+        # If the pattern's measured move (T1 amplitude) is less than MIN_RR× the
         # stop distance, the pattern is geometrically weak — either stop is
         # too wide or the measured move is tiny. Both are quality failures.
         # Alex's trades all had measured moves well beyond their stop distances.
         # 1:0.4 R:R (like AUD/CAD IH&S Jul 2024) = clear junk setup.
-        MIN_RR = 1.0
-        if rr_1 < MIN_RR:
+        # Controlled by MIN_RR lever in strategy_config (default 1.0).
+        if rr_1 < _cfg.MIN_RR:
             return TradeDecision(
                 decision=Decision.WAIT,
                 pair=pair,
                 direction=trade_direction,
                 reason=(
-                    f"R:R too low ({rr_1:.2f} < {MIN_RR:.1f} minimum). "
+                    f"R:R too low ({rr_1:.2f} < {_cfg.MIN_RR:.1f} minimum). "
                     f"Pattern amplitude too small vs stop distance. "
                     f"{matching_pattern.pattern_type.upper()} at {entry_price:.5f} "
                     f"SL={stop_loss:.5f} T1={target_1:.5f}"
@@ -1106,6 +1122,7 @@ class SetAndForgetStrategy:
             trend_daily=trend_d,
             trend_4h=trend_4,
             neckline_ref=neckline_ref,
+            is_macro_theme_pair=_is_macro_theme_pair,
         )
 
     def register_open_position(

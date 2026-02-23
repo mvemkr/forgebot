@@ -1,0 +1,5 @@
+{
+  "_comment": "Core reversal patterns only — no break_retest, no fine (0.01) increment levels. Tests whether Alex's strongest setups (H&S, double top/bottom at obvious round numbers) outperform the full set.",
+  "ALLOW_BREAK_RETEST": false,
+  "LEVEL_ALLOW_FINE_INCREMENT": false
+}

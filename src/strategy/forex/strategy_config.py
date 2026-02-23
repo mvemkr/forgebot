@@ -12,7 +12,24 @@ separately — that's exactly how they get out of sync.
 Rule: if a filter exists in the backtester, it must exist identically
 in the live bot, and vice versa. Both must import from this file.
 See GUIDELINES.md for the full policy.
+
+LEVER SYSTEM
+============
+Every filter is a named lever. To run a one-off experiment without editing
+source code, use the backtester's --lever and --profile flags:
+
+    python3 -m backtesting.oanda_backtest_v2 --window alex \\
+        --lever LEVEL_ALLOW_FINE_INCREMENT=False \\
+        --lever ALLOW_BREAK_RETEST=False
+
+Or load a named profile:
+
+    python3 -m backtesting.oanda_backtest_v2 --window jan --profile core_reversals
+
+apply_levers(overrides) patches module globals at runtime so that
+set_and_forget.py (which imports this module by reference) sees the changes.
 """
+import sys as _sys
 
 # ── Signal quality gates ───────────────────────────────────────────────────
 # Minimum confidence score to execute a trade.
@@ -134,19 +151,186 @@ NECKLINE_CLUSTER_PCT: float = 0.003
 DRY_RUN_PAPER_BALANCE: float = 8_000.0
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY LEVERS — toggleable filters, all with defaults matching Alex's rules
+# ══════════════════════════════════════════════════════════════════════════════
+# Override at runtime via apply_levers() or the backtester's --lever CLI flag.
+# Default state = current production config. Change a lever here to change both
+# the backtester AND the live bot simultaneously.
+
+# ── Level quality levers ───────────────────────────────────────────────────
+# Whether 0.01-increment price levels count as "major psychological levels."
+# True  → levels like USD/CHF 0.880, GBP/CHF 1.130 are valid anchors.
+# False → only 0.025-increment levels qualify (stricter, fewer trades).
+# Alex trades both 0.025 and 0.010 increments; False is more conservative.
+LEVEL_ALLOW_FINE_INCREMENT: bool = True
+
+# Minimum confluence score for structural S/R levels to substitute for a
+# round-number level. Score ≥ N means N confluence factors (EMA, equal
+# highs/lows, round number proximity, etc.). 3 = 3 confirmations required.
+# Lowering to 2 opens the door to noise levels (AUD/NZD 1.09184).
+STRUCTURAL_LEVEL_MIN_SCORE: int = 3
+
+# Max distance (as a fraction of price) between the structural level and the
+# pattern's structural price for the level to count as "at the pattern."
+# 0.015 = within 1.5% of price. Increase to catch sloppier setups.
+STRUCTURAL_LEVEL_MAX_DIST_PCT: float = 0.015
+
+# ── Pattern type levers ────────────────────────────────────────────────────
+# Allow break_retest patterns (continuation setups) as entry triggers.
+# True  → break & retest valid (requires TIER 1 trend alignment by design).
+# False → only reversal patterns: H&S, double top/bottom, IH&S.
+# Alex trades both; False tests whether reversals alone outperform.
+ALLOW_BREAK_RETEST: bool = True
+
+# ── Multi-timeframe context levers ────────────────────────────────────────
+# Overextension check: block trades going WITH a price extreme.
+# True  → if price is in top/bottom OVEREXTENSION_THRESHOLD % of 2yr range,
+#         only take reversals AGAINST the extension, never with it.
+#         This is what caught USD/JPY at 157-160 as a SHORT not a LONG.
+# False → overextension analysis is advisory only (no blocks, no bonuses).
+OVEREXTENSION_CHECK: bool = True
+
+# Percentile rank threshold that defines "price is at an extreme."
+# 0.90 → top or bottom 10% of the 2-year price range.
+# Lower = more aggressive (0.80 = top 20% is "extended").
+OVEREXTENSION_THRESHOLD: float = 0.90
+
+# Allow Tier 3 early reversals: weekly trend opposing + daily stalling (neutral).
+# True  → trades like GBP/CHF Aug 2024 are valid (weekly bullish, daily neutral,
+#         double top at high — the pattern IS the reversal signal).
+# False → require daily to be actively turning (confirmed reversal only).
+ALLOW_TIER3_REVERSALS: bool = True
+
+# ── Theme stacking lever ───────────────────────────────────────────────────
+# Whether an active macro theme can BLOCK an entry that contradicts it.
+# True  → if USD_strong theme is active and pattern wants EUR/USD LONG,
+#         that entry is blocked (EUR = USD counter-currency, bad timing).
+# False → theme analysis informs sizing only; never blocks a trade.
+REQUIRE_THEME_GATE: bool = True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LEVER RUNTIME SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+def apply_levers(overrides: dict) -> dict:
+    """
+    Patch module-level constants at runtime.
+
+    This enables the backtester's --lever CLI flag to change strategy behaviour
+    without editing source files. Because set_and_forget.py imports this module
+    BY REFERENCE (import strategy_config as _cfg), it sees patched values
+    immediately — no reload needed.
+
+    Type coercion is automatic based on the existing type of each constant.
+    Booleans accept: True/False/true/false/1/0/yes/no.
+
+    Returns the dict of applied overrides (useful for logging).
+    Raises ValueError for unknown or non-overridable keys.
+
+    Example:
+        apply_levers({"LEVEL_ALLOW_FINE_INCREMENT": False, "MIN_CONFIDENCE": 0.70})
+    """
+    m = _sys.modules[__name__]
+    applied = {}
+    for key, raw_val in overrides.items():
+        existing = getattr(m, key, _MISSING := object())
+        if existing is _MISSING:
+            raise ValueError(f"apply_levers: unknown lever '{key}'")
+        if callable(existing):
+            raise ValueError(f"apply_levers: '{key}' is a function, not a lever")
+        # Type coercion
+        if isinstance(existing, bool):
+            if isinstance(raw_val, str):
+                val = raw_val.strip().lower() not in ("false", "0", "no", "off")
+            else:
+                val = bool(raw_val)
+        elif isinstance(existing, float):
+            val = float(raw_val)
+        elif isinstance(existing, int):
+            val = int(raw_val)
+        elif isinstance(existing, str):
+            val = str(raw_val)
+        else:
+            val = raw_val
+        setattr(m, key, val)
+        applied[key] = val
+    return applied
+
+
+def load_profile(profile_name: str) -> dict:
+    """
+    Load a named lever profile from profiles/<name>.json and apply it.
+    Returns the dict of applied overrides.
+
+    Profiles live in <repo>/profiles/ relative to this file's package root.
+    """
+    import json, pathlib
+    # Walk up from this file to find the profiles/ directory
+    here = pathlib.Path(__file__).resolve()
+    # src/strategy/forex/strategy_config.py → go up 3 levels → repo root
+    repo_root = here.parents[3]
+    profile_path = repo_root / "profiles" / f"{profile_name}.json"
+    if not profile_path.exists():
+        available = [p.stem for p in (repo_root / "profiles").glob("*.json")]
+        raise FileNotFoundError(
+            f"Profile '{profile_name}' not found at {profile_path}. "
+            f"Available: {available}"
+        )
+    with open(profile_path) as f:
+        overrides = json.load(f)
+    # Strip comment/metadata keys (anything starting with "_")
+    overrides = {k: v for k, v in overrides.items() if not k.startswith("_")}
+    return apply_levers(overrides)
+
+
 # ── Model tag helper ────────────────────────────────────────────────────────
 def get_model_tags() -> list:
     """
-    Returns a list of short descriptive tags for the current strategy config.
-    Written into every backtest result record so you can always tell what
-    rules were active when a number was produced.
+    Returns a list of short descriptive tags capturing ALL active levers.
+    Written into every backtest result record so you can always reproduce
+    exactly what config produced a given number.
+
+    Tags are stable short strings — sort + join them to get a run fingerprint.
     """
+    m = _sys.modules[__name__]
     tags = []
-    tags.append("engulfing_only"    if ENGULFING_ONLY               else "pin_bars_allowed")
-    tags.append("no_gate"           if not BLOCK_ENTRY_WHILE_WINNER_RUNNING
-                                    else f"winner_gate_{WINNER_THRESHOLD_R:.0f}R")
-    tags.append(f"atr_min_{ATR_MIN_MULTIPLIER}")
-    tags.append(f"atr_max_{int(ATR_STOP_MULTIPLIER)}")
-    tags.append(f"conf_{int(MIN_CONFIDENCE * 100)}")
-    tags.append(f"max_concurrent_{MAX_CONCURRENT_TRADES}")
+
+    # ── Entry signal ────────────────────────────────────────────────────────
+    tags.append("engulfing_only" if m.ENGULFING_ONLY else "pin_bars_allowed")
+
+    # ── Pattern types ───────────────────────────────────────────────────────
+    if not m.ALLOW_BREAK_RETEST:
+        tags.append("no_break_retest")
+
+    # ── Level quality ───────────────────────────────────────────────────────
+    if not m.LEVEL_ALLOW_FINE_INCREMENT:
+        tags.append("no_fine_levels")
+    if m.STRUCTURAL_LEVEL_MIN_SCORE != 3:
+        tags.append(f"struct_score_{m.STRUCTURAL_LEVEL_MIN_SCORE}")
+
+    # ── MTF context ─────────────────────────────────────────────────────────
+    if not m.OVEREXTENSION_CHECK:
+        tags.append("no_ext_check")
+    elif m.OVEREXTENSION_THRESHOLD != 0.90:
+        tags.append(f"ext_{int(m.OVEREXTENSION_THRESHOLD * 100)}pct")
+    if not m.ALLOW_TIER3_REVERSALS:
+        tags.append("no_tier3")
+
+    # ── Theme gate ──────────────────────────────────────────────────────────
+    if not m.REQUIRE_THEME_GATE:
+        tags.append("no_theme_gate")
+
+    # ── Winner / concurrency ────────────────────────────────────────────────
+    tags.append("no_gate" if not m.BLOCK_ENTRY_WHILE_WINNER_RUNNING
+                else f"winner_gate_{m.WINNER_THRESHOLD_R:.0f}R")
+
+    # ── Signal / ATR ────────────────────────────────────────────────────────
+    tags.append(f"atr_min_{m.ATR_MIN_MULTIPLIER}")
+    tags.append(f"atr_max_{int(m.ATR_STOP_MULTIPLIER)}")
+    tags.append(f"conf_{int(m.MIN_CONFIDENCE * 100)}")
+    tags.append(f"rr_{m.MIN_RR:.1f}")
+    tags.append(f"max_concurrent_{m.MAX_CONCURRENT_TRADES}")
+
     return tags

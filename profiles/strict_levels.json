@@ -1,0 +1,5 @@
+{
+  "_comment": "Strict level quality — no fine (0.01) increment levels, require structural score >= 4 instead of 3. Goal: block AUD/NZD 1.09184 and EUR/USD 1.192 noise levels while keeping GBP/CHF 1.05 and USD/JPY 154/158. Tests whether level quality improvement beats the baseline.",
+  "LEVEL_ALLOW_FINE_INCREMENT": false,
+  "STRUCTURAL_LEVEL_MIN_SCORE": 4
+}

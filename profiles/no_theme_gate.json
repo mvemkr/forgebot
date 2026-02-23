@@ -1,0 +1,4 @@
+{
+  "_comment": "Theme analysis is informational only — no entries are blocked by macro theme direction. Tests whether theme gate is adding or removing value. Previous test showed removing gate made things worse at -23% (21 trades), but that also disabled fine-level filter. This tests ONLY the gate removal.",
+  "REQUIRE_THEME_GATE": false
+}

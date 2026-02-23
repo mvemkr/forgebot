@@ -73,6 +73,7 @@ WATCHLIST = [
 # ── Shared execution config (single source of truth) ─────────────────────────
 # Imported from strategy_config — same values used by the backtester.
 # To change any threshold, edit strategy_config.py. Never hardcode here.
+from ..strategy.forex import strategy_config as _sc   # module-ref for lever access
 from ..strategy.forex.strategy_config import (
     MIN_CONFIDENCE,
     BLOCK_ENTRY_WHILE_WINNER_RUNNING,
@@ -563,6 +564,23 @@ class ForexOrchestrator:
                     f"< {MIN_CONFIDENCE:.0%} threshold. Waiting for stronger setup."
                 )
                 return
+
+            # ── Macro theme direction gate ────────────────────────────────
+            # PARITY: identical logic to backtester (oanda_backtest_v2.py).
+            # If a macro theme is active and this pair is one of its suggested
+            # trades, block entries whose direction CONTRADICTS the theme.
+            # E.g. USD_strong theme → EUR/USD SHORT is fine, EUR/USD LONG is blocked.
+            # Controlled by REQUIRE_THEME_GATE lever in strategy_config.py.
+            if _sc.REQUIRE_THEME_GATE and macro_theme:
+                _theme_dir_map = dict(macro_theme.suggested_trades)
+                _theme_dir     = _theme_dir_map.get(pair)
+                if _theme_dir and _theme_dir != decision.direction:
+                    logger.info(
+                        f"⚠ {pair}: ENTER BLOCKED — theme direction conflict. "
+                        f"Theme={macro_theme.currency}_{macro_theme.direction} "
+                        f"wants {_theme_dir}, pattern wants {decision.direction}."
+                    )
+                    return
 
             # ── Winner rule: don't compete with your winner ───────────────
             # Block new entries only when any open position is ACTIVELY up

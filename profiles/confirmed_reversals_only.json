@@ -1,0 +1,5 @@
+{
+  "_comment": "Confirmed reversals only — requires daily to actively be turning (no Tier 3 early reversals where daily is still stalling). Also blocks break_retest. Tests whether waiting for confirmation beats acting early.",
+  "ALLOW_TIER3_REVERSALS": false,
+  "ALLOW_BREAK_RETEST": false
+}

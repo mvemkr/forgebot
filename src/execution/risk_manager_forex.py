@@ -394,39 +394,49 @@ class ForexRiskManager:
         pair: str,
         open_positions: dict,
         account_balance: float,
+        is_macro_theme_pair: bool = False,
     ) -> Tuple[bool, str]:
         """
-        Gate check for opening a new position.  Replaces the old one-trade
-        hard block with three layered rules:
+        Gate check for opening a new position.  Three layered rules:
 
           1. Max concurrent positions (hard cap = MAX_CONCURRENT_TRADES)
+             EXCEPTION: macro theme pairs → cap raised to STACK_MAX (4)
           2. Currency overlap — no two positions share a currency
+             EXCEPTION: macro theme pairs → waived (correlated exposure intentional)
           3. Book exposure — remaining budget must be ≥ MIN_SECOND_TRADE_PCT
+
+        is_macro_theme_pair: set by set_and_forget.evaluate() when a macro
+        currency theme is active and this pair is one of the stacked trades.
+        Matches the backtester's _entry_eligible() exception exactly.
 
         Returns (blocked: bool, reason: str).
         """
+        from src.strategy.forex.currency_strength import STACK_MAX
         n = len(open_positions)
 
-        # 1 — Hard cap
-        if n >= self.MAX_CONCURRENT_TRADES:
+        # 1 — Hard cap (STACK_MAX for theme pairs, MAX_CONCURRENT_TRADES otherwise)
+        max_allowed = STACK_MAX if is_macro_theme_pair else self.MAX_CONCURRENT_TRADES
+        if n >= max_allowed:
             return True, (
                 f"⛔ MAX POSITIONS: {n} trades already open "
-                f"(max {self.MAX_CONCURRENT_TRADES}). Waiting for one to close."
+                f"(max {max_allowed}{'  [theme stack]' if is_macro_theme_pair else ''}). "
+                f"Waiting for one to close."
             )
 
         if n == 0:
             return False, ""   # first trade — no further checks needed
 
-        # 2 — Currency overlap
-        proposed = self.pair_currencies(pair)
-        in_use   = self.currencies_in_use(open_positions)
-        overlap  = proposed & in_use
-        if overlap:
-            return True, (
-                f"⛔ CURRENCY OVERLAP: {', '.join(overlap)} already exposed. "
-                f"Open: {list(open_positions.keys())}. "
-                f"Can't double-expose the same currency."
-            )
+        # 2 — Currency overlap (waived for macro theme — correlated exposure intentional)
+        if not is_macro_theme_pair:
+            proposed = self.pair_currencies(pair)
+            in_use   = self.currencies_in_use(open_positions)
+            overlap  = proposed & in_use
+            if overlap:
+                return True, (
+                    f"⛔ CURRENCY OVERLAP: {', '.join(overlap)} already exposed. "
+                    f"Open: {list(open_positions.keys())}. "
+                    f"Can't double-expose the same currency."
+                )
 
         # 3 — Book budget
         book_risk = self.get_book_risk_pct(account_balance, open_positions)

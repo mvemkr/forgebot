@@ -106,8 +106,10 @@ class TradeExecutor:
 
         # ── Dual-trade eligibility (belt and suspenders) ─────────────
         # Checks: max concurrent positions, currency overlap, book budget.
+        # Macro theme exception: raised cap + waived overlap (matches backtester).
         pos_blocked, pos_reason = self.risk.check_entry_eligibility(
-            pair, self.strategy.open_positions, account_balance
+            pair, self.strategy.open_positions, account_balance,
+            is_macro_theme_pair=getattr(decision, "is_macro_theme_pair", False),
         )
         if pos_blocked:
             logger.warning(f"{pair}: {pos_reason}")

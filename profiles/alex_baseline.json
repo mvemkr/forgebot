@@ -1,0 +1,19 @@
+{
+  "_comment": "Official baseline — matches production defaults as of commit 27cd440. All levers at default values. Used to verify reproducibility of -6.2% Alex window and +111% Jan 2026.",
+  "ENGULFING_ONLY": true,
+  "ALLOW_BREAK_RETEST": true,
+  "LEVEL_ALLOW_FINE_INCREMENT": true,
+  "STRUCTURAL_LEVEL_MIN_SCORE": 3,
+  "STRUCTURAL_LEVEL_MAX_DIST_PCT": 0.015,
+  "OVEREXTENSION_CHECK": true,
+  "OVEREXTENSION_THRESHOLD": 0.90,
+  "ALLOW_TIER3_REVERSALS": true,
+  "REQUIRE_THEME_GATE": true,
+  "BLOCK_ENTRY_WHILE_WINNER_RUNNING": false,
+  "WINNER_THRESHOLD_R": 2.0,
+  "MIN_CONFIDENCE": 0.65,
+  "MIN_RR": 1.0,
+  "ATR_MIN_MULTIPLIER": 0.15,
+  "ATR_STOP_MULTIPLIER": 8.0,
+  "MAX_CONCURRENT_TRADES": 2
+}
