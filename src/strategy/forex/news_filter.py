@@ -219,7 +219,7 @@ class NewsFilter:
         except Exception:
             return True   # can't assess → don't block
 
-    def is_news_candle(self, candle_dt_utc: datetime) -> bool:
+    def is_news_candle(self, candle_dt_utc: datetime, pair: str = "") -> bool:
         """
         Returns True if this 1H candle opens inside a news blackout window.
         Signal detector calls this to skip candles that fired during news.

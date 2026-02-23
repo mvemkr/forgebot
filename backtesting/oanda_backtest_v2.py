@@ -92,14 +92,68 @@ WATCHLIST = [
     "AUD/CAD", "AUD/NZD", "NZD/CAD", "NZD/JPY",
 ]
 
-# ── Disable-news-filter sentinel ──────────────────────────────────────────────
-class _NoOpNewsFilter(NewsFilter):
-    """News filter that never blocks — used in backtest since historical
-    ForexFactory data is unavailable. Gap logged separately."""
+# ── Historical news filter — CSV-backed ───────────────────────────────────────
+class _HistoricalNewsFilter(NewsFilter):
+    """
+    Backtest news filter backed by data/news/high_impact_events.csv.
+    Source: TradingView Economic Calendar API (high-impact only).
+
+    Blocks entries when the candle falls within BLOCK_WINDOW_MIN of a
+    high-impact event for any currency in the pair being evaluated.
+    Falls back to no-op if CSV not found (logs a warning once).
+    """
+    BLOCK_WINDOW_MIN = 60   # ±60 min around each news event
+
+    def __init__(self):
+        super().__init__()
+        self._events: list = []          # list of (datetime_utc, set_of_currencies)
+        self._loaded = False
+        self._warned = False
+        self._load()
+
+    def _load(self):
+        import csv as _csv, pathlib
+        csv_path = pathlib.Path(__file__).resolve().parents[1] / "data" / "news" / "high_impact_events.csv"
+        if not csv_path.exists():
+            self._warned = True
+            return
+        from datetime import timezone as _tz
+        with open(csv_path) as f:
+            for row in _csv.DictReader(f):
+                try:
+                    dt = datetime.strptime(row["datetime_utc"], "%Y-%m-%d %H:%M").replace(tzinfo=_tz.utc)
+                    ccy = row["currency"].upper().strip()
+                    self._events.append((dt, ccy))
+                except Exception:
+                    pass
+        self._loaded = True
+
+    def _pair_currencies(self, pair: str):
+        return set(pair.replace("_", "/").upper().split("/")[:2])
+
+    def _near_news(self, candle_dt: datetime, currencies: set) -> tuple:
+        from datetime import timedelta
+        window = timedelta(minutes=self.BLOCK_WINDOW_MIN)
+        for ev_dt, ev_ccy in self._events:
+            if ev_ccy in currencies and abs(candle_dt - ev_dt) <= window:
+                return True, ev_ccy, ev_dt
+        return False, None, None
+
     def is_entry_blocked(self, dt_utc, post_news_candle=None):
+        """Not used in backtest path — candle-level check used instead."""
         return False, ""
-    def is_news_candle(self, candle_dt_utc):
-        return False
+
+    def is_news_candle(self, candle_dt_utc, pair: str = "") -> bool:
+        if not self._loaded:
+            if not self._warned:
+                print("  ⚠ Historical news CSV not found — news filter disabled")
+                self._warned = True
+            return False
+        ccys = self._pair_currencies(pair) if pair else set()
+        hit, _, _ = self._near_news(candle_dt_utc, ccys if ccys else
+                                    {"USD","EUR","GBP","JPY","AUD","NZD","CAD","CHF"})
+        return hit
+
     def refresh_if_needed(self):
         pass
 
@@ -330,11 +384,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     strategies: Dict[str, SetAndForgetStrategy] = {}
     for pair in candle_data:
         s = SetAndForgetStrategy(account_balance=starting_bal, risk_pct=15.0)
-        s.news_filter = _NoOpNewsFilter()   # historical news data unavailable
+        s.news_filter = _HistoricalNewsFilter()   # CSV-backed historical filter
         strategies[pair] = s
-        log_gap(start_dt, pair, "N/A", "N/A", "news_filter_skipped",
-                "NewsFilter disabled in backtest — historical ForexFactory data unavailable."
-                " Live bot may block some of these entries.")
 
     # ── Risk manager ──────────────────────────────────────────────────
     journal = TradeJournal()
@@ -946,6 +997,8 @@ Examples:
     parser.add_argument("--lever",   action="append",      default=[],
                         metavar="KEY=VALUE",
                         help="Override a strategy_config lever (e.g. --lever MIN_CONFIDENCE=0.70)")
+    parser.add_argument("--news-filter", action="store_true", default=False,
+                        help="Enable historical news filter (CSV from data/news/). Alex never used this.")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -966,6 +1019,11 @@ Examples:
         except FileNotFoundError as e:
             parser.error(str(e))
 
+    # ── News filter ───────────────────────────────────────────────────────────
+    if args.news_filter:
+        _sc.apply_levers({"NEWS_FILTER_ENABLED": True})
+        print("  📰 News filter ENABLED — using data/news/high_impact_events.csv")
+
     # ── Apply individual --lever overrides ────────────────────────────────────
     if args.lever:
         overrides = {}
@@ -985,13 +1043,14 @@ Examples:
 
     # Build notes string that captures any lever overrides
     notes = args.notes
-    if args.lever or args.profile:
-        lever_summary = []
-        if args.profile:
-            lever_summary.append(f"profile={args.profile}")
-        if args.lever:
-            lever_summary.extend(args.lever)
-        suffix = " [levers: " + ", ".join(lever_summary) + "]"
-        notes = (notes + suffix).strip()
+    extra = []
+    if args.news_filter:
+        extra.append("news_filter=on")
+    if args.profile:
+        extra.append(f"profile={args.profile}")
+    if args.lever:
+        extra.extend(args.lever)
+    if extra:
+        notes = (notes + " [levers: " + ", ".join(extra) + "]").strip()
 
     run_backtest(start_dt=start, end_dt=end, starting_bal=args.balance, notes=notes)

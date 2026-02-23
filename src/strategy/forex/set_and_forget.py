@@ -933,7 +933,7 @@ class SetAndForgetStrategy:
                 from datetime import timezone as _tz2
                 if not last_candle_ts.tzinfo:
                     last_candle_ts = last_candle_ts.replace(tzinfo=_tz2.utc)
-                if _cfg.NEWS_FILTER_ENABLED and self.news_filter.is_news_candle(last_candle_ts):
+                if _cfg.NEWS_FILTER_ENABLED and self.news_filter.is_news_candle(last_candle_ts, pair=pair):
                     logger.info(
                         f"{pair}: Signal REJECTED — triggering candle formed during "
                         f"Tier 1 news window. Not genuine price action. Waiting for next bar."

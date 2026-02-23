@@ -1,0 +1,310 @@
+datetime_utc,currency,importance,event,hour_utc,in_london_window
+2024-07-01 05:00,JPY,1,Consumer Confidence,5,0
+2024-07-01 12:00,EUR,1,Inflation Rate YoY Prel,12,1
+2024-07-01 14:00,USD,1,ISM Manufacturing PMI,14,0
+2024-07-02 01:30,AUD,1,RBA Meeting Minutes,1,0
+2024-07-02 09:00,EUR,1,Inflation Rate YoY Flash,9,1
+2024-07-02 13:30,USD,1,Fed Chair Powell Speech,13,1
+2024-07-02 14:00,USD,1,JOLTs Job Openings,14,0
+2024-07-03 12:30,CAD,1,Balance of Trade,12,1
+2024-07-03 14:00,USD,1,ISM Services PMI,14,0
+2024-07-03 18:00,USD,1,FOMC Minutes,18,0
+2024-07-04 01:30,AUD,1,Balance of Trade,1,0
+2024-07-04 09:00,GBP,1,UK General Election,9,1
+2024-07-05 12:30,USD,1,Non Farm Payrolls,12,1
+2024-07-05 12:30,USD,1,Unemployment Rate,12,1
+2024-07-05 12:30,CAD,1,Unemployment Rate,12,1
+2024-07-05 14:00,CAD,1,Ivey PMI s.a,14,0
+2024-07-08 06:00,EUR,1,Balance of Trade,6,1
+2024-07-09 00:30,AUD,1,Westpac Consumer Confidence Change,0,0
+2024-07-09 01:30,AUD,1,NAB Business Confidence,1,0
+2024-07-09 14:00,USD,1,Fed Chair Powell Testimony,14,0
+2024-07-10 14:00,USD,1,Fed Chair Powell Testimony,14,0
+2024-07-11 06:00,GBP,1,GDP MoM,6,1
+2024-07-11 12:30,USD,1,Inflation Rate MoM,12,1
+2024-07-11 12:30,USD,1,Inflation Rate YoY,12,1
+2024-07-11 12:30,USD,1,Core Inflation Rate YoY,12,1
+2024-07-11 12:30,USD,1,Core Inflation Rate MoM,12,1
+2024-07-12 12:30,USD,1,PPI MoM,12,1
+2024-07-12 14:00,USD,1,Michigan Consumer Sentiment Prel,14,0
+2024-07-15 16:30,USD,1,Fed Chair Powell Speech,16,0
+2024-07-16 09:00,EUR,1,ZEW Economic Sentiment Index,9,1
+2024-07-16 12:30,CAD,1,Inflation Rate YoY,12,1
+2024-07-16 12:30,USD,1,Retail Sales MoM,12,1
+2024-07-17 06:00,GBP,1,Inflation Rate YoY,6,1
+2024-07-17 12:30,USD,1,Building Permits Prel,12,1
+2024-07-17 23:50,JPY,1,Balance of Trade,23,0
+2024-07-18 06:00,GBP,1,Unemployment Rate,6,1
+2024-07-18 12:15,EUR,1,Deposit Facility Rate,12,1
+2024-07-18 12:15,EUR,1,ECB Interest Rate Decision,12,1
+2024-07-18 12:45,EUR,1,ECB Press Conference,12,1
+2024-07-18 23:30,JPY,1,Inflation Rate YoY,23,0
+2024-07-19 06:00,GBP,1,Retail Sales MoM,6,1
+2024-07-24 06:00,EUR,1,GfK Consumer Confidence,6,1
+2024-07-24 07:30,EUR,1,HCOB Manufacturing PMI Flash,7,1
+2024-07-24 13:45,CAD,1,BoC Interest Rate Decision,13,1
+2024-07-24 13:45,CAD,1,BoC Monetary Policy Report,13,1
+2024-07-25 08:00,EUR,1,Ifo Business Climate,8,1
+2024-07-25 12:30,USD,1,Durable Goods Orders MoM,12,1
+2024-07-25 12:30,USD,1,GDP Growth Rate QoQ Adv,12,1
+2024-07-26 12:30,USD,1,Core PCE Price Index MoM,12,1
+2024-07-26 12:30,USD,1,Personal Spending MoM,12,1
+2024-07-26 12:30,USD,1,Personal Income MoM,12,1
+2024-07-30 05:30,EUR,1,GDP Growth Rate YoY Prel,5,0
+2024-07-30 05:30,EUR,1,GDP Growth Rate QoQ Prel,5,0
+2024-07-30 08:00,EUR,1,GDP Growth Rate YoY Flash,8,1
+2024-07-30 08:00,EUR,1,GDP Growth Rate QoQ Flash,8,1
+2024-07-30 08:00,EUR,1,GDP Growth Rate YoY Adv,8,1
+2024-07-30 08:00,EUR,1,GDP Growth Rate QoQ Adv,8,1
+2024-07-30 09:00,EUR,1,GDP Growth Rate YoY Flash,9,1
+2024-07-30 09:00,EUR,1,GDP Growth Rate QoQ Flash,9,1
+2024-07-30 12:00,EUR,1,Inflation Rate YoY Prel,12,1
+2024-07-30 14:00,USD,1,JOLTs Job Openings,14,0
+2024-07-31 01:30,AUD,1,Monthly CPI Indicator,1,0
+2024-07-31 04:00,JPY,1,BoJ Interest Rate Decision,4,0
+2024-07-31 05:00,JPY,1,Consumer Confidence,5,0
+2024-07-31 06:45,EUR,1,Inflation Rate YoY Prel,6,1
+2024-07-31 08:30,EUR,1,Inflation Rate YoY Prel,8,1
+2024-07-31 09:00,EUR,1,Inflation Rate YoY Flash,9,1
+2024-07-31 18:00,USD,1,Fed Interest Rate Decision,18,0
+2024-07-31 18:30,USD,1,Fed Press Conference,18,0
+2024-08-01 01:30,AUD,1,Balance of Trade,1,0
+2024-08-01 11:00,GBP,1,BoE Interest Rate Decision,11,1
+2024-08-01 14:00,USD,1,ISM Manufacturing PMI,14,0
+2024-08-02 12:30,USD,1,Unemployment Rate,12,1
+2024-08-02 12:30,USD,1,Non Farm Payrolls,12,1
+2024-08-05 14:00,USD,1,ISM Services PMI,14,0
+2024-08-06 04:30,AUD,1,RBA Interest Rate Decision,4,0
+2024-08-06 12:30,CAD,1,Balance of Trade,12,1
+2024-08-07 06:00,EUR,1,Balance of Trade,6,1
+2024-08-07 14:00,CAD,1,Ivey PMI s.a,14,0
+2024-08-09 12:30,CAD,1,Unemployment Rate,12,1
+2024-08-13 00:30,AUD,1,Westpac Consumer Confidence Change,0,0
+2024-08-13 01:30,AUD,1,NAB Business Confidence,1,0
+2024-08-13 06:00,GBP,1,Unemployment Rate,6,1
+2024-08-13 09:00,EUR,1,ZEW Economic Sentiment Index,9,1
+2024-08-13 12:30,USD,1,PPI MoM,12,1
+2024-08-14 06:00,GBP,1,Inflation Rate YoY,6,1
+2024-08-14 12:30,USD,1,Core Inflation Rate MoM,12,1
+2024-08-14 12:30,USD,1,Inflation Rate MoM,12,1
+2024-08-14 12:30,USD,1,Core Inflation Rate YoY,12,1
+2024-08-14 12:30,USD,1,Inflation Rate YoY,12,1
+2024-08-14 23:50,JPY,1,GDP Growth Rate QoQ Prel,23,0
+2024-08-15 06:00,GBP,1,GDP MoM,6,1
+2024-08-15 06:00,GBP,1,GDP Growth Rate YoY Prel,6,1
+2024-08-15 06:00,GBP,1,GDP Growth Rate QoQ Prel,6,1
+2024-08-15 12:30,USD,1,Retail Sales MoM,12,1
+2024-08-16 06:00,GBP,1,Retail Sales MoM,6,1
+2024-08-16 12:30,USD,1,Building Permits Prel,12,1
+2024-08-16 14:00,USD,1,Michigan Consumer Sentiment Prel,14,0
+2024-08-20 01:30,AUD,1,RBA Meeting Minutes,1,0
+2024-08-20 12:30,CAD,1,Inflation Rate YoY,12,1
+2024-08-20 23:50,JPY,1,Balance of Trade,23,0
+2024-08-21 14:00,USD,1,Non Farm Payrolls Annual Revision,14,0
+2024-08-21 18:00,USD,1,FOMC Minutes,18,0
+2024-08-22 07:30,EUR,1,HCOB Manufacturing PMI Flash,7,1
+2024-08-22 23:30,JPY,1,Inflation Rate YoY,23,0
+2024-08-23 14:00,USD,1,Fed Chair Powell Speech,14,0
+2024-08-26 08:00,EUR,1,Ifo Business Climate,8,1
+2024-08-26 12:30,USD,1,Durable Goods Orders MoM,12,1
+2024-08-27 06:00,EUR,1,GfK Consumer Confidence,6,1
+2024-08-28 01:30,AUD,1,Monthly CPI Indicator,1,0
+2024-08-29 05:00,JPY,1,Consumer Confidence,5,0
+2024-08-29 12:00,EUR,1,Inflation Rate YoY Prel,12,1
+2024-08-29 12:30,USD,1,GDP Growth Rate QoQ 2nd Est,12,1
+2024-08-30 06:45,EUR,1,Inflation Rate YoY Prel,6,1
+2024-08-30 09:00,EUR,1,Inflation Rate YoY Prel,9,1
+2024-08-30 09:00,EUR,1,Inflation Rate YoY Flash,9,1
+2024-08-30 12:30,CAD,1,GDP Growth Rate Annualized,12,1
+2024-08-30 12:30,CAD,1,GDP Growth Rate QoQ,12,1
+2024-08-30 12:30,USD,1,Core PCE Price Index MoM,12,1
+2024-08-30 12:30,USD,1,Personal Income MoM,12,1
+2024-08-30 12:30,USD,1,Personal Spending MoM,12,1
+2024-09-03 14:00,USD,1,ISM Manufacturing PMI,14,0
+2024-09-04 01:30,AUD,1,GDP Growth Rate QoQ,1,0
+2024-09-04 12:30,CAD,1,Balance of Trade,12,1
+2024-09-04 13:45,CAD,1,BoC Interest Rate Decision,13,1
+2024-09-04 14:00,USD,1,JOLTs Job Openings,14,0
+2024-09-05 01:30,AUD,1,Balance of Trade,1,0
+2024-09-05 14:00,USD,1,ISM Services PMI,14,0
+2024-09-06 06:00,EUR,1,Balance of Trade,6,1
+2024-09-06 12:30,USD,1,Non Farm Payrolls,12,1
+2024-09-06 12:30,USD,1,Unemployment Rate,12,1
+2024-09-06 12:30,CAD,1,Unemployment Rate,12,1
+2024-09-06 14:00,CAD,1,Ivey PMI s.a,14,0
+2024-09-10 00:30,AUD,1,Westpac Consumer Confidence Change,0,0
+2024-09-10 01:30,AUD,1,NAB Business Confidence,1,0
+2024-09-10 06:00,GBP,1,Unemployment Rate,6,1
+2024-09-11 06:00,GBP,1,GDP MoM,6,1
+2024-09-11 12:30,USD,1,Core Inflation Rate MoM,12,1
+2024-09-11 12:30,USD,1,Inflation Rate MoM,12,1
+2024-09-11 12:30,USD,1,Inflation Rate YoY,12,1
+2024-09-11 12:30,USD,1,Core Inflation Rate YoY,12,1
+2024-09-12 12:15,EUR,1,Deposit Facility Rate,12,1
+2024-09-12 12:15,EUR,1,ECB Interest Rate Decision,12,1
+2024-09-12 12:30,USD,1,PPI MoM,12,1
+2024-09-12 12:45,EUR,1,ECB Press Conference,12,1
+2024-09-13 14:00,USD,1,Michigan Consumer Sentiment Prel,14,0
+2024-09-17 09:00,EUR,1,ZEW Economic Sentiment Index,9,1
+2024-09-17 12:30,USD,1,Retail Sales MoM,12,1
+2024-09-17 12:30,CAD,1,Inflation Rate YoY,12,1
+2024-09-17 23:50,JPY,1,Balance of Trade,23,0
+2024-09-18 06:00,GBP,1,Inflation Rate YoY,6,1
+2024-09-18 12:30,USD,1,Building Permits Prel,12,1
+2024-09-18 18:00,USD,1,Fed Interest Rate Decision,18,0
+2024-09-18 18:00,USD,1,FOMC Economic Projections,18,0
+2024-09-18 18:30,USD,1,Fed Press Conference,18,0
+2024-09-19 11:00,GBP,1,BoE Interest Rate Decision,11,1
+2024-09-19 23:30,JPY,1,Inflation Rate YoY,23,0
+2024-09-20 03:00,JPY,1,BoJ Interest Rate Decision,3,0
+2024-09-20 06:00,GBP,1,Retail Sales MoM,6,1
+2024-09-23 07:30,EUR,1,HCOB Manufacturing PMI Flash,7,1
+2024-09-24 04:30,AUD,1,RBA Interest Rate Decision,4,0
+2024-09-24 08:00,EUR,1,Ifo Business Climate,8,1
+2024-09-25 01:30,AUD,1,Monthly CPI Indicator,1,0
+2024-09-26 06:00,EUR,1,GfK Consumer Confidence,6,1
+2024-09-26 12:30,USD,1,GDP Growth Rate QoQ Final,12,1
+2024-09-26 12:30,USD,1,Durable Goods Orders MoM,12,1
+2024-09-26 13:20,USD,1,Fed Chair Powell Speech,13,1
+2024-09-27 06:45,EUR,1,Inflation Rate YoY Prel,6,1
+2024-09-27 12:30,USD,1,Core PCE Price Index MoM,12,1
+2024-09-27 12:30,USD,1,Personal Spending MoM,12,1
+2024-09-27 12:30,USD,1,Personal Income MoM,12,1
+2024-09-30 09:00,EUR,1,Inflation Rate YoY Prel,9,1
+2024-09-30 12:00,EUR,1,Inflation Rate YoY Prel,12,1
+2024-09-30 17:55,USD,1,Fed Chair Powell Speech,17,0
+2024-09-30 23:50,JPY,1,Tankan Large Manufacturers Index,23,0
+2024-10-01 09:00,EUR,1,Inflation Rate YoY Flash,9,1
+2024-10-01 14:00,USD,1,ISM Manufacturing PMI,14,0
+2024-10-01 14:00,USD,1,JOLTs Job Openings,14,0
+2024-10-02 05:00,JPY,1,Consumer Confidence,5,0
+2024-10-03 01:30,AUD,1,Balance of Trade,1,0
+2024-10-03 14:00,USD,1,ISM Services PMI,14,0
+2024-10-04 12:30,USD,1,Unemployment Rate,12,1
+2024-10-04 12:30,USD,1,Non Farm Payrolls,12,1
+2024-10-04 14:00,CAD,1,Ivey PMI s.a,14,0
+2024-10-08 00:30,AUD,1,NAB Business Confidence,0,0
+2024-10-08 00:30,AUD,1,RBA Meeting Minutes,0,0
+2024-10-08 01:00,AUD,1,Westpac Consumer Confidence Change,1,0
+2024-10-08 12:30,CAD,1,Balance of Trade,12,1
+2024-10-09 06:00,EUR,1,Balance of Trade,6,1
+2024-10-09 18:00,USD,1,FOMC Minutes,18,0
+2024-10-10 12:30,USD,1,Core Inflation Rate MoM,12,1
+2024-10-10 12:30,USD,1,Inflation Rate MoM,12,1
+2024-10-10 12:30,USD,1,Core Inflation Rate YoY,12,1
+2024-10-10 12:30,USD,1,Inflation Rate YoY,12,1
+2024-10-11 06:00,GBP,1,GDP MoM,6,1
+2024-10-11 12:30,CAD,1,Unemployment Rate,12,1
+2024-10-11 12:30,USD,1,PPI MoM,12,1
+2024-10-11 14:00,USD,1,Michigan Consumer Sentiment Prel,14,0
+2024-10-15 06:00,GBP,1,Unemployment Rate,6,1
+2024-10-15 09:00,EUR,1,ZEW Economic Sentiment Index,9,1
+2024-10-15 12:30,CAD,1,Inflation Rate YoY,12,1
+2024-10-16 06:00,GBP,1,Inflation Rate YoY,6,1
+2024-10-16 18:40,EUR,1,ECB President Lagarde Speech,18,0
+2024-10-16 23:50,JPY,1,Balance of Trade,23,0
+2024-10-17 12:15,EUR,1,Deposit Facility Rate,12,1
+2024-10-17 12:15,EUR,1,ECB Interest Rate Decision,12,1
+2024-10-17 12:30,USD,1,Retail Sales MoM,12,1
+2024-10-17 12:45,EUR,1,ECB Press Conference,12,1
+2024-10-17 23:30,JPY,1,Inflation Rate YoY,23,0
+2024-10-18 06:00,GBP,1,Retail Sales MoM,6,1
+2024-10-18 12:30,USD,1,Building Permits Prel,12,1
+2024-10-22 14:00,EUR,1,ECB President Lagarde Speech,14,0
+2024-10-22 19:15,EUR,1,ECB President Lagarde Speech,19,0
+2024-10-23 13:45,CAD,1,BoC Interest Rate Decision,13,1
+2024-10-23 13:45,CAD,1,BoC Monetary Policy Report,13,1
+2024-10-23 14:00,EUR,1,ECB President Lagarde Speech,14,0
+2024-10-24 07:30,EUR,1,HCOB Manufacturing PMI Flash,7,1
+2024-10-25 08:00,EUR,1,Ifo Business Climate,8,1
+2024-10-25 12:30,USD,1,Durable Goods Orders MoM,12,1
+2024-10-29 07:00,EUR,1,GfK Consumer Confidence,7,1
+2024-10-29 14:00,USD,1,JOLTs Job Openings,14,0
+2024-10-30 00:30,AUD,1,Monthly CPI Indicator,0,0
+2024-10-30 05:00,JPY,1,Consumer Confidence,5,0
+2024-10-30 06:30,EUR,1,GDP Growth Rate QoQ Prel,6,1
+2024-10-30 06:30,EUR,1,GDP Growth Rate YoY Prel,6,1
+2024-10-30 09:00,EUR,1,GDP Growth Rate QoQ Flash,9,1
+2024-10-30 09:00,EUR,1,GDP Growth Rate YoY Flash,9,1
+2024-10-30 09:00,EUR,1,GDP Growth Rate QoQ Adv,9,1
+2024-10-30 09:00,EUR,1,GDP Growth Rate YoY Adv,9,1
+2024-10-30 10:00,EUR,1,GDP Growth Rate YoY Flash,10,1
+2024-10-30 10:00,EUR,1,GDP Growth Rate QoQ Flash,10,1
+2024-10-30 12:30,USD,1,GDP Growth Rate QoQ Adv,12,1
+2024-10-30 13:00,EUR,1,Inflation Rate YoY Prel,13,1
+2024-10-31 03:00,JPY,1,BoJ Interest Rate Decision,3,0
+2024-10-31 07:45,EUR,1,Inflation Rate YoY Prel,7,1
+2024-10-31 10:00,EUR,1,Inflation Rate YoY Prel,10,1
+2024-10-31 10:00,EUR,1,Inflation Rate YoY Flash,10,1
+2024-10-31 12:30,USD,1,Core PCE Price Index MoM,12,1
+2024-10-31 12:30,USD,1,Personal Income MoM,12,1
+2024-10-31 12:30,USD,1,Personal Spending MoM,12,1
+2026-01-05 15:00,USD,1,ISM Manufacturing PMI,15,0
+2026-01-06 07:45,EUR,1,Inflation Rate YoY Prel,7,1
+2026-01-06 13:00,EUR,1,Inflation Rate YoY Prel,13,1
+2026-01-07 10:00,EUR,1,Inflation Rate YoY Flash,10,1
+2026-01-07 10:00,EUR,1,Inflation Rate YoY Prel,10,1
+2026-01-07 15:00,USD,1,ISM Services PMI,15,0
+2026-01-07 15:00,USD,1,JOLTs Job Openings,15,0
+2026-01-07 15:00,CAD,1,Ivey PMI s.a,15,0
+2026-01-08 00:30,AUD,1,Balance of Trade,0,0
+2026-01-08 05:00,JPY,1,Consumer Confidence,5,0
+2026-01-09 07:00,EUR,1,Balance of Trade,7,1
+2026-01-09 13:30,USD,1,Building Permits Prel,13,1
+2026-01-09 13:30,USD,1,Housing Starts,13,1
+2026-01-09 13:30,USD,1,Building Permits Prel,13,1
+2026-01-09 13:30,USD,1,Housing Starts,13,1
+2026-01-09 13:30,USD,1,Non Farm Payrolls,13,1
+2026-01-09 13:30,USD,1,Unemployment Rate,13,1
+2026-01-09 13:30,CAD,1,Unemployment Rate,13,1
+2026-01-09 15:00,USD,1,Michigan Consumer Sentiment Prel,15,0
+2026-01-12 23:30,AUD,1,Westpac Consumer Confidence Change,23,0
+2026-01-13 13:30,USD,1,Inflation Rate YoY,13,1
+2026-01-13 13:30,USD,1,Core Inflation Rate YoY,13,1
+2026-01-13 13:30,USD,1,Core Inflation Rate MoM,13,1
+2026-01-13 13:30,USD,1,Inflation Rate MoM,13,1
+2026-01-14 13:30,USD,1,PPI MoM,13,1
+2026-01-14 13:30,USD,1,PPI MoM,13,1
+2026-01-14 13:30,USD,1,Retail Sales MoM,13,1
+2026-01-14 15:00,USD,1,Existing Home Sales,15,0
+2026-01-15 07:00,GBP,1,GDP MoM,7,1
+2026-01-15 09:00,EUR,1,Full Year GDP Growth,9,1
+2026-01-19 13:30,CAD,1,Inflation Rate YoY,13,1
+2026-01-20 07:00,GBP,1,Unemployment Rate,7,1
+2026-01-20 10:00,EUR,1,ZEW Economic Sentiment Index,10,1
+2026-01-21 07:00,GBP,1,Inflation Rate YoY,7,1
+2026-01-21 23:50,JPY,1,Balance of Trade,23,0
+2026-01-22 13:30,USD,1,GDP Growth Rate QoQ Final,13,1
+2026-01-22 15:00,USD,1,Core PCE Price Index MoM,15,0
+2026-01-22 15:00,USD,1,Personal Spending MoM,15,0
+2026-01-22 15:00,USD,1,Personal Income MoM,15,0
+2026-01-22 15:00,USD,1,Core PCE Price Index MoM,15,0
+2026-01-22 15:00,USD,1,Personal Income MoM,15,0
+2026-01-22 15:00,USD,1,Personal Spending MoM,15,0
+2026-01-22 23:30,JPY,1,Inflation Rate YoY,23,0
+2026-01-23 03:00,JPY,1,BoJ Interest Rate Decision,3,0
+2026-01-23 07:00,GBP,1,Retail Sales MoM,7,1
+2026-01-23 08:30,EUR,1,HCOB Manufacturing PMI Flash,8,1
+2026-01-23 09:30,GBP,1,S&P Global Services PMI Flash,9,1
+2026-01-23 09:30,GBP,1,S&P Global Manufacturing PMI Flash,9,1
+2026-01-26 09:00,EUR,1,Ifo Business Climate,9,1
+2026-01-26 13:30,USD,1,Durable Goods Orders MoM,13,1
+2026-01-27 00:30,AUD,1,NAB Business Confidence,0,0
+2026-01-28 07:00,EUR,1,GfK Consumer Confidence,7,1
+2026-01-28 14:45,CAD,1,BoC Interest Rate Decision,14,0
+2026-01-28 14:45,CAD,1,BoC Monetary Policy Report,14,0
+2026-01-28 19:00,USD,1,Fed Interest Rate Decision,19,0
+2026-01-28 19:30,USD,1,Fed Press Conference,19,0
+2026-01-29 05:00,JPY,1,Consumer Confidence,5,0
+2026-01-30 06:30,EUR,1,GDP Growth Rate QoQ Prel,6,1
+2026-01-30 06:30,EUR,1,GDP Growth Rate YoY Prel,6,1
+2026-01-30 08:00,EUR,1,GDP Growth Rate QoQ Flash,8,1
+2026-01-30 08:00,EUR,1,GDP Growth Rate YoY Flash,8,1
+2026-01-30 09:00,EUR,1,GDP Growth Rate YoY Flash,9,1
+2026-01-30 09:00,EUR,1,GDP Growth Rate QoQ Flash,9,1
+2026-01-30 09:00,EUR,1,GDP Growth Rate QoQ Adv,9,1
+2026-01-30 09:00,EUR,1,GDP Growth Rate YoY Adv,9,1
+2026-01-30 10:00,EUR,1,GDP Growth Rate YoY Flash,10,1
+2026-01-30 10:00,EUR,1,GDP Growth Rate QoQ Flash,10,1
+2026-01-30 13:00,EUR,1,Inflation Rate YoY Prel,13,1
+2026-01-30 13:30,USD,1,PPI MoM,13,1
