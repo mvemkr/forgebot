@@ -202,6 +202,15 @@ OVEREXTENSION_THRESHOLD: float = 0.90
 # False → require daily to be actively turning (confirmed reversal only).
 ALLOW_TIER3_REVERSALS: bool = True
 
+# ── News filter lever ─────────────────────────────────────────────────────
+# Whether to block entries when the triggering candle forms during a
+# high-impact news event (NFP, CPI, FOMC, BoE, ECB rate decisions).
+# Alex's rule: engulfing candle = entry. He never mentioned avoiding news.
+# This filter was added as a safeguard but is NOT in Alex's methodology.
+# Default False = matches backtest behavior (news filter has no historical
+# data and runs as a no-op). Live bot and backtest must match.
+NEWS_FILTER_ENABLED: bool = False
+
 # ── Theme stacking lever ───────────────────────────────────────────────────
 # Whether an active macro theme can BLOCK an entry that contradicts it.
 # True  → if USD_strong theme is active and pattern wants EUR/USD LONG,
@@ -296,6 +305,10 @@ def get_model_tags() -> list:
     """
     m = _sys.modules[__name__]
     tags = []
+
+    # ── News filter ─────────────────────────────────────────────────────────
+    if m.NEWS_FILTER_ENABLED:
+        tags.append("news_filter_on")
 
     # ── Entry signal ────────────────────────────────────────────────────────
     tags.append("engulfing_only" if m.ENGULFING_ONLY else "pin_bars_allowed")

@@ -489,9 +489,12 @@ class SetAndForgetStrategy:
             df_1h.iloc[-2][["open", "high", "low", "close"]].to_dict()
             if len(df_1h) >= 2 else None
         )
-        news_blocked, news_reason = self.news_filter.is_entry_blocked(
-            current_dt or datetime.now(_tz.utc),
-            post_news_candle=_last_closed_candle,
+        news_blocked, news_reason = (
+            self.news_filter.is_entry_blocked(
+                current_dt or datetime.now(_tz.utc),
+                post_news_candle=_last_closed_candle,
+            )
+            if _cfg.NEWS_FILTER_ENABLED else (False, "")
         )
         if news_blocked:
             return TradeDecision(
@@ -930,7 +933,7 @@ class SetAndForgetStrategy:
                 from datetime import timezone as _tz2
                 if not last_candle_ts.tzinfo:
                     last_candle_ts = last_candle_ts.replace(tzinfo=_tz2.utc)
-                if self.news_filter.is_news_candle(last_candle_ts):
+                if _cfg.NEWS_FILTER_ENABLED and self.news_filter.is_news_candle(last_candle_ts):
                     logger.info(
                         f"{pair}: Signal REJECTED — triggering candle formed during "
                         f"Tier 1 news window. Not genuine price action. Waiting for next bar."
