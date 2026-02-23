@@ -131,10 +131,12 @@ class ForexRiskManager:
         return 25.0  # fallback
 
     def get_tier_label(self, account_balance: float) -> str:
+        # Note: use &lt; not < — these labels are sent via Telegram HTML parse mode
+        # and bare < is treated as an opening HTML tag, causing a 400 parse error.
         labels = {
-            10.0: "Tier 1 (<$8K) — 10%",
-            15.0: "Tier 2 (<$15K) — 15%",
-            20.0: "Tier 3 (<$30K) — 20%",
+            10.0: "Tier 1 (&lt;$8K) — 10%",
+            15.0: "Tier 2 (&lt;$15K) — 15%",
+            20.0: "Tier 3 (&lt;$30K) — 20%",
             25.0: "Tier 4 ($30K+) — 25%",
         }
         return labels.get(self.get_risk_pct(account_balance), "?")
