@@ -74,6 +74,13 @@ WATCHLIST = [
 LONDON_SESSION_START_UTC = 8
 LONDON_SESSION_END_UTC   = 13
 
+# Minimum confidence to execute a trade (matches backtester threshold)
+MIN_CONFIDENCE = 0.65
+
+# Paper trading balance used in dry_run when OANDA account is unfunded ($0)
+# Ensures kill-switch math and risk sizing work correctly without real capital.
+DRY_RUN_PAPER_BALANCE = 8000.0
+
 
 class ForexOrchestrator:
     """
@@ -106,14 +113,24 @@ class ForexOrchestrator:
 
         try:
             summary              = self.oanda.get_account_summary()
-            self.account_balance = summary.get("balance", 4000.0)
-            self.account_nav     = summary.get("nav", self.account_balance)
+            real_balance         = summary.get("balance", 0.0)
+            self.account_nav     = summary.get("nav", real_balance)
             self.unrealized_pnl  = summary.get("unrealized_pnl", 0.0)
-            logger.info(f"Account balance: ${self.account_balance:,.2f}")
+            # In dry_run with an unfunded account ($0), use a paper balance so
+            # risk sizing and kill-switch math work correctly.
+            if dry_run and real_balance < 100.0:
+                self.account_balance = DRY_RUN_PAPER_BALANCE
+                logger.info(
+                    f"DRY RUN — OANDA balance ${real_balance:.2f} (unfunded). "
+                    f"Using paper balance ${DRY_RUN_PAPER_BALANCE:,.0f} for sizing."
+                )
+            else:
+                self.account_balance = real_balance
+                logger.info(f"Account balance: ${self.account_balance:,.2f}")
         except Exception as e:
             logger.error(f"Could not fetch account balance: {e}")
-            self.account_balance = 4000.0
-            self.account_nav     = 4000.0
+            self.account_balance = DRY_RUN_PAPER_BALANCE if dry_run else 4000.0
+            self.account_nav     = self.account_balance
             self.unrealized_pnl  = 0.0
 
         self.risk             = ForexRiskManager(self.journal)
@@ -217,8 +234,14 @@ class ForexOrchestrator:
 
         # Refresh balance
         try:
-            summary              = self.oanda.get_account_summary()
-            self.account_balance = summary.get("balance", self.account_balance)
+            summary    = self.oanda.get_account_summary()
+            real_bal   = summary.get("balance", self.account_balance)
+            # Dry run with unfunded account: always use paper balance so risk
+            # sizing and kill-switch math work. Never let $0 bleed through.
+            if self.dry_run and real_bal < 100.0:
+                self.account_balance = DRY_RUN_PAPER_BALANCE
+            else:
+                self.account_balance = real_bal
             self.account_nav     = summary.get("nav",     self.account_nav)
             self.unrealized_pnl  = summary.get("unrealized_pnl", 0.0)
             self.strategy.update_balance(self.account_balance)
@@ -409,7 +432,31 @@ class ForexOrchestrator:
         )
 
         if decision.decision.value == "ENTER":
-            logger.info(f"🎯 {pair}: ENTER signal! overnight={overnight}")
+            # ── Confidence gate (matches backtester MIN_CONFIDENCE=65%) ──
+            if decision.confidence < MIN_CONFIDENCE:
+                logger.info(
+                    f"⚠ {pair}: ENTER signal BLOCKED — confidence {decision.confidence:.0%} "
+                    f"< {MIN_CONFIDENCE:.0%} threshold. Waiting for stronger setup."
+                )
+                return
+
+            # ── Session gate — only auto-execute during London session ────
+            # Outside London: log the signal so Mike can act manually, but
+            # don't auto-execute. Alex always enters London session (1-3 AM ET).
+            if not overnight:
+                logger.info(
+                    f"⏰ {pair}: ENTER signal in non-London session — "
+                    f"logging for review, not auto-executing. (conf={decision.confidence:.0%})"
+                )
+                self.notifier.send(
+                    f"⏰ <b>{pair} signal (non-London)</b> — {decision.direction} @ "
+                    f"{decision.entry_price:.5f if decision.entry_price else '?'} | "
+                    f"conf={decision.confidence:.0%}\n"
+                    f"<i>Not auto-executing — outside London session. Review manually.</i>"
+                )
+                return
+
+            logger.info(f"🎯 {pair}: ENTER signal! overnight={overnight} conf={decision.confidence:.0%}")
             result = self.executor.execute(decision, self.account_balance)
 
             if result.get("status") in ("filled", "pending", "dry_run"):

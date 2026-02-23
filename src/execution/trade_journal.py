@@ -163,7 +163,13 @@ class TradeJournal:
             "exit_reason": exit_reason,
             "units": units,
             "pnl_pips": round(pnl_pips, 1),
-            "pnl_dollars": round(pnl_pips * units * (0.01 if "JPY" in pair else 0.0001), 2),
+            # Pip value → USD conversion.
+            # For JPY pairs the raw calculation gives JPY, not USD.
+            # Divide by approximate USD/JPY rate (150) to convert.
+            # For non-JPY pairs 0.0001 pip × units ≈ USD directly.
+            "pnl_dollars": round(
+                pnl_pips * units * (0.01 / 150 if "JPY" in pair else 0.0001), 2
+            ),
             "rr_achieved": round(rr, 2),
             "account_balance_after": account_balance_after,
             "notes": notes,
