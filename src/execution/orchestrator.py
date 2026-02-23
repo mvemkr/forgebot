@@ -175,7 +175,37 @@ class ForexOrchestrator:
         self._last_monthly_report: Optional[datetime] = None
         self._prev_mode:           Optional[str]      = None
 
-        # Restore pattern memory from last saved state (crash recovery)
+        # ── Crash recovery — restore full state from last save ───────────
+        # Reconciles saved state with OANDA live data:
+        #   - Open positions: restores full context (entry, stop, direction,
+        #     pattern, trends, confidence, entry_reason, tier — everything)
+        #   - Pattern memory: marks exhausted patterns so we don't re-enter
+        # If the bot restarts mid-trade, it picks up exactly where it left off.
+        try:
+            recovery = self.state.reconcile_with_oanda(self.oanda, self.strategy)
+            if recovery.get("recovered"):
+                n_pos = len(recovery.get("recovered_positions", {}))
+                age_m = int(recovery.get("state_age_seconds", 0) / 60)
+                if n_pos:
+                    logger.info(
+                        f"✅ Recovered {n_pos} open position(s) from state "
+                        f"({age_m}m ago): {list(recovery['recovered_positions'].keys())}"
+                    )
+                    self.notifier.send(
+                        f"♻️ Bot restarted — recovered {n_pos} open position(s) from saved state "
+                        f"({age_m}m ago):\n" +
+                        "\n".join(
+                            f"  • {p}: {v.get('direction','?')} @ {v.get('entry','?'):.5f}  "
+                            f"SL={v.get('stop','?'):.5f}  pattern={v.get('pattern_type','?')}"
+                            for p, v in recovery["recovered_positions"].items()
+                        )
+                    )
+                else:
+                    logger.info("State reconciled — no open positions to recover")
+        except Exception as e:
+            logger.warning(f"State recovery failed: {e}")
+
+        # Restore pattern memory from last saved state
         try:
             saved = self.state.load()
             if saved:
@@ -183,7 +213,7 @@ class ForexOrchestrator:
                 if patterns:
                     restored = {k: "exhausted" for k in patterns}
                     self.strategy.restore_traded_patterns(restored)
-                    logger.info(f"Restored {len(restored)} exhausted patterns from state")
+                    logger.info(f"Restored {len(restored)} exhausted pattern(s) from state")
         except Exception as e:
             logger.warning(f"Pattern memory restore failed: {e}")
 

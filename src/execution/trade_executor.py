@@ -14,6 +14,7 @@ Safety defaults:
   - All orders are LIMIT orders (no market orders on entry)
 """
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -196,7 +197,11 @@ class TradeExecutor:
             risk_pct=risk_pct,   # stored for book exposure tracking on 2nd trade
         )
 
-        # Enrich position dict with metadata for post-trade analysis
+        # ── Enrich position dict with full entry context ─────────────────
+        # This is the "why" behind the trade. Persisted to bot_state.json
+        # every tick and restored on startup via reconcile_with_oanda().
+        # On restart the bot knows exactly why it's in each trade and
+        # manages stops / breakeven / exit signals correctly.
         if pair in self.strategy.open_positions:
             pos = self.strategy.open_positions[pair]
             if oanda_trade_id:
@@ -208,7 +213,13 @@ class TradeExecutor:
             pos["risk_pct"]            = risk_pct
             pos["risk_dollars"]        = risk_dollars
             pos["units"]               = units
-            pos["entry_ts"]            = decision.entry_price  # approximation; journal has real ts
+            pos["entry_ts"]            = datetime.now(timezone.utc).isoformat()
+            pos["entry_reason"]        = decision.reason or ""
+            pos["trend_weekly"]        = trend_weekly
+            pos["trend_daily"]         = trend_daily
+            pos["trend_4h"]            = trend_4h
+            pos["pattern_clarity"]     = decision.pattern.clarity if decision.pattern else 0.0
+            pos["pattern_notes"]       = decision.pattern.notes   if decision.pattern else ""
             # Session extraction
             for part in (decision.reason or "").split("|"):
                 if "Session:" in part:

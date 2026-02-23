@@ -151,19 +151,26 @@ class BotState:
 
         for pair, pos in saved_positions.items():
             if pair in oanda_open:
-                # Trade still open on OANDA — restore it
+                # Trade still open on OANDA — restore full context from saved state.
+                # Start with everything we saved (the full "why" — pattern, trends,
+                # confidence, entry reason, tier) then overlay live OANDA values for
+                # fields that may have changed (stop, units, trade ID).
                 oanda_trade = oanda_open[pair]
-                restored = {
-                    "entry": pos.get("entry", oanda_trade["entry"]),
-                    "stop": pos.get("stop", oanda_trade.get("stop_loss")),
-                    "direction": pos.get("direction", oanda_trade["direction"]),
-                    "oanda_trade_id": oanda_trade["id"],
-                    "units": oanda_trade["units"],
-                }
+                restored = dict(pos)  # full saved context — pattern, trends, reason, etc.
+                restored["oanda_trade_id"] = oanda_trade["id"]
+                restored["units"]          = oanda_trade["units"]
+                # Trust OANDA's stop as ground truth (may have been moved to breakeven)
+                live_stop = oanda_trade.get("stop_loss")
+                if live_stop:
+                    restored["stop"] = live_stop
                 strategy.open_positions[pair] = restored
                 recovered_positions[pair] = restored
-                logger.info(f"Recovered open position: {pair} {restored['direction']} "
-                           f"entry={restored['entry']} stop={restored['stop']}")
+                logger.info(
+                    f"Recovered open position: {pair} {restored.get('direction','?')} "
+                    f"entry={restored.get('entry','?')} stop={restored.get('stop','?')} "
+                    f"pattern={restored.get('pattern_type','?')} "
+                    f"conf={restored.get('confidence', 0):.0%}"
+                )
             else:
                 logger.info(f"Saved position {pair} not found on OANDA — may have been closed")
 
