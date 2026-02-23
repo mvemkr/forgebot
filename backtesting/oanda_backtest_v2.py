@@ -58,6 +58,7 @@ from src.strategy.forex.strategy_config import (
     LONDON_SESSION_START_UTC,
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
+    progressive_confluence_check,
     NECKLINE_CLUSTER_PCT,
     DRY_RUN_PAPER_BALANCE,
 )
@@ -618,6 +619,23 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                         f"Confidence {decision.confidence:.0%} < {MIN_CONFIDENCE:.0%} threshold  "
                         f"entry={decision.entry_price:.5f}  reason={decision.reason[:60]}")
                 continue  # skip silently (high-frequency; print only on debug)
+
+            # ── Progressive confluence gate ───────────────────────────
+            # Second trade must clear a higher bar: 75%+ confidence,
+            # structural pattern required (no break-retests as 2nd entry).
+            if decision.decision == Decision.ENTER:
+                pattern_type = (
+                    decision.pattern.pattern_type if decision.pattern else ""
+                )
+                prog_blocked, prog_reason = progressive_confluence_check(
+                    n_open=len(open_pos),
+                    confidence=decision.confidence,
+                    pattern_type=pattern_type,
+                )
+                if prog_blocked:
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED",
+                            "progressive_confluence", prog_reason)
+                    continue
 
             # ── Stop-distance guard ───────────────────────────────────
             if (decision.decision == Decision.ENTER

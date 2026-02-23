@@ -83,6 +83,7 @@ from ..strategy.forex.strategy_config import (
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
     DRY_RUN_PAPER_BALANCE,
+    progressive_confluence_check,
 )
 
 
@@ -472,6 +473,21 @@ class ForexOrchestrator:
                     f"⚠ {pair}: ENTER signal BLOCKED — confidence {decision.confidence:.0%} "
                     f"< {MIN_CONFIDENCE:.0%} threshold. Waiting for stronger setup."
                 )
+                return
+
+            # ── Progressive confluence gate ───────────────────────────────
+            # Second trade must clear a higher bar: 75%+ confidence,
+            # structural pattern only (no break-retests alongside open position).
+            pattern_type = (
+                decision.pattern.pattern_type if decision.pattern else ""
+            )
+            prog_blocked, prog_reason = progressive_confluence_check(
+                n_open=len(self.strategy.open_positions),
+                confidence=decision.confidence,
+                pattern_type=pattern_type,
+            )
+            if prog_blocked:
+                logger.info(f"⚠ {pair}: ENTER BLOCKED — {prog_reason}")
                 return
 
             # ── Session gate — only auto-execute during London session ────
