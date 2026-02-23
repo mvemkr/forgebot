@@ -89,8 +89,22 @@
   <span>⏸ <strong>BOT PAUSED</strong> — No new trades. Tell Forge "resume trading" to restart.</span>
 </div>
 
+<!-- ── TAB NAV ────────────────────────────────────────────── -->
+<div class="px-6 pt-4 border-b border-base-300 bg-base-200 flex gap-1">
+  <button @click="activeTab='live'"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
+    :class="activeTab==='live' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
+    <i class="ph ph-pulse mr-1"></i> Live
+  </button>
+  <button @click="activeTab='backtests'; loadBacktests()"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
+    :class="activeTab==='backtests' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
+    <i class="ph ph-chart-bar mr-1"></i> Backtests
+  </button>
+</div>
+
 <!-- ── MAIN GRID ──────────────────────────────────────────── -->
-<div class="p-6 grid grid-cols-12 gap-5">
+<div class="p-6 grid grid-cols-12 gap-5" x-show="activeTab==='live'">
 
   <!-- ── ACCOUNT STATS ROW ────────────────────────────── -->
   <div class="col-span-12 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
@@ -481,7 +495,183 @@
     </div>
   </div>
 
-</div><!-- end grid -->
+</div><!-- end live grid -->
+
+<!-- ── BACKTESTS TAB ─────────────────────────────────────── -->
+<div x-show="activeTab==='backtests'" class="p-6 space-y-5">
+
+  <!-- Run a backtest -->
+  <div class="bg-base-200 border border-base-300 rounded-2xl p-5">
+    <div class="font-bold text-sm uppercase tracking-widest text-base-content/50 mb-4">
+      <i class="ph ph-play-circle mr-1"></i> Run Backtest
+    </div>
+    <div class="flex flex-wrap gap-3 items-end">
+      <div>
+        <div class="text-xs text-base-content/50 mb-1">Start</div>
+        <input type="date" x-model="btStart" class="input input-sm input-bordered font-mono" value="2024-07-01">
+      </div>
+      <div>
+        <div class="text-xs text-base-content/50 mb-1">End</div>
+        <input type="date" x-model="btEnd" class="input input-sm input-bordered font-mono" value="2024-10-31">
+      </div>
+      <div class="flex-1 min-w-48">
+        <div class="text-xs text-base-content/50 mb-1">Notes (what changed?)</div>
+        <input type="text" x-model="btNotes" placeholder="e.g. engulfing only, no pin bars" class="input input-sm input-bordered w-full">
+      </div>
+      <button @click="runBacktest()"
+        class="btn btn-primary btn-sm"
+        :disabled="btRunning"
+        x-text="btRunning ? '⏳ Running...' : '▶ Run'">
+      </button>
+    </div>
+    <div x-show="btMsg" class="mt-2 text-xs" :class="btMsg.includes('error')||btMsg.includes('Error') ? 'text-error' : 'text-success'" x-text="btMsg"></div>
+  </div>
+
+  <!-- Quick window buttons -->
+  <div class="flex gap-2 flex-wrap">
+    <span class="text-xs text-base-content/40 self-center">Quick:</span>
+    <button @click="btStart='2024-07-01';btEnd='2024-10-31';btNotes='Alex challenge window'" class="btn btn-xs btn-ghost border border-base-300">Alex Jul–Oct 2024</button>
+    <button @click="btStart='2026-01-01';btEnd='2026-01-31';btNotes='January 2026'" class="btn btn-xs btn-ghost border border-base-300">Jan 2026</button>
+    <button @click="btStart='2025-07-01';btEnd='2025-07-31';btNotes='July 2025'" class="btn btn-xs btn-ghost border border-base-300">Jul 2025</button>
+  </div>
+
+  <!-- Compare selected -->
+  <div x-show="btSelected.length >= 2" class="bg-base-300/30 border border-base-300 rounded-2xl p-4">
+    <div class="font-semibold text-sm mb-3">Comparison — <span x-text="btSelected.length"></span> runs selected</div>
+    <div class="overflow-x-auto">
+      <table class="table table-sm">
+        <thead><tr>
+          <th>Run</th><th>Window</th><th>Return</th><th>Trades</th><th>WR</th><th>Net P&L</th><th>Model</th>
+        </tr></thead>
+        <tbody>
+          <template x-for="id in btSelected" :key="id">
+            <template x-if="btResults.find(r=>r._id===id)">
+              <tr>
+                <td class="font-mono text-xs" x-text="btResults.find(r=>r._id===id).commit"></td>
+                <td class="text-xs" x-text="btResults.find(r=>r._id===id).window_start.slice(0,10)+' → '+btResults.find(r=>r._id===id).window_end.slice(0,10)"></td>
+                <td class="font-mono font-bold"
+                    :class="(btResults.find(r=>r._id===id).results.return_pct||0)>=0?'text-success':'text-error'"
+                    x-text="((btResults.find(r=>r._id===id).results.return_pct||0)>=0?'+':'')+btResults.find(r=>r._id===id).results.return_pct+'%'"></td>
+                <td x-text="btResults.find(r=>r._id===id).results.n_trades"></td>
+                <td x-text="btResults.find(r=>r._id===id).results.win_rate+'%'"></td>
+                <td class="font-mono"
+                    :class="(btResults.find(r=>r._id===id).results.net_pnl||0)>=0?'text-success':'text-error'"
+                    x-text="((btResults.find(r=>r._id===id).results.net_pnl||0)>=0?'+':'')+'$'+Math.abs(btResults.find(r=>r._id===id).results.net_pnl||0).toFixed(0)"></td>
+                <td>
+                  <div class="flex flex-wrap gap-1">
+                    <template x-for="tag in (btResults.find(r=>r._id===id).model_tags||[])" :key="tag">
+                      <span class="badge badge-xs" :class="tagColor(tag)" x-text="tag"></span>
+                    </template>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </template>
+        </tbody>
+      </table>
+    </div>
+    <button @click="btSelected=[]" class="btn btn-xs btn-ghost mt-2">Clear selection</button>
+  </div>
+
+  <!-- Results history -->
+  <div class="bg-base-200 border border-base-300 rounded-2xl overflow-hidden">
+    <div class="flex items-center justify-between px-5 py-3 border-b border-base-300">
+      <div class="font-bold text-sm uppercase tracking-widest text-base-content/50">
+        <i class="ph ph-clock-counter-clockwise mr-1"></i> Run History
+        <span class="badge badge-sm ml-2" x-text="btResults.length + ' runs'"></span>
+      </div>
+      <button @click="loadBacktests()" class="btn btn-xs btn-ghost">
+        <i class="ph ph-arrows-clockwise"></i> Refresh
+      </button>
+    </div>
+
+    <div x-show="btResults.length === 0" class="text-center py-12 text-base-content/30">
+      No backtest runs yet — run one above.
+    </div>
+
+    <div class="divide-y divide-base-300">
+      <template x-for="run in btResults" :key="run._id">
+        <div>
+          <!-- Row header -->
+          <div class="flex items-center gap-3 px-5 py-3 hover:bg-base-300/30 cursor-pointer"
+               @click="btExpanded===run._id ? btExpanded=null : btExpanded=run._id">
+            <!-- Checkbox -->
+            <input type="checkbox" class="checkbox checkbox-xs"
+                   :checked="btSelected.includes(run._id)"
+                   @click.stop
+                   @change="btSelected.includes(run._id) ? btSelected=btSelected.filter(x=>x!==run._id) : btSelected.push(run._id)">
+            <!-- Return badge -->
+            <div class="w-20 text-right">
+              <span class="font-mono font-bold text-sm"
+                    :class="(run.results.return_pct||0)>=0?'text-success':'text-error'"
+                    x-text="((run.results.return_pct||0)>=0?'+':'')+run.results.return_pct+'%'"></span>
+            </div>
+            <!-- Window -->
+            <div class="w-44 text-xs text-base-content/60 font-mono"
+                 x-text="run.window_start.slice(0,10)+' → '+run.window_end.slice(0,10)"></div>
+            <!-- Stats -->
+            <div class="text-xs text-base-content/50"
+                 x-text="run.results.n_trades+'T · '+run.results.win_rate+'% WR'"></div>
+            <!-- Model tags -->
+            <div class="flex flex-wrap gap-1 flex-1">
+              <template x-for="tag in (run.model_tags||[])" :key="tag">
+                <span class="badge badge-xs" :class="tagColor(tag)" x-text="tag"></span>
+              </template>
+            </div>
+            <!-- Notes -->
+            <div x-show="run.notes" class="text-xs text-base-content/40 italic max-w-48 truncate" x-text="run.notes"></div>
+            <!-- Commit -->
+            <div class="font-mono text-xs" :class="run.commit.includes('dirty')?'text-warning':'text-base-content/30'"
+                 x-text="run.commit"></div>
+            <!-- Expand chevron -->
+            <i class="ph text-base-content/30 transition-transform duration-200"
+               :class="btExpanded===run._id ? 'ph-caret-up' : 'ph-caret-down'"></i>
+          </div>
+
+          <!-- Expanded trade list -->
+          <div x-show="btExpanded===run._id" class="px-5 pb-4 bg-base-300/20">
+            <table class="table table-xs mt-2">
+              <thead><tr>
+                <th></th><th>Pair</th><th>Dir</th><th>Pattern</th>
+                <th>Entry</th><th>Exit</th><th>R</th><th>P&L</th><th>Reason</th>
+              </tr></thead>
+              <tbody>
+                <template x-for="t in (run.trades||[])" :key="t.pair+t.entry_ts">
+                  <tr>
+                    <td x-text="t.pnl>=0?'✅':'❌'"></td>
+                    <td class="font-mono font-bold" x-text="t.pair"></td>
+                    <td>
+                      <span class="badge badge-xs"
+                            :class="t.direction==='long'?'badge-success':'badge-error'"
+                            x-text="t.direction"></span>
+                    </td>
+                    <td class="text-xs text-base-content/60" x-text="(t.pattern||'').replace(/_/g,' ')"></td>
+                    <td class="font-mono text-xs" x-text="t.entry.toFixed(5)"></td>
+                    <td class="font-mono text-xs" x-text="t.exit.toFixed(5)"></td>
+                    <td class="font-mono text-xs"
+                        :class="t.r>=0?'text-success':'text-error'"
+                        x-text="(t.r>=0?'+':'')+t.r.toFixed(1)+'R'"></td>
+                    <td class="font-mono text-xs font-bold"
+                        :class="t.pnl>=0?'text-success':'text-error'"
+                        x-text="(t.pnl>=0?'+':'')+'$'+Math.abs(t.pnl).toFixed(0)"></td>
+                    <td class="text-xs text-base-content/40 max-w-xs truncate" x-text="t.reason"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+            <!-- Gap summary -->
+            <div x-show="run.gap_summary && Object.keys(run.gap_summary).length > 0" class="mt-2 flex flex-wrap gap-2">
+              <span class="text-xs text-base-content/40">Blocked:</span>
+              <template x-for="[k,v] in Object.entries(run.gap_summary||{})" :key="k">
+                <span class="badge badge-xs badge-ghost" x-text="k+'='+v"></span>
+              </template>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
 
 <!-- ── Progress bar ─────────────────────────────────────── -->
 <div class="fixed bottom-0 left-0 right-0 h-0.5 bg-base-300">
@@ -499,6 +689,12 @@ function dashboard() {
     botOnline: false, lastSeen: '—', refreshIn: REFRESH_SECS,
     progressPct: 100, chart: null,
     newsEvents: [],
+
+    // ── Backtests tab ───────────────────────────────────────────────
+    activeTab: 'live',
+    btResults: [], btExpanded: null, btSelected: [],
+    btStart: '2024-07-01', btEnd: '2024-10-31', btNotes: '',
+    btRunning: false, btMsg: '', btPollTimer: null,
 
     async init() {
       await this.refresh();
@@ -615,7 +811,61 @@ function dashboard() {
       if (diff < 3600) return Math.floor(diff/60) + 'm ago';
       if (diff < 86400)return Math.floor(diff/3600) + 'h ago';
       return new Date(ts).toLocaleDateString();
-    }
+    },
+
+    // ── Backtest methods ────────────────────────────────────────────
+    async loadBacktests() {
+      try {
+        const r = await fetch('/api/backtest_results');
+        const data = await r.json();
+        // Assign stable _id to each record for selection tracking
+        this.btResults = (Array.isArray(data) ? data : []).map((rec, i) => ({
+          ...rec, _id: rec.run_dt + '_' + i
+        }));
+      } catch(e) { this.btResults = []; }
+    },
+
+    async runBacktest() {
+      this.btRunning = true;
+      this.btMsg = '';
+      try {
+        const r = await fetch('/api/run_backtest', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ start: this.btStart, end: this.btEnd, notes: this.btNotes })
+        });
+        const d = await r.json();
+        if (d.status === 'already_running') {
+          this.btMsg = `Already running (pid ${d.pid}) — wait for it to finish`;
+          this.btRunning = false;
+          return;
+        }
+        this.btMsg = `Started (pid ${d.pid}) — polling for completion...`;
+        this.btPollTimer = setInterval(async () => {
+          const s = await fetch('/api/backtest_status').then(r => r.json());
+          if (!s.running) {
+            clearInterval(this.btPollTimer);
+            this.btRunning = false;
+            this.btMsg = s.exit_code === 0 ? '✅ Done! Results updated.' : `⚠️ Exited with code ${s.exit_code}`;
+            await this.loadBacktests();
+          }
+        }, 5000);
+      } catch(e) {
+        this.btMsg = 'Error: ' + e.message;
+        this.btRunning = false;
+      }
+    },
+
+    tagColor(tag) {
+      if (tag.includes('engulfing_only'))  return 'badge-info';
+      if (tag.includes('pin_bars'))        return 'badge-warning';
+      if (tag.includes('no_gate'))         return 'badge-ghost';
+      if (tag.includes('winner_gate'))     return 'badge-primary';
+      if (tag.includes('progressive'))     return 'badge-secondary';
+      if (tag.includes('atr'))             return 'badge-ghost';
+      if (tag.includes('conf'))            return 'badge-ghost';
+      return 'badge-ghost';
+    },
   };
 }
 </script>

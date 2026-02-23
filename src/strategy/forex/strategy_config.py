@@ -63,6 +63,12 @@ MAX_CONCURRENT_TRADES: int = 2
 # No exceptions for high-confidence setups — the whole point is simplicity.
 BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = False
 
+# ── Entry signal quality ────────────────────────────────────────────────────
+# Alex's rule: "No engulfing candle = no trade." Every video. Absolute rule.
+# When True: only bearish_engulfing / bullish_engulfing trigger entry.
+# Pin bars, rejection wicks, etc. are NOT valid entry signals.
+ENGULFING_ONLY: bool = True
+
 # Unrealized-R threshold that defines a "winner running."
 # A position must be THIS many R's in profit RIGHT NOW (at current price)
 # to trigger the winner rule and block new entries.
@@ -126,3 +132,21 @@ NECKLINE_CLUSTER_PCT: float = 0.003
 # Used for risk sizing, kill-switch math, and P&L tracking.
 # Set this to the capital you intend to fund with.
 DRY_RUN_PAPER_BALANCE: float = 8_000.0
+
+
+# ── Model tag helper ────────────────────────────────────────────────────────
+def get_model_tags() -> list:
+    """
+    Returns a list of short descriptive tags for the current strategy config.
+    Written into every backtest result record so you can always tell what
+    rules were active when a number was produced.
+    """
+    tags = []
+    tags.append("engulfing_only"    if ENGULFING_ONLY               else "pin_bars_allowed")
+    tags.append("no_gate"           if not BLOCK_ENTRY_WHILE_WINNER_RUNNING
+                                    else f"winner_gate_{WINNER_THRESHOLD_R:.0f}R")
+    tags.append(f"atr_min_{ATR_MIN_MULTIPLIER}")
+    tags.append(f"atr_max_{int(ATR_STOP_MULTIPLIER)}")
+    tags.append(f"conf_{int(MIN_CONFIDENCE * 100)}")
+    tags.append(f"max_concurrent_{MAX_CONCURRENT_TRADES}")
+    return tags

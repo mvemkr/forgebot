@@ -2,12 +2,12 @@
 Forge Bot Dashboard — Flask API + Web UI
 Serves the Tailwind/DaisyUI/Alpine.js dashboard at http://localhost:5001
 """
-import json, sys, logging
+import json, sys, logging, subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from src.exchange.oanda_client import OandaClient
@@ -256,6 +256,70 @@ def api_news():
 
     except Exception as e:
         return jsonify({"events": [], "error": str(e)})
+
+RESULTS_LOG  = LOG_DIR / "backtest_results.jsonl"
+VENV_PYTHON  = Path.home() / "trading-bot" / "venv" / "bin" / "python"
+BOT_ROOT     = Path.home() / "trading-bot"
+
+@app.route("/api/backtest_results")
+def api_backtest_results():
+    if not RESULTS_LOG.exists():
+        return jsonify([])
+    records = []
+    try:
+        with open(RESULTS_LOG) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+    except Exception as e:
+        return jsonify({"error": str(e)})
+    records.reverse()   # newest first
+    return jsonify(records)
+
+
+_backtest_proc = None   # track last background backtest
+
+@app.route("/api/run_backtest", methods=["POST"])
+def run_backtest_api():
+    global _backtest_proc
+    data  = request.get_json() or {}
+    start = data.get("start", "2024-07-01")
+    end   = data.get("end",   "2024-10-31")
+    notes = data.get("notes", "")
+
+    # Don't spawn if one is already running
+    if _backtest_proc and _backtest_proc.poll() is None:
+        return jsonify({"status": "already_running", "pid": _backtest_proc.pid})
+
+    cmd = [
+        str(VENV_PYTHON), "-m", "backtesting.oanda_backtest_v2",
+        "--start", start, "--end", end,
+    ]
+    if notes:
+        cmd += ["--notes", notes]
+
+    _backtest_proc = subprocess.Popen(
+        cmd,
+        cwd=str(BOT_ROOT),
+        env={**__import__("os").environ, "PYTHONPATH": str(BOT_ROOT)},
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    return jsonify({"status": "started", "pid": _backtest_proc.pid})
+
+
+@app.route("/api/backtest_status")
+def backtest_status():
+    global _backtest_proc
+    if _backtest_proc is None:
+        return jsonify({"running": False, "pid": None, "exit_code": None})
+    code = _backtest_proc.poll()
+    return jsonify({
+        "running":   code is None,
+        "pid":       _backtest_proc.pid,
+        "exit_code": code,
+    })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=False)

@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
+from .strategy_config import ENGULFING_ONLY
 
 
 @dataclass
@@ -114,10 +115,13 @@ class EntrySignalDetector:
                     notes=f"Bullish engulfing at {current['close']:.5f}",
                 ))
 
-            # Pin bar — NOT a valid entry signal.
+            # Pin bar — controlled by ENGULFING_ONLY config flag.
             # Alex's rule: "No engulfing candle = no trade." Every video.
-            # Pin bars are NOT engulfing candles. Removed as entry trigger.
-            # _pin_bar() method kept for reference but not called here.
+            # Default: ENGULFING_ONLY=True → pin bars are NOT valid entry signals.
+            if not ENGULFING_ONLY:
+                pb = self._pin_bar(current)
+                if pb:
+                    signals.append(pb)
 
         if not signals:
             return None

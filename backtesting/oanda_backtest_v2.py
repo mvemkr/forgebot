@@ -62,6 +62,7 @@ from src.strategy.forex.strategy_config import (
     BLOCK_ENTRY_WHILE_WINNER_RUNNING,
     WINNER_THRESHOLD_R,
     NECKLINE_CLUSTER_PCT,
+    get_model_tags,
     DRY_RUN_PAPER_BALANCE,
 )
 
@@ -266,7 +267,7 @@ def _load_v1_decisions():
 
 
 # ── Main backtest ─────────────────────────────────────────────────────────────
-def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, starting_bal: float = STARTING_BAL):
+def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, starting_bal: float = STARTING_BAL, notes: str = ""):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     print(f"\n{'='*65}")
     print(f"OANDA 1H BACKTEST v2 — Real Strategy Code")
@@ -845,6 +846,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     _result_record = {
         "run_dt":       datetime.now(timezone.utc).isoformat(),
         "commit":       _commit + ("-dirty" if _dirty else ""),
+        "notes":        notes,
+        "model_tags":   get_model_tags(),
         "window_start": start_dt.isoformat(),
         "window_end":   (end_dt or datetime.now(timezone.utc)).isoformat(),
         "config": {
@@ -905,8 +908,9 @@ if __name__ == "__main__":
     parser.add_argument("--start",   default="2025-07-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--end",     default=None,         help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--balance", type=float, default=STARTING_BAL, help="Starting balance")
+    parser.add_argument("--notes",   default="",           help="Description of what changed (logged with results)")
     args = parser.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end   = datetime.strptime(args.end,   "%Y-%m-%d").replace(tzinfo=timezone.utc) if args.end else None
-    run_backtest(start_dt=start, end_dt=end, starting_bal=args.balance)
+    run_backtest(start_dt=start, end_dt=end, starting_bal=args.balance, notes=args.notes)
