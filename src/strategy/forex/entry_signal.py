@@ -114,10 +114,10 @@ class EntrySignalDetector:
                     notes=f"Bullish engulfing at {current['close']:.5f}",
                 ))
 
-            # Pin bar (rejection wick)
-            pb = self._pin_bar(current)
-            if pb:
-                signals.append(pb)
+            # Pin bar — NOT a valid entry signal.
+            # Alex's rule: "No engulfing candle = no trade." Every video.
+            # Pin bars are NOT engulfing candles. Removed as entry trigger.
+            # _pin_bar() method kept for reference but not called here.
 
         if not signals:
             return None
