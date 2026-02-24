@@ -509,10 +509,16 @@ class ForexOrchestrator:
 
         # Pip equity: measured move in pips (neckline → target_1)
         # Reflects how much room the trade has to run — key priority signal.
+        # consolidation_breakout: use target_2 (2× range) — T1 is small by
+        # construction (= 1× range) but Alex runs these 2-3× minimum.
         _pip_mult   = 100.0 if "JPY" in pair.upper() else 10000.0
         _pip_equity = 0.0
         if has_pattern and decision.pattern.target_1 and decision.pattern.neckline:
-            _pip_equity = abs(decision.pattern.neckline - decision.pattern.target_1) * _pip_mult
+            _is_cb = 'consolidation_breakout' in (decision.pattern.pattern_type or '')
+            _pe_target = (decision.pattern.target_2
+                          if _is_cb and decision.pattern.target_2
+                          else decision.pattern.target_1)
+            _pip_equity = abs(decision.pattern.neckline - _pe_target) * _pip_mult
 
         self._confluence_state[pair] = {
             "pair":        pair,

@@ -442,10 +442,15 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         Measured move in pips for a pattern entry.
         Used to rank competing entry candidates — highest pip equity gets priority.
         Measured move = |neckline − target_1| (conservative target, 1:1 R:R minimum).
+        Exception: consolidation_breakout uses target_2 (2× measured move) because
+        T1 = 1× range which is small by construction. Alex consistently runs these
+        for 2-3× the range — T2 reflects actual pip opportunity more accurately.
         """
         if not decision.pattern or not decision.pattern.target_1:
             return 0.0
-        raw = abs(decision.pattern.neckline - decision.pattern.target_1)
+        is_cb = 'consolidation_breakout' in (decision.pattern.pattern_type or '')
+        target = decision.pattern.target_2 if (is_cb and decision.pattern.target_2) else decision.pattern.target_1
+        raw = abs(decision.pattern.neckline - target)
         mult = 100.0 if "JPY" in pair.upper() else 10000.0
         return raw * mult
 
@@ -775,7 +780,13 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             # Minimum pip equity gate — blocks low-potential setups from
             # consuming slots that a higher-equity trade might need later.
             # Macro theme trades are exempt (their size is already fractional).
-            if not _is_theme_pair and pe < _sc.MIN_PIP_EQUITY:
+            # Consolidation_breakout is also exempt: the 46p range looks small
+            # but Alex captures 3-5× by trailing. Its own quality filters
+            # (round number + 10-bar consol + live break + 4H engulfing) are
+            # sufficient quality gating without a pip equity floor.
+            _is_cb_pattern = 'consolidation_breakout' in (
+                decision.pattern.pattern_type if decision.pattern else '')
+            if not _is_theme_pair and not _is_cb_pattern and pe < _sc.MIN_PIP_EQUITY:
                 log_gap(ts_utc, pair, "ENTER", "BLOCKED", "low_pip_equity",
                         f"Pip equity {pe:.0f}p < min {_sc.MIN_PIP_EQUITY:.0f}p — "
                         f"setup too small to consume a slot")
