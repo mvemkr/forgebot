@@ -347,6 +347,87 @@ class SetAndForgetStrategy:
         return False
 
     @staticmethod
+    def _nearest_round_number(price: float, pair: str) -> float:
+        """
+        Return the value of the nearest psychological round number for this pair.
+        Uses the same increment logic as _is_major_level.
+        """
+        is_jpy = "JPY" in pair.upper()
+        if is_jpy:
+            if price > 50:
+                inc = 0.50
+            else:
+                inc = 0.025
+        elif price > 1.50:
+            inc = 0.025
+        else:
+            inc = 0.025
+        return round(price / inc) * inc
+
+    @staticmethod
+    def _peaks_at_level(pattern, pair: str) -> bool:
+        """
+        Rule: for double_top SHORT, pattern_level (avg of peaks) must be AT or
+        ABOVE the nearest round number. If below, price is still approaching
+        the round number from below = continuation, not a rejection/reversal.
+
+        For double_bottom LONG, pattern_level (avg of troughs) must be AT or
+        BELOW the nearest round number.
+
+        This blocks "false double tops" where price is grinding up toward a
+        round number — two bars just below the level look like a double top
+        but are actually a bullish flag about to break through.
+
+        Tolerance: 15 pips non-JPY / 25 pips JPY.
+        Bypassed when REQUIRE_PEAKS_AT_LEVEL lever is False.
+        """
+        if not _cfg.REQUIRE_PEAKS_AT_LEVEL:
+            return True
+        if pattern.pattern_type not in ('double_top', 'double_bottom'):
+            return True   # only applies to double patterns
+
+        is_jpy = "JPY" in pair.upper()
+        tol = 0.0025 if is_jpy else 0.0015   # 25 pip / 15 pip tolerance
+
+        nearest = SetAndForgetStrategy._nearest_round_number(pattern.pattern_level, pair)
+
+        if pattern.pattern_type == 'double_top':
+            # Peaks must have REACHED the round number from below
+            # i.e. pattern_level >= nearest_round - tolerance
+            return pattern.pattern_level >= nearest - tol
+
+        else:  # double_bottom
+            # Troughs must have REACHED the round number from above
+            # i.e. pattern_level <= nearest_round + tolerance
+            return pattern.pattern_level <= nearest + tol
+
+    @staticmethod
+    def _neckline_at_level(pattern, pair: str) -> bool:
+        """
+        Rule: for H&S, IH&S, and break_retest patterns, the neckline/break
+        level must sit within NECKLINE_LEVEL_TOLERANCE_PCT of a round number.
+
+        Double top/bottom peaks are already gated by _peaks_at_level().
+        This extends the same discipline to neckline-based entries.
+
+        Why: NZD/CAD Sep 2024 — H&S neckline at ~0.835, not near 0.840 or
+        any meaningful level. Breaking an arbitrary structure point is a
+        momentum trade, not a set-and-forget reversal at a psychological price.
+        Alex ALWAYS trades levels humans are watching (0.84, 1.10, 160, etc.).
+
+        Bypassed when REQUIRE_NECKLINE_AT_LEVEL lever is False.
+        """
+        if not _cfg.REQUIRE_NECKLINE_AT_LEVEL:
+            return True
+        if pattern.pattern_type not in ('head_and_shoulders', 'inv_head_and_shoulders',
+                                        'break_retest'):
+            return True  # double top/bottom handled by _peaks_at_level
+
+        nearest = SetAndForgetStrategy._nearest_round_number(pattern.pattern_level, pair)
+        tol = pattern.pattern_level * _cfg.NECKLINE_LEVEL_TOLERANCE_PCT
+        return abs(pattern.pattern_level - nearest) <= tol
+
+    @staticmethod
     def _pair_currencies(pair: str) -> set:
         """Extract the two currency codes from a pair string.
         'GBP/USD' → {'GBP', 'USD'}   'GBP_USD' → {'GBP', 'USD'}
@@ -747,10 +828,35 @@ class SetAndForgetStrategy:
             # Break-retest is EXCLUDED — it requires trend confirmation to enter.
             # Controlled by ALLOW_TIER3_REVERSALS lever (default True).
             if _cfg.ALLOW_TIER3_REVERSALS:
+                # Weekly stall gate (TIER3_REQUIRE_WEEKLY_STALL lever).
+                # Require the most recent weekly candle to show compression or a
+                # reversal close before taking a counter-trend Tier 3 position.
+                # Prevents "fresh trend" reversals: 8 consecutive red weeks with
+                # no pause, or 4-month uptrend with no doji — neither is ready.
+                # Alex's rule: "I look for the weekly doji before I sell the top."
+                def _weekly_stalling() -> bool:
+                    if not _cfg.TIER3_REQUIRE_WEEKLY_STALL:
+                        return True   # gate disabled — always allow
+                    if len(df_weekly) < 5:
+                        return True   # not enough history — assume ok
+                    ranges = (df_weekly['high'] - df_weekly['low']).values
+                    recent_rng = float(ranges[-1])
+                    avg_4wk    = float(np.mean(ranges[-5:-1]))  # prior 4 weeks
+                    # Compression: recent week < STALL_RATIO of prior avg
+                    compressed = avg_4wk > 0 and recent_rng < avg_4wk * _cfg.TIER3_WEEKLY_STALL_RATIO
+                    # OR: recent candle closed against the trend (crack in momentum)
+                    recent_close = float(df_weekly['close'].iloc[-1])
+                    recent_open  = float(df_weekly['open'].iloc[-1])
+                    crack = (w_bullish and recent_close < recent_open) or \
+                            (w_bearish and recent_close > recent_open)
+                    return compressed or crack
+
                 if is_reversal_type and is_short and w_bullish and not d_bullish:
-                    return True, -0.05 + _ext_bonus, True
+                    if _weekly_stalling():
+                        return True, -0.05 + _ext_bonus, True
                 if is_reversal_type and is_long  and w_bearish and not d_bearish:
-                    return True, -0.05 + _ext_bonus, True
+                    if _weekly_stalling():
+                        return True, -0.05 + _ext_bonus, True
 
             # ── TIER 4: Range reversal — weekly neutral + local push exhausted ──
             # When the weekly trend is neutral (ranging), price bounces between
@@ -913,6 +1019,97 @@ class SetAndForgetStrategy:
                 trend_daily=trend_d,
                 trend_4h=trend_4,
             )
+
+        # ── Peak/trough direction check (REQUIRE_PEAKS_AT_LEVEL lever) ──
+        # For double_top SHORT: peaks must be AT the round number, not still
+        # approaching it from below. Peaks below the round number = price is
+        # still heading toward the level = continuation, NOT a reversal.
+        # AUD/NZD Jul 2024: peaks at 1.099, round number 1.10 above → blocked.
+        # For double_bottom LONG: troughs must be AT or below the round number.
+        if not self._peaks_at_level(matching_pattern, pair):
+            failed_filters.append("peaks_below_level")
+            return TradeDecision(
+                decision=Decision.WAIT,
+                pair=pair,
+                direction=trade_direction,
+                reason=(
+                    f"{matching_pattern.pattern_type} at {matching_pattern.pattern_level:.5f}: "
+                    f"peaks/troughs are still APPROACHING the round number from below/above. "
+                    f"Price is continuing toward the level, not being rejected from it. "
+                    f"Wait for price to actually reach and reject."
+                ),
+                confidence=0.20,
+                failed_filters=failed_filters,
+                pattern=matching_pattern,
+                trend_weekly=trend_w,
+                trend_daily=trend_d,
+                trend_4h=trend_4,
+            )
+
+        # ── Neckline level anchor (REQUIRE_NECKLINE_AT_LEVEL lever) ─────────
+        # For H&S, IH&S and break_retest patterns: the neckline/break level
+        # must sit within NECKLINE_LEVEL_TOLERANCE_PCT of a round number.
+        # NZD/CAD Sep 2024: neckline at 0.835, nearest round level 0.840 —
+        # breaking an arbitrary structure point is momentum, not a reversal.
+        if not self._neckline_at_level(matching_pattern, pair):
+            failed_filters.append("neckline_not_at_level")
+            nearest = self._nearest_round_number(matching_pattern.pattern_level, pair)
+            return TradeDecision(
+                decision=Decision.WAIT,
+                pair=pair,
+                direction=trade_direction,
+                reason=(
+                    f"{matching_pattern.pattern_type} neckline at "
+                    f"{matching_pattern.pattern_level:.5f} is not near a round number "
+                    f"(nearest: {nearest:.5f}, tolerance: "
+                    f"{matching_pattern.pattern_level * _cfg.NECKLINE_LEVEL_TOLERANCE_PCT:.5f}). "
+                    f"Set-and-forget trades anchor to psychological levels humans watch."
+                ),
+                confidence=0.15,
+                failed_filters=failed_filters,
+                pattern=matching_pattern,
+                trend_weekly=trend_w,
+                trend_daily=trend_d,
+                trend_4h=trend_4,
+            )
+
+        # ── Weekly candle agreement (REQUIRE_WEEKLY_CANDLE_AGREEMENT lever) ─
+        # The current forming weekly candle must not be running strongly
+        # AGAINST the trade direction. A daily bearish signal inside a massive
+        # bull week is profit-taking, not a reversal.
+        # USD/JPY Sep 2024: daily bearish engulfing on Sep 26 — but the
+        # Sep 23-27 weekly closed +6.4 pips BULL. Weekly told the truth.
+        if _cfg.REQUIRE_WEEKLY_CANDLE_AGREEMENT and len(df_weekly) >= 1:
+            w_open  = float(df_weekly['open'].iloc[-1])
+            w_close = float(df_weekly['close'].iloc[-1])
+            w_body  = w_close - w_open
+            ref_price = matching_pattern.pattern_level
+            tol = ref_price * _cfg.WEEKLY_AGREEMENT_MAX_OPPOSING_BODY_PCT
+            weekly_blocked = (
+                (trade_direction == 'SHORT' and w_body > tol) or
+                (trade_direction == 'LONG'  and w_body < -tol)
+            )
+            if weekly_blocked:
+                failed_filters.append("weekly_candle_opposing")
+                direction_word = "bullish" if w_body > 0 else "bearish"
+                return TradeDecision(
+                    decision=Decision.WAIT,
+                    pair=pair,
+                    direction=trade_direction,
+                    reason=(
+                        f"Weekly candle is forming strongly {direction_word} "
+                        f"(body={w_body:+.5f}, threshold=±{tol:.5f}). "
+                        f"A {trade_direction} daily signal inside an opposing weekly "
+                        f"is institutional profit-taking, not a reversal. "
+                        f"Wait for weekly to close in alignment."
+                    ),
+                    confidence=0.20,
+                    failed_filters=failed_filters,
+                    pattern=matching_pattern,
+                    trend_weekly=trend_w,
+                    trend_daily=trend_d,
+                    trend_4h=trend_4,
+                )
 
         # ─────────────────────────────────────────────
         # FILTER 5: Engulfing candle — THE PATIENCE FILTER

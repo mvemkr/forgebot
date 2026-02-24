@@ -202,6 +202,27 @@ OVEREXTENSION_THRESHOLD: float = 0.90
 # False → require daily to be actively turning (confirmed reversal only).
 ALLOW_TIER3_REVERSALS: bool = True
 
+# ── Peak/trough direction lever ────────────────────────────────────────────
+# For double_top SHORT: pattern peaks must be AT or ABOVE the round number,
+# not approaching it from below. Peaks below the round number = price is
+# still heading toward it = continuation, not reversal.
+# For double_bottom LONG: pattern troughs must be AT or BELOW round number.
+# This blocked AUD/NZD SHORT (peaks at 1.099, below 1.10 round level —
+# price was grinding UP toward 1.10, not being rejected FROM it).
+REQUIRE_PEAKS_AT_LEVEL: bool = True
+
+# ── Tier 3 weekly stall gate ───────────────────────────────────────────────
+# Tier 3 reversals (weekly opposing + daily stalling) require the most recent
+# weekly candle to show momentum compression OR a reversal close, before the
+# bot takes a counter-trend position.
+# Prevents "fresh trend" reversals: EUR/GBP in 8-week downtrend with no
+# pause, AUD/NZD in 4-month uptrend with no pause.
+# Alex explicitly looks for weekly doji/narrow bar before acting counter-trend.
+TIER3_REQUIRE_WEEKLY_STALL: bool = True
+# Recent weekly range must be < this fraction of 4-week avg to count as stalling.
+# 0.65 = recent week range less than 65% of prior average = compression/doji.
+TIER3_WEEKLY_STALL_RATIO: float = 0.65
+
 # ── News filter lever ─────────────────────────────────────────────────────
 # Whether to block entries when the triggering candle forms during a
 # high-impact news event (NFP, CPI, FOMC, BoE, ECB rate decisions).
@@ -210,6 +231,39 @@ ALLOW_TIER3_REVERSALS: bool = True
 # Default False = matches backtest behavior (news filter has no historical
 # data and runs as a no-op). Live bot and backtest must match.
 NEWS_FILTER_ENABLED: bool = False
+
+# ── Neckline level anchor (Week 9 / NZD-CAD rule) ─────────────────────────
+# For H&S, IH&S, and break_retest patterns the neckline/break level must sit
+# within NECKLINE_LEVEL_TOLERANCE_PCT of a round number.
+#
+# Double top/bottom peaks are already gated by REQUIRE_PEAKS_AT_LEVEL.
+# This extends that discipline to necklines and break levels.
+#
+# Why: NZD/CAD Sep 2024 H&S neckline was at ~0.835 — not near 0.840 or any
+# meaningful round level. A break of an arbitrary structure level is a momentum
+# trade, not a set-and-forget reversal anchored to a psychological price.
+# Alex ALWAYS trades levels that humans are watching (0.84, 1.10, 160, etc.).
+#
+# Tolerance: fraction of price (0.0020 = 20 pips on a 1.000 pair).
+REQUIRE_NECKLINE_AT_LEVEL: bool = True
+NECKLINE_LEVEL_TOLERANCE_PCT: float = 0.0020
+
+# ── Weekly candle agreement (Week 12 / USD-JPY Diddy rule) ─────────────────
+# The currently-forming weekly candle must not be running strongly AGAINST
+# the intended trade direction at the time of entry.
+#
+# Why: USD/JPY Oct 2024 — Alex saw a clean daily bearish engulfing on Sep 26,
+# but the Sep 23-27 weekly candle closed +6.4 pips BULL. A daily dip inside
+# a massive bull week is institutional profit-taking, not a reversal.
+# The weekly context told the truth; the daily candle lied.
+#
+# Rule: if the current forming weekly body > threshold in the OPPOSING direction,
+# block the entry. The weekly narrative overrides the daily signal.
+#
+# Threshold: fraction of price. 0.0035 = 35 pips on a 1.000 pair (350 pips JPY).
+# Tune higher to loosen (fewer blocks), lower to tighten (more blocks).
+REQUIRE_WEEKLY_CANDLE_AGREEMENT: bool = True
+WEEKLY_AGREEMENT_MAX_OPPOSING_BODY_PCT: float = 0.0035
 
 # ── Theme stacking lever ───────────────────────────────────────────────────
 # Whether an active macro theme can BLOCK an entry that contradicts it.
@@ -305,6 +359,26 @@ def get_model_tags() -> list:
     """
     m = _sys.modules[__name__]
     tags = []
+
+    # ── Peak direction + weekly stall ───────────────────────────────────────
+    if not m.REQUIRE_PEAKS_AT_LEVEL:
+        tags.append("no_peak_dir_check")
+    if not m.TIER3_REQUIRE_WEEKLY_STALL:
+        tags.append("no_tier3_stall_gate")
+    elif m.TIER3_WEEKLY_STALL_RATIO != 0.65:
+        tags.append(f"stall_ratio_{m.TIER3_WEEKLY_STALL_RATIO:.2f}")
+
+    # ── Neckline level anchor ────────────────────────────────────────────────
+    if not m.REQUIRE_NECKLINE_AT_LEVEL:
+        tags.append("no_neckline_anchor")
+    elif m.NECKLINE_LEVEL_TOLERANCE_PCT != 0.0020:
+        tags.append(f"neckline_tol_{m.NECKLINE_LEVEL_TOLERANCE_PCT:.4f}")
+
+    # ── Weekly candle agreement ──────────────────────────────────────────────
+    if not m.REQUIRE_WEEKLY_CANDLE_AGREEMENT:
+        tags.append("no_weekly_agreement")
+    elif m.WEEKLY_AGREEMENT_MAX_OPPOSING_BODY_PCT != 0.0035:
+        tags.append(f"weekly_agree_{m.WEEKLY_AGREEMENT_MAX_OPPOSING_BODY_PCT:.4f}")
 
     # ── News filter ─────────────────────────────────────────────────────────
     if m.NEWS_FILTER_ENABLED:
