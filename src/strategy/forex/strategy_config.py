@@ -35,7 +35,7 @@ import sys as _sys
 # Minimum confidence score to execute a trade.
 # Signals below this are logged as "forming" but never executed.
 # Tuned via backtest: 0.65 filters ~30% of marginal setups, improves WR.
-MIN_CONFIDENCE: float = 0.65
+MIN_CONFIDENCE: float = 0.75
 
 # Minimum R:R ratio based on pattern amplitude vs stop distance.
 # Not a take-profit target — geometric quality check only.
