@@ -84,12 +84,15 @@ V1_DECISION_LOG = Path.home() / "trading-bot" / "logs" / "backtest_decisions.jso
 WATCHLIST = [
     # USD-based majors
     "GBP/USD", "EUR/USD", "USD/JPY", "USD/CHF", "USD/CAD", "NZD/USD", "AUD/USD",
-    # GBP crosses
-    "GBP/JPY", "GBP/CHF", "GBP/NZD",
-    # EUR crosses (no USD/GBP — survive GBP+USD lockout)
-    "EUR/GBP", "EUR/AUD", "EUR/NZD", "EUR/CAD",
-    # Commodity crosses (no USD/GBP/JPY/CHF — survive most lockout scenarios)
-    "AUD/CAD", "AUD/NZD", "NZD/CAD", "NZD/JPY",
+    # GBP crosses (Alex's confirmed list)
+    "GBP/JPY", "GBP/CHF", "GBP/NZD", "GBP/CAD",
+    # EUR crosses
+    "EUR/AUD", "EUR/CAD", "EUR/JPY",
+    # JPY crosses (Alex runs all 6 for theme stacking — Week 7-8 $70K)
+    "AUD/JPY", "CAD/JPY", "NZD/JPY",
+    # Commodity crosses
+    "AUD/CAD", "NZD/CAD",
+    # Removed (not on Alex's watchlist): EUR/GBP, EUR/NZD, AUD/NZD
 ]
 
 # ── Historical news filter — CSV-backed ───────────────────────────────────────
@@ -486,14 +489,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         _theme_cache[date_key] = theme
         return theme
 
-    def _entry_eligible(pair, macro_theme: Optional[CurrencyTheme] = None):
-        """3-layer eligibility gate matching live risk_manager_forex logic.
+    def _entry_eligible(pair, macro_theme: Optional[CurrencyTheme] = None,
+                        direction: str = ""):
+        """4-layer eligibility gate matching live risk_manager_forex logic.
 
         Macro theme exception: when a currency theme is active and this pair
         is one of the suggested stacked trades, we:
           (a) raise the concurrent cap to STACK_MAX (default 4), and
           (b) waive the currency-overlap check — correlated exposure is intentional.
         This is exactly how Alex stacked 4 JPY shorts in Week 7-8 for $70K.
+
+        Layer 4 (open-position theme gate): if ≥2 open positions express the same
+        directional bias on a currency, block any new trade that contradicts it.
+        E.g. GBP/JPY SHORT + USD/JPY SHORT → JPY LONG theme → block NZD/JPY LONG,
+        allow NZD/JPY SHORT. Only runs when direction is provided (post-decision).
         """
         _is_theme = (
             macro_theme is not None
@@ -502,16 +511,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         max_concurrent = STACK_MAX if _is_theme else _sc.MAX_CONCURRENT_TRADES
 
         # Layer 1: max concurrent
-        # Theme trades use STACK_MAX against total open count.
-        # Non-theme trades only count against other non-theme positions — macro stacks
-        # should not block an unrelated setup like GBP/CHF when GBP/JPY is at BE.
         if _is_theme:
             if len(open_pos) >= max_concurrent:
                 return False, "max_concurrent"
         else:
-            # Only count non-theme positions that are STILL AT RISK (not yet at BE).
-            # Once a position moves to breakeven it's risk-free — Alex takes new trades
-            # when existing ones are locked in. BE positions don't consume real capital.
             non_theme_count = sum(
                 1 for p in open_pos
                 if open_pos[p].get("macro_theme") is None
@@ -519,12 +522,42 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             )
             if non_theme_count >= _sc.MAX_CONCURRENT_TRADES:
                 return False, "max_concurrent"
-        # Layer 2: same-pair block only — don't enter a pair already open.
-        # Alex never applied a broad currency-overlap rule. He stacked GBP/JPY + GBP/CHF,
-        # USD/JPY + NZD/JPY, etc. His only hard constraint is the slot count above.
-        # Broad currency overlap was blocking Wk2 (JPY) and Wk12b (GBP) entirely.
+
+        # Layer 2: same-pair block
         if pair in open_pos:
             return False, "same_pair_open"
+
+        # Layer 3 (theme contradiction gate — only when direction is known)
+        # Only applies to macro carry/safe-haven currencies (JPY, CHF) where a
+        # directional theme is meaningful. USD, EUR, GBP etc. selling in two pairs
+        # is coincidental (e.g. USD/JPY + USD/CHF both sell USD but that's not a
+        # "USD is crashing" macro theme — it's JPY strong + CHF strong individually).
+        MACRO_THEME_CCYS = {"JPY", "CHF"}
+
+        if direction and "/" in pair and len(open_pos) >= 2:
+            from collections import Counter
+            ccy_bias: Counter = Counter()
+            for op, pos in open_pos.items():
+                if "/" not in op:
+                    continue
+                ob, oq = op.split("/")
+                bias = 1 if pos.get("direction") == "long" else -1
+                ccy_bias[ob] += bias
+                ccy_bias[oq] -= bias
+
+            base, quote = pair.split("/")
+            new_bias = 1 if direction == "long" else -1
+            THEME_THRESHOLD = 2
+
+            for ccy, trade_impact in [(base, new_bias), (quote, -new_bias)]:
+                if ccy not in MACRO_THEME_CCYS:
+                    continue   # only gate on macro carry currencies
+                existing = ccy_bias.get(ccy, 0)
+                if existing >= THEME_THRESHOLD and trade_impact < 0:
+                    return False, f"theme_contradiction:{ccy}_long_theme"
+                if existing <= -THEME_THRESHOLD and trade_impact > 0:
+                    return False, f"theme_contradiction:{ccy}_short_theme"
+
         return True, ""
 
     # ── Main loop ─────────────────────────────────────────────────────
@@ -793,9 +826,15 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 continue
 
             # Re-check eligibility — earlier entries this bar may have changed
-            # currency overlap or slot counts
-            eligible, _ = _entry_eligible(pair, active_theme)
+            # slot counts; also runs theme contradiction gate (needs direction)
+            eligible, elig_reason2 = _entry_eligible(pair, active_theme,
+                                                      direction=decision.direction)
             if not eligible:
+                if "theme_contradiction" in elig_reason2:
+                    log_gap(ts_utc, pair, decision.direction.upper(), "BLOCKED",
+                            "theme_contradiction",
+                            f"Open-position theme contradicts {decision.direction} {pair}: "
+                            f"{elig_reason2}")
                 continue
 
             rpct = _risk_pct(balance)

@@ -389,21 +389,90 @@ class ForexRiskManager:
 
         return min(tier_rate, budget)
 
+    @staticmethod
+    def _open_position_theme_gate(
+        pair: str,
+        direction: str,
+        open_positions: dict,
+        threshold: int = 2,
+    ) -> Tuple[bool, str]:
+        """
+        Open-position theme contradiction gate.
+
+        If ≥ threshold open positions all express the same directional bias on a
+        currency, that IS the theme — regardless of price momentum scores.
+        Block any new position that expresses the OPPOSITE bias on that currency.
+
+        Key example: GBP/JPY SHORT + USD/JPY SHORT both BUY JPY → JPY theme = LONG.
+        NZD/JPY LONG would SELL JPY → contradiction → blocked.
+        NZD/JPY SHORT would BUY JPY → aligns → allowed (this is the "push to short").
+
+        threshold=2 means 2 confirming positions establish the theme.
+        Returns (blocked: bool, reason: str).
+        """
+        if "/" not in pair:
+            return False, ""
+
+        # Build currency bias from open positions: +N = that currency is being bought
+        from collections import Counter
+        currency_bias: Counter = Counter()
+        for op, pos in open_positions.items():
+            if "/" not in op:
+                continue
+            ob, oq = op.split("/")
+            d = pos.get("direction", "")
+            # SHORT = sell base, buy quote  →  base -1, quote +1
+            # LONG  = buy base, sell quote  →  base +1, quote -1
+            bias = 1 if d == "long" else -1
+            currency_bias[ob] += bias
+            currency_bias[oq] -= bias
+
+        # Only gate on macro carry/safe-haven currencies.
+        # USD, EUR, GBP selling in two pairs is coincidental (USD/JPY + USD/CHF
+        # both sell USD but that's JPY strong + CHF strong — not a "USD is crashing"
+        # theme). Applying the gate to USD would block valid Alex trades like
+        # EUR/USD SHORT when USD/JPY + USD/CHF are running.
+        MACRO_THEME_CCYS = {"JPY", "CHF"}
+
+        base, quote = pair.split("/")
+        new_bias = 1 if direction == "long" else -1   # +1 = buying base, -1 = selling base
+
+        for ccy, trade_impact in [(base, new_bias), (quote, -new_bias)]:
+            if ccy not in MACRO_THEME_CCYS:
+                continue
+            existing = currency_bias.get(ccy, 0)
+            if existing >= threshold and trade_impact < 0:
+                return True, (
+                    f"⛔ THEME CONTRADICTION: {ccy} is being bought in "
+                    f"{existing} open positions — new {direction} {pair} would sell it."
+                )
+            if existing <= -threshold and trade_impact > 0:
+                return True, (
+                    f"⛔ THEME CONTRADICTION: {ccy} is being sold in "
+                    f"{abs(existing)} open positions — new {direction} {pair} would buy it."
+                )
+
+        return False, ""
+
     def check_entry_eligibility(
         self,
         pair: str,
         open_positions: dict,
         account_balance: float,
         is_macro_theme_pair: bool = False,
+        direction: str = "",
     ) -> Tuple[bool, str]:
         """
-        Gate check for opening a new position.  Three layered rules:
+        Gate check for opening a new position.  Four layered rules:
 
           1. Max concurrent positions (hard cap = MAX_CONCURRENT_TRADES)
              EXCEPTION: macro theme pairs → cap raised to STACK_MAX (4)
-          2. Currency overlap — no two positions share a currency
-             EXCEPTION: macro theme pairs → waived (correlated exposure intentional)
+          2. Same-pair block — can't enter the same instrument twice
           3. Book exposure — remaining budget must be ≥ MIN_SECOND_TRADE_PCT
+          4. Open-position theme gate — if ≥2 positions express the same
+             directional bias on a currency, block contradicting new trades.
+             E.g. GBP/JPY SHORT + USD/JPY SHORT → JPY theme = LONG →
+             blocks NZD/JPY LONG, allows NZD/JPY SHORT.
 
         is_macro_theme_pair: set by set_and_forget.evaluate() when a macro
         currency theme is active and this pair is one of the stacked trades.
@@ -468,6 +537,12 @@ class ForexRiskManager:
                 f"below {self.MIN_SECOND_TRADE_PCT:.0f}% minimum. "
                 f"Waiting for a position to close."
             )
+
+        # 4 — Open-position theme gate (only when direction is known)
+        if direction:
+            blocked, reason = self._open_position_theme_gate(pair, direction, open_positions)
+            if blocked:
+                return True, reason
 
         return False, ""
 

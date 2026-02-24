@@ -69,6 +69,24 @@ ATR_LOOKBACK: int = 14
 # Macro theme stacking bypasses this — 4 JPY shorts = 1 theme = allowed.
 MAX_CONCURRENT_TRADES: int = 4   # Alex runs 4+ simultaneous set-and-forget positions
 
+# ── Alex's confirmed watchlist (extracted from first video screenshot) ─────────
+# Only evaluate pairs on this list. Anything else is outside Alex's universe.
+# Removed: EUR/GBP, EUR/NZD, AUD/NZD (not on Alex's watchlist)
+# Added: GBP/CAD, AUD/JPY, CAD/JPY, EUR/JPY (on his list, were missing from bot)
+# JPY crosses: Alex watches ALL 6 — key for theme stacking (Week 7-8 $70K)
+ALLOWED_PAIRS: frozenset = frozenset({
+    # USD majors
+    "GBP/USD", "EUR/USD", "USD/JPY", "USD/CHF", "USD/CAD", "NZD/USD", "AUD/USD",
+    # GBP crosses
+    "GBP/JPY", "GBP/CHF", "GBP/NZD", "GBP/CAD",
+    # EUR crosses
+    "EUR/AUD", "EUR/CAD", "EUR/JPY",
+    # JPY crosses (all 6 for theme stacking)
+    "AUD/JPY", "CAD/JPY", "NZD/JPY",
+    # Commodity crosses
+    "AUD/CAD", "NZD/CAD",
+})
+
 # ── Winner rule ("don't compete with your winner") ────────────────────────
 # When an open position is past breakeven (≥1R in profit), block all new entries.
 #
