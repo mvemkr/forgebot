@@ -77,7 +77,7 @@ class ForexRiskManager:
 
     # Dual-trade book limits (Monte Carlo validated 2026-02-21)
     MAX_BOOK_EXPOSURE    = 35.0   # % — max total risk across all open positions
-    MAX_CONCURRENT_TRADES = 2     # hard cap on simultaneous positions
+    MAX_CONCURRENT_TRADES = 4     # hard cap on simultaneous at-risk positions (Alex runs 4+)
     MIN_SECOND_TRADE_PCT  = 5.0   # % — skip 2nd trade if budget below this
 
     def __init__(
@@ -414,14 +414,37 @@ class ForexRiskManager:
         from src.strategy.forex.currency_strength import STACK_MAX
         n = len(open_positions)
 
-        # 1 — Hard cap (STACK_MAX for theme pairs, MAX_CONCURRENT_TRADES otherwise)
-        max_allowed = STACK_MAX if is_macro_theme_pair else self.MAX_CONCURRENT_TRADES
-        if n >= max_allowed:
-            return True, (
-                f"⛔ MAX POSITIONS: {n} trades already open "
-                f"(max {max_allowed}{'  [theme stack]' if is_macro_theme_pair else ''}). "
-                f"Waiting for one to close."
+        # 1 — Hard cap (STACK_MAX for theme, MAX_CONCURRENT_TRADES for non-theme).
+        # BE positions are risk-free — don't count them toward the limit.
+        # Alex takes new trades when existing ones hit BE (locked in profit = free slot).
+        def _pos_at_be(pos: dict) -> bool:
+            entry = pos.get("entry", 0)
+            stop  = pos.get("stop", pos.get("stop_loss", 0))
+            direction = pos.get("direction", "")
+            if direction == "short": return stop <= entry
+            if direction == "long":  return stop >= entry
+            return False
+
+        if is_macro_theme_pair:
+            at_risk_count = sum(1 for p in open_positions if not _pos_at_be(open_positions[p]))
+            max_allowed = STACK_MAX
+            if at_risk_count >= max_allowed:
+                return True, (
+                    f"⛔ MAX POSITIONS: {at_risk_count} at-risk trades open "
+                    f"(max {max_allowed} [theme stack]). Waiting for one to close or hit BE."
+                )
+        else:
+            # Non-theme: only count non-BE, non-theme positions
+            at_risk_count = sum(
+                1 for p, pos in open_positions.items()
+                if not pos.get("macro_theme") and not _pos_at_be(pos)
             )
+            max_allowed = self.MAX_CONCURRENT_TRADES
+            if at_risk_count >= max_allowed:
+                return True, (
+                    f"⛔ MAX POSITIONS: {at_risk_count} non-BE positions open "
+                    f"(max {max_allowed}). Waiting for one to close or hit BE."
+                )
 
         if n == 0:
             return False, ""   # first trade — no further checks needed

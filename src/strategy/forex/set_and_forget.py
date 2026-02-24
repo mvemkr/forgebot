@@ -748,9 +748,25 @@ class SetAndForgetStrategy:
             # be more recent / at a different level. Let _mtf_context score it.
             patterns_daily.append(p4)
 
-        # Sort by clarity — daily patterns usually win but 4H can rank higher
-        # if they're unusually clean
-        patterns = sorted(patterns_daily, key=lambda p: p.clarity, reverse=True)
+        # Sort by clarity + psych-level bonus.
+        # A pattern at a round psychological level (e.g. 1.125, 157.5) gets a
+        # +0.10 bonus. This ensures double_top at 1.124 (near 1.125) outranks
+        # double_bottom at 1.109 (not near any major level) even if raw clarity
+        # is similar. Faithful to Alex: "I only trade at round numbers" — every video.
+        def _psych_sort_score(p: 'PatternResult') -> float:
+            level = p.pattern_level if p.pattern_level else p.neckline
+            if not level:
+                return p.clarity
+            nearest = SetAndForgetStrategy._nearest_round_number(level, pair)
+            if nearest <= 0:
+                return p.clarity
+            dist_pct = abs(level - nearest) / nearest
+            PSYCH_TOL = 0.002   # 0.2% — matches the downstream round-number filter tolerance
+            # Tighter than tol*1.5: only boost patterns that will also PASS the level check
+            bonus = 0.10 if dist_pct <= PSYCH_TOL else 0.0
+            return p.clarity + bonus
+
+        patterns = sorted(patterns_daily, key=_psych_sort_score, reverse=True)
 
         MAX_NECKLINE_PCT_SWEEP      = 3.5
         MAX_NECKLINE_PCT_STRUCTURAL = 2.0
@@ -1001,12 +1017,17 @@ class SetAndForgetStrategy:
 
         # Also check: is the pattern level near any level the detector found?
         # (Includes structural levels from _find_structural_levels)
+        # Pick the HIGHEST-SCORING level within 1% — not just the nearest.
+        # GBP/CHF example: 1.12500 scores 2, but 1.12476 (2p away) scores 3.
+        # Taking the nearest by distance misses the stronger structural level.
         nearest_level = None
+        best_score = -1
         for level in levels:
             dist_frac = abs(level.price - matching_pattern.pattern_level) / max(matching_pattern.pattern_level, 0.0001)
             if dist_frac < 0.01:   # within 1% of the pattern structural price
-                nearest_level = level
-                break
+                if level.score > best_score:
+                    best_score = level.score
+                    nearest_level = level
         # Fall back: use the closest level regardless of proximity
         if nearest_level is None and levels:
             nearest_level = levels[0]
@@ -1163,6 +1184,22 @@ class SetAndForgetStrategy:
                     failed_filters.append("news_candle")
             except Exception:
                 pass  # if timestamp check fails, proceed normally
+
+        # ── 4H fallback — Alex says "1H or 4H engulfing" ─────────────────────
+        # If no 1H engulfing fired, check the most recent 4H bar.
+        # ONLY for structural reversal patterns at key levels — NOT break_retest
+        # or other continuation patterns (those need 1H precision to avoid noise).
+        # This catches GBP/CHF Wk6 where 1H bars grind sideways but a 4H candle
+        # cleanly rejects the double-top level.
+        _is_reversal_pattern = any(k in matching_pattern.pattern_type for k in
+            ('head_and_shoulders', 'double_top', 'double_bottom',
+             'inverted_head_and_shoulders', 'consolidation_breakout'))
+        if (not has_signal or signal is None) and _is_reversal_pattern and len(df_4h) >= 2:
+            has_signal_4h, signal_4h = self.signal_detector.has_signal(df_4h, trade_direction)
+            if has_signal_4h and signal_4h:
+                signal_4h.signal_type = signal_4h.signal_type + '_4h'
+                has_signal = True
+                signal = signal_4h
 
         if not has_signal or signal is None:
             # Setup is valid but we're waiting for the candle

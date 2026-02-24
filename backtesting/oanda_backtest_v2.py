@@ -504,8 +504,13 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             if len(open_pos) >= max_concurrent:
                 return False, "max_concurrent"
         else:
+            # Only count non-theme positions that are STILL AT RISK (not yet at BE).
+            # Once a position moves to breakeven it's risk-free — Alex takes new trades
+            # when existing ones are locked in. BE positions don't consume real capital.
             non_theme_count = sum(
-                1 for p in open_pos if open_pos[p].get("macro_theme") is None
+                1 for p in open_pos
+                if open_pos[p].get("macro_theme") is None
+                and not open_pos[p].get("be_moved", False)
             )
             if non_theme_count >= _sc.MAX_CONCURRENT_TRADES:
                 return False, "max_concurrent"
