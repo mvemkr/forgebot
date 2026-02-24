@@ -994,6 +994,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
 
     print(f"  Results log:  {_results_log}  [{_commit}{'-dirty' if _dirty else ''}]")
 
+    # ── Auto-run miss analyzer on Alex window ─────────────────────────
+    # Only fires when running the Jul 15 – Oct 31 2024 window so we
+    # always get an up-to-date Alex vs bot scorecard.
+    _is_alex_window = (
+        str(args.start)[:7] == "2024-07" and str(args.end)[:7] == "2024-10"
+    )
+    if _is_alex_window:
+        try:
+            from backtesting.miss_analyzer import analyze as _miss_analyze
+            print()
+            _miss_analyze(verbose=True)
+        except Exception as _me:
+            print(f"  [miss analyzer error: {_me}]")
+
     return trades, balance, gap_log
 
 
