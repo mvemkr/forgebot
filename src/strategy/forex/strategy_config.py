@@ -37,6 +37,13 @@ import sys as _sys
 # Tuned via backtest: 0.65 filters ~30% of marginal setups, improves WR.
 MIN_CONFIDENCE: float = 0.77
 
+# Minimum pip equity (measured move in pips) required to enter.
+# Blocks low-potential setups that consume a slot but can't run far.
+# EUR/CAD at 62p blocked EUR/CAD Sep 23 entry, preventing GBP/CHF
+# from entering 2 days later with a 226p setup.
+# 150p = meaningful move for Alex-style set-and-forget trades.
+MIN_PIP_EQUITY: float = 100.0
+
 # Minimum R:R ratio based on pattern amplitude vs stop distance.
 # Not a take-profit target — geometric quality check only.
 # Blocks patterns where the measured move is smaller than the stop.

@@ -503,6 +503,13 @@ class ForexOrchestrator:
         elif not waiting:
             waiting.append("Building setup")
 
+        # Pip equity: measured move in pips (neckline → target_1)
+        # Reflects how much room the trade has to run — key priority signal.
+        _pip_mult   = 100.0 if "JPY" in pair.upper() else 10000.0
+        _pip_equity = 0.0
+        if has_pattern and decision.pattern.target_1 and decision.pattern.neckline:
+            _pip_equity = abs(decision.pattern.neckline - decision.pattern.target_1) * _pip_mult
+
         self._confluence_state[pair] = {
             "pair":        pair,
             "timestamp":   datetime.now(timezone.utc).isoformat(),
@@ -512,6 +519,7 @@ class ForexOrchestrator:
             "conf_required": conf_req,
             "pattern":     decision.pattern.pattern_type if has_pattern else None,
             "pattern_clarity": round(decision.pattern.clarity, 2) if has_pattern else None,
+            "pip_equity":  round(_pip_equity, 1),
             "level_price": round(decision.nearest_level.price, 5) if has_level else None,
             "level_score": decision.nearest_level.score if has_level else None,
             "trend_weekly": decision.trend_weekly.value if decision.trend_weekly else "?",

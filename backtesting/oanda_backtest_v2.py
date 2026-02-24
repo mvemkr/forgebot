@@ -771,6 +771,15 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             if pair in open_pos:
                 continue  # entered by an earlier candidate this bar
 
+            # Minimum pip equity gate — blocks low-potential setups from
+            # consuming slots that a higher-equity trade might need later.
+            # Macro theme trades are exempt (their size is already fractional).
+            if not _is_theme_pair and pe < _sc.MIN_PIP_EQUITY:
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "low_pip_equity",
+                        f"Pip equity {pe:.0f}p < min {_sc.MIN_PIP_EQUITY:.0f}p — "
+                        f"setup too small to consume a slot")
+                continue
+
             # Re-check eligibility — earlier entries this bar may have changed
             # currency overlap or slot counts
             eligible, _ = _entry_eligible(pair, active_theme)
