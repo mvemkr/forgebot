@@ -283,7 +283,7 @@
   </div>
 
   <!-- ── CONFLUENCE RADAR ──────────────────────────────── -->
-  <div class="col-span-12" x-show="confluence.length > 0">
+  <div class="col-span-12">
     <div class="card bg-base-200 border border-info/30">
       <div class="card-body p-5">
         <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -304,7 +304,21 @@
                     @click="confluenceSort='pip_equity'">📊 Pip Equity</button>
           </div>
         </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+        <!-- Loading / empty / offline states -->
+        <div x-show="!confluenceLoaded" class="flex items-center gap-3 py-6 text-base-content/40 text-sm">
+          <span class="loading loading-spinner loading-sm"></span>
+          Scanning pairs — waiting for first cycle…
+        </div>
+        <div x-show="confluenceLoaded && !botOnline" class="flex items-center gap-3 py-6 text-error/70 text-sm">
+          <i class="ph ph-warning-circle text-lg"></i>
+          Bot offline — confluence data unavailable
+        </div>
+        <div x-show="confluenceLoaded && botOnline && confluence.length === 0" class="flex items-center gap-3 py-6 text-base-content/40 text-sm">
+          <i class="ph ph-clock text-lg"></i>
+          No active setups — all pairs in WAIT or next scan pending
+        </div>
+
+        <div x-show="confluence.length > 0" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           <template x-for="c in sortedConfluence" :key="c.pair">
             <div class="rounded-xl border p-4 pair-card" :class="{
               'border-success/40 bg-success/5':  c.decision === 'ENTER',
@@ -337,11 +351,10 @@
                 <div x-show="c.pattern" class="flex items-center gap-2 flex-wrap">
                   📐 <span class="font-mono" x-text="(c.pattern||'').replace(/_/g,' ')"></span>
                   <span x-show="c.pattern_clarity" class="opacity-40" x-text="' · ' + Math.round((c.pattern_clarity||0)*100)+'% clarity'"></span>
-                  <!-- Pip equity badge -->
-                  <span x-show="c.pip_equity > 0"
-                        class="badge badge-xs font-mono"
-                        :class="c.pip_equity >= 300 ? 'badge-success' : c.pip_equity >= 150 ? 'badge-warning' : 'badge-ghost'"
-                        x-text="'📊 ' + Math.round(c.pip_equity) + 'p'"></span>
+                  <!-- Pip equity badge — always shown when pattern exists -->
+                  <span class="badge badge-xs font-mono"
+                        :class="(c.pip_equity||0) >= 300 ? 'badge-success' : (c.pip_equity||0) >= 150 ? 'badge-warning' : 'badge-ghost'"
+                        x-text="'📊 ' + ((c.pip_equity||0) > 0 ? Math.round(c.pip_equity)+'p' : '—')"></span>
                 </div>
                 <div x-show="c.level_price">
                   🎯 Level <span class="font-mono" x-text="(c.level_price||0).toFixed(5)"></span>
@@ -385,7 +398,17 @@
               <!-- Waiting for -->
               <div class="text-xs" x-show="c.waiting_for && c.waiting_for.length > 0">
                 <span class="opacity-40">Waiting for: </span>
-                <span class="text-warning font-medium" x-text="(c.waiting_for||[]).join(' · ')"></span>
+                <template x-for="(item, i) in (c.waiting_for||[])" :key="i">
+                  <span>
+                    <span :class="item.includes('Pip equity') ? 'text-error font-semibold' :
+                                  item.includes('Engulfing')  ? 'text-warning font-medium' :
+                                  item.includes('Confidence') ? 'text-warning font-medium' :
+                                  item.includes('Nothing')    ? 'text-success font-medium' :
+                                  'text-warning font-medium'"
+                          x-text="item"></span>
+                    <span class="opacity-30" x-show="i < (c.waiting_for||[]).length - 1"> · </span>
+                  </span>
+                </template>
               </div>
 
               <div class="text-xs opacity-30 mt-2" x-text="timeAgo(c.timestamp)"></div>
@@ -708,6 +731,7 @@ function dashboard() {
     topSetups: [], confluence: [], weeklyPnl: {}, weeklyPnlHasData: false,
     botOnline: false, lastSeen: '—', refreshIn: REFRESH_SECS,
     confluenceSort: 'decision',
+    confluenceLoaded: false,
 
     get sortedConfluence() {
       const arr = [...this.confluence];
@@ -778,6 +802,7 @@ function dashboard() {
         this.recentTrades  = (status.recent_trades || []).slice().reverse();
         this.topSetups     = status.top_setups || [];
         this.confluence    = status.confluence  || [];
+        this.confluenceLoaded = true;
 
         // Bot online check
         const ts = this.state.timestamp;

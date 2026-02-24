@@ -488,6 +488,10 @@ class ForexOrchestrator:
             waiting.append(f"Confidence {conf_val:.0%} → {conf_req:.0%}")
         if has_pattern and has_level and trend_ok and conf_ok and not has_signal:
             waiting.append("Engulfing candle / entry signal")
+        # Pip equity gate — show if pattern exists but measured move is too small
+        from src.strategy.forex import strategy_config as _sc_live
+        if has_pattern and _pip_equity > 0 and _pip_equity < _sc_live.MIN_PIP_EQUITY:
+            waiting.append(f"Pip equity {_pip_equity:.0f}p → {_sc_live.MIN_PIP_EQUITY:.0f}p min")
         if not session_ok:
             waiting.append("London session (3–8 AM ET)")
         if not news_ok:
