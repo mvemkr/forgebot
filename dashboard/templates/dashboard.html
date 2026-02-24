@@ -617,6 +617,91 @@
     <button @click="btSelected=[]" class="btn btn-xs btn-ghost mt-2">Clear selection</button>
   </div>
 
+  <!-- Latest Run — Full Trade List -->
+  <div x-show="btResults.length > 0" class="bg-base-200 border border-base-300 rounded-2xl overflow-hidden">
+    <div class="flex items-center justify-between px-5 py-3 border-b border-base-300">
+      <div class="font-bold text-sm uppercase tracking-widest text-base-content/50">
+        <i class="ph ph-list-bullets mr-1"></i> Latest Run — Trade List
+      </div>
+      <div x-show="btResults[0]" class="flex items-center gap-3 text-xs">
+        <span class="font-mono text-base-content/40" x-text="btResults[0]?.window_start?.slice(0,10)+' → '+btResults[0]?.window_end?.slice(0,10)"></span>
+        <span class="font-mono font-bold"
+              :class="(btResults[0]?.results?.return_pct||0)>=0?'text-success':'text-error'"
+              x-text="((btResults[0]?.results?.return_pct||0)>=0?'+':'')+btResults[0]?.results?.return_pct+'%'"></span>
+        <span class="text-base-content/40"
+              x-text="btResults[0]?.results?.n_trades+'T · '+btResults[0]?.results?.win_rate+'% WR · $'+Math.abs(btResults[0]?.results?.net_pnl||0).toFixed(0)"></span>
+        <span class="font-mono text-xs" :class="btResults[0]?.commit?.includes('dirty')?'text-warning':'text-base-content/30'"
+              x-text="btResults[0]?.commit"></span>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="table table-xs">
+        <thead>
+          <tr class="text-base-content/50">
+            <th>#</th>
+            <th>Date</th>
+            <th>Pair</th>
+            <th>Dir</th>
+            <th>Pattern</th>
+            <th class="text-right">Entry</th>
+            <th class="text-right">Exit</th>
+            <th class="text-right">Pips</th>
+            <th class="text-right">R</th>
+            <th class="text-right">P&L</th>
+            <th class="text-right">Running</th>
+            <th>Reason</th>
+            <th>Theme</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="(t, i) in latestTrades()" :key="t.pair+t.entry_ts">
+            <tr :class="t.pnl > 0 ? 'hover:bg-success/5' : t.pnl < 0 ? 'hover:bg-error/5' : 'hover:bg-base-300/20'">
+              <td class="text-base-content/30 text-xs" x-text="i+1"></td>
+              <td class="font-mono text-xs text-base-content/60" x-text="t.entry_ts?.slice(0,10)"></td>
+              <td class="font-mono font-bold text-sm" x-text="t.pair"></td>
+              <td>
+                <span class="badge badge-xs"
+                      :class="t.direction==='long'?'badge-success':'badge-error'"
+                      x-text="t.direction==='long'?'↑ LONG':'↓ SHORT'"></span>
+              </td>
+              <td class="text-xs text-base-content/50 max-w-[140px] truncate"
+                  x-text="(t.pattern||'').replace(/_/g,' ').toLowerCase()"></td>
+              <td class="font-mono text-xs text-right" x-text="t.entry?.toFixed(5)"></td>
+              <td class="font-mono text-xs text-right" x-text="t.exit?.toFixed(5)"></td>
+              <td class="font-mono text-xs text-right font-bold"
+                  :class="pipCount(t)>=0?'text-success':'text-error'"
+                  x-text="(pipCount(t)>=0?'+':'')+pipCount(t).toFixed(0)+'p'"></td>
+              <td class="font-mono text-xs text-right"
+                  :class="t.r>=0?'text-success':'text-error'"
+                  x-text="(t.r>=0?'+':'')+t.r?.toFixed(1)+'R'"></td>
+              <td class="font-mono text-xs text-right font-bold"
+                  :class="t.pnl>=0?'text-success':'text-error'"
+                  x-text="(t.pnl>=0?'+$':'−$')+Math.abs(t.pnl||0).toFixed(0)"></td>
+              <td class="font-mono text-xs text-right"
+                  :class="runningTotal(i)>=0?'text-success':'text-error'"
+                  x-text="(runningTotal(i)>=0?'+$':'−$')+Math.abs(runningTotal(i)).toFixed(0)"></td>
+              <td>
+                <span class="badge badge-xs"
+                      :class="t.reason==='target_reached'?'badge-success badge-outline':t.reason==='stop_hit'?'badge-error badge-outline':t.reason==='weekend_proximity'?'badge-warning badge-outline':'badge-ghost'"
+                      x-text="t.reason==='target_reached'?'🎯 target':t.reason==='stop_hit'?'🛑 stop':t.reason==='weekend_proximity'?'📅 wknd':t.reason||'?'"></span>
+              </td>
+              <td class="text-xs text-base-content/40" x-text="t.macro_theme||''"></td>
+            </tr>
+          </template>
+        </tbody>
+        <tfoot x-show="btResults[0]">
+          <tr class="border-t-2 border-base-300 font-bold">
+            <td colspan="9" class="text-right text-xs text-base-content/50">TOTAL</td>
+            <td class="font-mono text-sm text-right"
+                :class="(btResults[0]?.results?.net_pnl||0)>=0?'text-success':'text-error'"
+                x-text="((btResults[0]?.results?.net_pnl||0)>=0?'+$':'−$')+Math.abs(btResults[0]?.results?.net_pnl||0).toFixed(0)"></td>
+            <td colspan="3"></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+
   <!-- Results history -->
   <div class="bg-base-200 border border-base-300 rounded-2xl overflow-hidden">
     <div class="flex items-center justify-between px-5 py-3 border-b border-base-300">
@@ -875,6 +960,23 @@ function dashboard() {
       if (diff < 3600) return Math.floor(diff/60) + 'm ago';
       if (diff < 86400)return Math.floor(diff/3600) + 'h ago';
       return new Date(ts).toLocaleDateString();
+    },
+
+    // ── Latest run trade list helpers ──────────────────────────────
+    latestTrades() {
+      return (this.btResults[0]?.trades || []);
+    },
+    pipCount(t) {
+      if (!t || t.entry == null || t.exit == null) return 0;
+      const pip = (t.pair||'').includes('JPY') ? 0.01 : 0.0001;
+      const d = t.direction === 'long' ? (t.exit - t.entry) : (t.entry - t.exit);
+      return Math.round(d / pip * 10) / 10;
+    },
+    runningTotal(idx) {
+      const trades = this.latestTrades();
+      let sum = 0;
+      for (let i = 0; i <= idx; i++) sum += (trades[i]?.pnl || 0);
+      return Math.round(sum * 100) / 100;
     },
 
     // ── Backtest methods ────────────────────────────────────────────

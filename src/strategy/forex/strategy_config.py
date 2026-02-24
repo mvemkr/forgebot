@@ -44,6 +44,11 @@ MIN_CONFIDENCE: float = 0.77
 # 150p = meaningful move for Alex-style set-and-forget trades.
 MIN_PIP_EQUITY: float = 100.0
 
+# Pips from target at which we consider price to have "reached the target area."
+# Alex monitors actively and closes when price touches his 4H level — High/Low
+# touch within this threshold triggers the backtester exit (and live alert).
+TARGET_PROXIMITY_PIPS: float = 15.0
+
 # Minimum R:R ratio based on pattern amplitude vs stop distance.
 # Not a take-profit target — geometric quality check only.
 # Blocks patterns where the measured move is smaller than the stop.

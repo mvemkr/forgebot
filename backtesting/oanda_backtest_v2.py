@@ -297,6 +297,55 @@ def _resample_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
     }).dropna()
 
 
+# ── 4H structure target ───────────────────────────────────────────────────────
+
+def _find_next_structure_level(
+    df_4h: pd.DataFrame,
+    direction: str,
+    reference_price: float,
+    swing_bars: int = 5,
+) -> Optional[float]:
+    """
+    Find the nearest prior 4H swing level beyond the neckline in trade direction.
+
+    Alex explicitly places his target at "the next 4-hour low/high" visible on
+    the chart at entry time — not the geometric measured move.
+
+    For SHORT: nearest swing LOW strictly below reference_price
+    For LONG:  nearest swing HIGH strictly above reference_price
+
+    Returns the level, or None if no swing found.
+    """
+    if df_4h is None or len(df_4h) < swing_bars * 2 + 1:
+        return None
+
+    lows  = df_4h["low"].values  if "low"  in df_4h.columns else df_4h["Low"].values
+    highs = df_4h["high"].values if "high" in df_4h.columns else df_4h["High"].values
+    n     = len(df_4h)
+
+    candidates: List[float] = []
+    for i in range(swing_bars, n - swing_bars):
+        if direction == "short":
+            price = lows[i]
+            if price >= reference_price:
+                continue
+            if (all(price <= lows[i - j] for j in range(1, swing_bars + 1)) and
+                    all(price <= lows[i + j] for j in range(1, swing_bars + 1))):
+                candidates.append(price)
+        else:  # long
+            price = highs[i]
+            if price <= reference_price:
+                continue
+            if (all(price >= highs[i - j] for j in range(1, swing_bars + 1)) and
+                    all(price >= highs[i + j] for j in range(1, swing_bars + 1))):
+                candidates.append(price)
+
+    if not candidates:
+        return None
+    # nearest = highest swing low (SHORT) or lowest swing high (LONG)
+    return max(candidates) if direction == "short" else min(candidates)
+
+
 # ── Gap logger ────────────────────────────────────────────────────────────────
 gap_log: List[dict] = []
 
@@ -332,6 +381,11 @@ def _load_v1_decisions():
 # ── Main backtest ─────────────────────────────────────────────────────────────
 def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, starting_bal: float = STARTING_BAL, notes: str = ""):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
+    # Extend data fetch so open positions can run to natural close after the entry window.
+    # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
+    RUNOUT_DAYS = 180
+    runout_dt  = (end_dt + pd.Timedelta(days=RUNOUT_DAYS)).replace(tzinfo=timezone.utc) if end_dt else None
+
     print(f"\n{'='*65}")
     print(f"OANDA 1H BACKTEST v2 — Real Strategy Code")
     print(f"Start: {start_dt.date()}  |  End: {end_dt.date() if end_dt else 'today'}  |  Capital: ${starting_bal:,.2f}")
@@ -348,10 +402,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
 
     for pair in WATCHLIST:
         if use_range:
-            # Paginated date-range fetch — handles any historical window
-            df_1h = _fetch_range(pair, "H1", from_dt=data_start, to_dt=end_dt)
-            df_4h = _fetch_range(pair, "H4", from_dt=data_start, to_dt=end_dt)
-            df_d  = _fetch_range(pair, "D",  from_dt=(start_dt - pd.Timedelta(days=730)).replace(tzinfo=timezone.utc), to_dt=end_dt)
+            # Paginated date-range fetch — handles any historical window.
+            # Fetch to runout_dt so we can let positions close naturally after window end.
+            df_1h = _fetch_range(pair, "H1", from_dt=data_start, to_dt=runout_dt)
+            df_4h = _fetch_range(pair, "H4", from_dt=data_start, to_dt=runout_dt)
+            df_d  = _fetch_range(pair, "D",  from_dt=(start_dt - pd.Timedelta(days=730)).replace(tzinfo=timezone.utc), to_dt=runout_dt)
         else:
             df_1h = _fetch(pair, "H1", 5000)   # ~208 days of hourly bars
             df_4h = _fetch(pair, "H4", 1500)   # ~250 days of 4H bars
@@ -370,13 +425,15 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         print("No data loaded. Exiting.")
         return
 
-    # Build unified 1H timeline from start_dt
-    # Candle timestamps are tz-naive UTC from OandaClient — strip tz from start_dt for comparison
-    start_naive = start_dt.replace(tzinfo=None)
+    # Build unified 1H timeline from start_dt through runout_dt.
+    # Entries are gated at end_naive in the main loop; the extra bars let
+    # open positions close via target/stop rather than being force-closed.
+    start_naive  = start_dt.replace(tzinfo=None)
+    runout_naive = runout_dt.replace(tzinfo=None) if runout_dt else None
     all_1h = sorted(set(
         ts for pdata in candle_data.values()
         for ts in pdata["1h"].index
-        if ts >= start_naive and (end_naive is None or ts <= end_naive)
+        if ts >= start_naive and (runout_naive is None or ts <= runout_naive)
     ))
     print(f"\nPairs loaded: {len(candle_data)}")
     print(f"Backtesting {len(all_1h)} hourly bars: "
@@ -599,6 +656,65 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 if direction == "short" and low   <= entry - risk_dist:
                     stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
 
+            # ── Target-price exit (Alex's manual close) ───────────────────────
+            # Alex closes when price reaches his "next 4H structure low/high"
+            # target. He actively monitors: if price hits the target area and
+            # bounces he closes — especially going into the weekend.
+            # Two exit triggers:
+            #   1. at_target  — High/Low touches within TARGET_PROXIMITY_PIPS
+            #   2. late_week  — Thu/Fri PM, profitable, and ≥70% of the way to
+            #                   target ("don't want it to go into the weekend")
+            target = pos.get("target_price")
+            if target and target != 0:
+                pip_sz    = 0.01 if "JPY" in pair else 0.0001
+                near_pips = getattr(_sc, "TARGET_PROXIMITY_PIPS", 15.0)
+                at_target = (
+                    (direction == "short" and low  <= target + near_pips * pip_sz) or
+                    (direction == "long"  and high >= target - near_pips * pip_sz)
+                )
+                # Weekend proximity close
+                is_late_week = ts_utc.weekday() in (3, 4) and ts_utc.hour >= 15
+                if is_late_week and not at_target:
+                    dist_total   = abs(entry - target)
+                    dist_covered = ((entry - close) if direction == "short"
+                                    else (close - entry))
+                    at_target = (dist_total > 0
+                                 and dist_covered / dist_total >= 0.70
+                                 and dist_covered > 0)
+
+                if at_target:
+                    close_price  = target if not is_late_week else close
+                    delta        = ((entry - close_price) if direction == "short"
+                                    else (close_price - entry))
+                    pnl = delta * units
+                    balance += pnl
+                    close_reason = ("weekend_proximity" if is_late_week
+                                    else "target_reached")
+                    risk_r = delta / risk_dist if risk_dist else 0
+                    trades.append({
+                        "pair":        pair,   "direction": direction,
+                        "entry":       entry,  "exit":      close_price,
+                        "pnl":         round(pnl, 2),
+                        "r":           risk_r,
+                        "reason":      close_reason,
+                        "entry_ts":    pos["entry_ts"].isoformat(),
+                        "exit_ts":     ts_utc.isoformat(),
+                        "bars_held":   bars_held,
+                        "pattern":     pos.get("pattern", "?"),
+                        "notes":       pos.get("notes", ""),
+                        "macro_theme": pos.get("macro_theme"),
+                        "target_1":    target,
+                    })
+                    r_sign   = "+" if risk_r >= 0 else ""
+                    pnl_sign = "+" if pnl >= 0 else ""
+                    print(f"  {'✅' if pnl >= 0 else '❌'} {ts_utc.strftime('%Y-%m-%d')} "
+                          f"| EXIT {pair} {direction.upper()} "
+                          f"@ {close_price:.5f}  {r_sign}{risk_r:.1f}R  "
+                          f"${pnl_sign}{pnl:,.2f}  [{close_reason}]")
+                    strategies[pair].close_position(pair, close_price)
+                    del open_pos[pair]
+                    continue
+
             # Stop hit?
             stopped = (direction == "long"  and low  <= stop) or \
                       (direction == "short" and high >= stop)
@@ -638,6 +754,15 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 continue
 
         # ── Evaluate new entries ──────────────────────────────────────
+        # After the entry window closes (ts > end_naive): stop taking new trades.
+        # Existing positions continue to monitor and close via target or stop.
+        # This eliminates "open_at_end" phantom P&L — results are fully realized.
+        in_entry_window = (end_naive is None or ts <= end_naive)
+        if not in_entry_window:
+            if not open_pos:
+                break  # all positions closed, no new entries — done
+            continue   # keep monitoring open positions, skip entry evaluation
+
         # Macro theme: computed once per calendar day (daily data doesn't change intraday)
         active_theme = _get_theme(ts)
 
@@ -846,17 +971,38 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 continue
 
             strat = strategies[pair]
+
+            # ── Target: next 4H structure level (Alex's actual method) ────────
+            # Alex says "take profit was very strategically placed at this next
+            # 4-hour low" — he looks at prior 4H swing structure, not a geometric
+            # measured move. Find nearest swing low/high beyond the neckline.
+            # Fall back to pattern.target_1 (measured move) if no swing found.
+            # NOTE: recompute hist_4h for THIS pair — Phase 1 left a stale value.
+            _pat       = decision.pattern
+            _neckline  = getattr(decision, "neckline_ref", None) or decision.entry_price
+            _df4h_entry = candle_data[pair].get("4h")
+            _hist4h_entry = (
+                _df4h_entry[_df4h_entry.index < ts]
+                if _df4h_entry is not None else pd.DataFrame()
+            )
+            _target    = _find_next_structure_level(_hist4h_entry, decision.direction, _neckline)
+            if _target is None:
+                _target = (_pat.target_1 if _pat and _pat.target_1 else
+                           _pat.target_2 if _pat and _pat.target_2 else None)
+
             open_pos[pair] = {
-                "entry_price": decision.entry_price,
-                "stop_loss":   decision.stop_loss,
-                "direction":   decision.direction,
-                "units":       units,
-                "bar_idx":     bar_idx,
-                "entry_ts":    ts_utc,
-                "pattern":     decision.pattern.pattern_type if decision.pattern else "?",
-                "notes":       decision.reason[:80],
-                "be_moved":    False,
-                "macro_theme": f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
+                "entry_price":  decision.entry_price,
+                "stop_loss":    decision.stop_loss,
+                "direction":    decision.direction,
+                "units":        units,
+                "bar_idx":      bar_idx,
+                "entry_ts":     ts_utc,
+                "pattern":      decision.pattern.pattern_type if decision.pattern else "?",
+                "notes":        decision.reason[:80],
+                "be_moved":     False,
+                "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
+                "target_price": _target,   # measured move close target
+                "initial_risk": abs(decision.entry_price - decision.stop_loss),
             }
             strat.register_open_position(
                 pair=pair,
@@ -880,8 +1026,13 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                   f"  conf={decision.confidence:.0%}  [{decision.reason[:55]}]"
                   f"  📊{pe:.0f}p{theme_tag}")
 
-    # ── Close any still-open positions at last bar price ──────────────
+    # ── Last-resort close (runout period exhausted) ───────────────────
+    # Normally positions close via target or stop during the runout window.
+    # This block only fires if RUNOUT_DAYS wasn't long enough — rare edge case.
     last_ts = all_1h[-1] if all_1h else None
+    if open_pos:
+        print(f"\n  ⚠ {len(open_pos)} position(s) still open after {RUNOUT_DAYS}-day runout "
+              f"— closing at last bar price (edge case).")
     for pair, pos in list(open_pos.items()):
         if pair not in candle_data: continue
         df_1h_p = candle_data[pair]["1h"]
@@ -897,13 +1048,14 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         trades.append({
             "pair": pair, "direction": direction,
             "entry": entry, "exit": close_p,
-            "pnl": pnl, "r": r, "reason": "open_at_end",
+            "pnl": pnl, "r": r, "reason": "runout_expired",
             "entry_ts": pos["entry_ts"].isoformat(),
             "exit_ts":  last_ts.isoformat() if last_ts else "",
             "bars_held": len(all_1h) - pos["bar_idx"],
             "pattern": pos.get("pattern", "?"),
             "notes": pos.get("notes", ""),
             "macro_theme": pos.get("macro_theme"),
+            "target_1": pos.get("target_price"),
         })
 
     # ── Results ───────────────────────────────────────────────────────
