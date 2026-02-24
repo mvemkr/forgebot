@@ -714,7 +714,7 @@ class PatternDetector:
         best_consol: Optional[dict] = None
         for end_i in range(n - 1, max(n - 61, MIN_CONSOL_BARS), -1):
             # try windows of increasing length starting from end_i going back
-            for start_i in range(end_i - MIN_CONSOL_BARS, max(end_i - 40, -1), -1):
+            for start_i in range(end_i - MIN_CONSOL_BARS + 1, max(end_i - 40, -1), -1):
                 if start_i < 0:
                     break
                 window_highs = highs[start_i:end_i + 1]
@@ -765,7 +765,9 @@ class PatternDetector:
             if abs(floor - nearest) / (floor + 1e-9) > ROUND_TOL:
                 return results   # floor not near a round number — skip
 
-            clarity = min(1.0, 0.5 + n_bars / 40.0)  # longer consol = cleaner setup
+            # Live break = maximum conviction: the current bar just crossed the level.
+            # No ambiguity — the break IS the signal. Always score 1.0.
+            clarity = 1.0
 
             # Entry zone: at/below floor — 1H engulfing in this zone fires entry
             entry_low  = floor * (1 - self.tol * 2)
@@ -805,7 +807,7 @@ class PatternDetector:
             if abs(ceiling - nearest) / (ceiling + 1e-9) > ROUND_TOL:
                 return results
 
-            clarity = min(1.0, 0.5 + n_bars / 40.0)
+            clarity = 1.0   # live break — maximum conviction
 
             entry_low  = ceiling * (1 - self.tol * 0.5)
             entry_high = ceiling * (1 + self.tol * 2)

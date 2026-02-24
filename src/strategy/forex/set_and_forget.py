@@ -763,7 +763,16 @@ class SetAndForgetStrategy:
             dist_pct = abs(level - nearest) / nearest
             PSYCH_TOL = 0.002   # 0.2% — matches the downstream round-number filter tolerance
             # Tighter than tol*1.5: only boost patterns that will also PASS the level check
-            bonus = 0.10 if dist_pct <= PSYCH_TOL else 0.0
+            at_psych = dist_pct <= PSYCH_TOL
+            # Consolidation_breakout = live break in progress — highest priority.
+            # The break bar IS the signal; it should never lose to a stale pattern
+            # that's still waiting for price to arrive.
+            if 'consolidation_breakout' in p.pattern_type and at_psych:
+                bonus = 0.20   # live break at psych level — always wins sort
+            elif at_psych:
+                bonus = 0.10
+            else:
+                bonus = 0.0
             return p.clarity + bonus
 
         patterns = sorted(patterns_daily, key=_psych_sort_score, reverse=True)
@@ -906,6 +915,27 @@ class SetAndForgetStrategy:
                 return True, +0.10, True   # high confidence — extreme + pattern
             if _ext_low  and is_long  and is_reversal_type:
                 return True, +0.10, True
+
+            # ── TIER CB: Consolidation breakout — neutral market, key level breaks ─
+            # Classic set-and-forget: price consolidates in a tight range at a
+            # major psychological level, then breaks out through the floor (bearish)
+            # or ceiling (bullish). Weekly and daily are ranging (neutral) — the
+            # BREAKOUT IS the directional signal, not a prior trend confirmation.
+            #
+            # GBP/CHF Oct 2024 (Wk12b): W=neutral, D=neutral, 4H bearish break at 1.125.
+            # Weekly is not pushing a direction; the consolidation at the key level
+            # and its break IS Alex's setup.
+            #
+            # Also valid when daily has started turning (d_bearish for SHORT,
+            # d_bullish for LONG) — that's even better context.
+            if 'consolidation_breakout' in pat.pattern_type:
+                # The break IS the signal — Alex enters ON the 4H candle that
+                # closes through the level. No context penalty: tight consolidation
+                # + live break at a psych level is high conviction, not an early warning.
+                if is_short and _w_neutral:
+                    return True, 0.0 + _ext_bonus, False
+                if is_long and _w_neutral:
+                    return True, 0.0 + _ext_bonus, False
 
             # ── BLOCK: insufficient context for all other cases ────────────
             return False, 0.0, False
@@ -1297,7 +1327,12 @@ class SetAndForgetStrategy:
             (trade_direction == 'short' and h4_bearish)
         ) else 0.0
         _mtf_bonus   = 0.08 if mtf_confluence.get(matching_pattern.pattern_type) else 0.0
-        _4h_penalty  = -0.05 if getattr(matching_pattern, '_source_tf', 'daily') == '4h' else 0.0
+        # consolidation_breakout: 4H IS the primary timeframe (Alex: "enter on the
+        # 4H engulfing at the break"). No penalty — it's not a less-mature signal.
+        _is_cb = 'consolidation_breakout' in matching_pattern.pattern_type
+        _4h_penalty  = 0.0 if _is_cb else (
+            -0.05 if getattr(matching_pattern, '_source_tf', 'daily') == '4h' else 0.0
+        )
         _level_score = nearest_level.score if nearest_level else 2
         confidence = min(1.0, max(0.0, (
             0.26 * min(1.0, _level_score / 4)    # level quality
@@ -1323,7 +1358,15 @@ class SetAndForgetStrategy:
                           f"{_effective_risk_pct:.1f}% risk each)")
 
         risk_dollars = self.account_balance * (_effective_risk_pct / 100)
-        rr_1 = abs(entry_price - target_1) / max(abs(entry_price - stop_loss), 0.000001)
+        # For consolidation_breakout: measured T1 = 1× range, stop = range + buffer.
+        # R:R at T1 ≈ 0.57 (always <1.0 by construction). Alex runs these for 2-3×
+        # the range minimum — use T2 (2× measured move) as the R:R quality reference.
+        _rr_target = (
+            target_2
+            if 'consolidation_breakout' in matching_pattern.pattern_type
+            else target_1
+        )
+        rr_1 = abs(entry_price - _rr_target) / max(abs(entry_price - stop_loss), 0.000001)
 
         # ── Minimum R:R quality gate ───────────────────────────────────────
         # If the pattern's measured move (T1 amplitude) is less than MIN_RR× the
@@ -1447,7 +1490,18 @@ class SetAndForgetStrategy:
         Returns (entry_price, stop_loss, target_1, target_2, lot_size).
         """
         # Entry: current price (limit order near current close)
-        entry = current_price
+        # Exception: consolidation_breakout — Alex enters AT the break level
+        # (floor for SHORT, ceiling for LONG), not wherever the 1H close ended up
+        # after the 4H break candle formed. By the time the 1H bar is evaluated,
+        # price may be 30-50p past the floor — using that as entry gives a terrible
+        # R:R (tiny reward vs large stop). Use the floor/ceiling as the entry ref.
+        if 'consolidation_breakout' in pattern.pattern_type:
+            if direction == 'short':
+                entry = pattern.neckline        # = floor (the break level)
+            else:
+                entry = pattern.neckline        # = ceiling (the break level)
+        else:
+            entry = current_price
 
         # ── Stop loss: structural stop behind the pattern extreme ──────
         #
