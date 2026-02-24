@@ -232,6 +232,21 @@ TIER3_WEEKLY_STALL_RATIO: float = 0.65
 # data and runs as a no-op). Live bot and backtest must match.
 NEWS_FILTER_ENABLED: bool = False
 
+# ── Pattern proximity preference ───────────────────────────────────────────
+# When multiple patterns qualify (similar clarity), prefer the one whose
+# peaks/troughs (pattern_level) are closest to current price.
+#
+# Why: the pattern detector returns patterns sorted by clarity. High-clarity
+# old patterns (e.g. a June double top at 200.698 when price is at 205.56)
+# can outrank newer, more relevant patterns (July double top at 206.422).
+# The overextension proximity window (5%) makes this worse by allowing
+# patterns whose necklines are 3-4% below price.
+#
+# With PATTERN_PREFER_PROXIMITY=True, patterns are re-ranked by combined
+# proximity of pattern_level + neckline to current price before selection.
+# Clarity still acts as a tiebreaker within the same proximity bucket.
+PATTERN_PREFER_PROXIMITY: bool = True
+
 # ── Neckline level anchor (Week 9 / NZD-CAD rule) ─────────────────────────
 # For H&S, IH&S, and break_retest patterns the neckline/break level must sit
 # within NECKLINE_LEVEL_TOLERANCE_PCT of a round number.
@@ -367,6 +382,10 @@ def get_model_tags() -> list:
         tags.append("no_tier3_stall_gate")
     elif m.TIER3_WEEKLY_STALL_RATIO != 0.65:
         tags.append(f"stall_ratio_{m.TIER3_WEEKLY_STALL_RATIO:.2f}")
+
+    # ── Pattern proximity preference ─────────────────────────────────────────
+    if not m.PATTERN_PREFER_PROXIMITY:
+        tags.append("no_proximity_sort")
 
     # ── Neckline level anchor ────────────────────────────────────────────────
     if not m.REQUIRE_NECKLINE_AT_LEVEL:

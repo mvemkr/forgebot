@@ -419,9 +419,14 @@ class SetAndForgetStrategy:
         """
         if not _cfg.REQUIRE_NECKLINE_AT_LEVEL:
             return True
-        if pattern.pattern_type not in ('head_and_shoulders', 'inv_head_and_shoulders',
-                                        'break_retest'):
-            return True  # double top/bottom handled by _peaks_at_level
+        # Only applies to H&S and IH&S — their neckline is not the pattern_level
+        # so it can float far from any round number.
+        # Double top/bottom: _peaks_at_level handles level validation.
+        # Break_retest: Filter 4 (_is_major_level / structural level) already
+        #               validates the break level — no additional check needed.
+        if pattern.pattern_type not in ('head_and_shoulders',
+                                        'inverted_head_and_shoulders'):
+            return True
 
         nearest = SetAndForgetStrategy._nearest_round_number(pattern.pattern_level, pair)
         tol = pattern.pattern_level * _cfg.NECKLINE_LEVEL_TOLERANCE_PCT
@@ -894,6 +899,24 @@ class SetAndForgetStrategy:
         trade_direction   = None
         _reversal_context = False
         _context_adj      = 0.0
+
+        # ── Pattern proximity sort (PATTERN_PREFER_PROXIMITY lever) ──────────
+        # Re-rank patterns so that those nearest current price are evaluated
+        # first. Prevents old, far-away patterns (high clarity but stale) from
+        # outranking fresh patterns near current price.
+        # Primary key: combined distance of pattern_level + neckline to price.
+        # Secondary key: clarity (higher = better) as tiebreaker.
+        # Example: June DT at 200.698 (241 pips away) loses to July DT at
+        # 206.422 (86 pips away) even if June clarity=1.00 vs July clarity=0.98.
+        if _cfg.PATTERN_PREFER_PROXIMITY and current_price > 0:
+            patterns = sorted(
+                patterns,
+                key=lambda p: (
+                    (abs(p.pattern_level - current_price)
+                     + abs(p.neckline - current_price)) / current_price,
+                    -p.clarity,          # tiebreak: higher clarity first
+                ),
+            )
 
         for p in patterns:
             if p.clarity < self.min_pattern_clarity:
