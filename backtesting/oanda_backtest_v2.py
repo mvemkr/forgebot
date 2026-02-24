@@ -437,6 +437,18 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         min_dist = atr * _sc.ATR_MIN_MULTIPLIER
         return min_dist <= dist <= max_dist
 
+    def _pip_equity(decision, pair: str) -> float:
+        """
+        Measured move in pips for a pattern entry.
+        Used to rank competing entry candidates — highest pip equity gets priority.
+        Measured move = |neckline − target_1| (conservative target, 1:1 R:R minimum).
+        """
+        if not decision.pattern or not decision.pattern.target_1:
+            return 0.0
+        raw = abs(decision.pattern.neckline - decision.pattern.target_1)
+        mult = 100.0 if "JPY" in pair.upper() else 10000.0
+        return raw * mult
+
     def _currencies_in_use():
         """Set of individual currency codes currently in open positions."""
         ccys = set()
@@ -614,6 +626,12 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             if _wr > _max_open_r:
                 _max_open_r = _wr
 
+        # ── Phase 1: evaluate all pairs, collect entry candidates ────────
+        # Evaluate every eligible pair, log decisions, then sort ENTER
+        # candidates by pip equity before filling slots.
+        # This ensures highest-potential setups get priority when slots are scarce.
+        entry_candidates = []  # (pip_equity, pair, decision, _is_theme_pair)
+
         for pair, pdata in candle_data.items():
             if pair in open_pos:
                 continue   # already in this pair
@@ -633,7 +651,6 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             df_d_p  = pdata.get("d")
             df_w_p  = pdata.get("w")
 
-            # Slice history up to (not including) current bar
             hist_1h = df_1h_p[df_1h_p.index < ts]
             hist_4h = df_4h_p[df_4h_p.index < ts] if df_4h_p is not None else pd.DataFrame()
             hist_d  = df_d_p[df_d_p.index < ts]   if df_d_p  is not None else pd.DataFrame()
@@ -642,12 +659,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             if len(hist_1h) < 20 or len(hist_4h) < 10:
                 continue
 
-            # Update strategy risk tier for current balance
             strat = strategies[pair]
             strat.account_balance = balance
             strat.risk_pct = _risk_pct(balance)
 
-            # ── Run real strategy evaluation ──────────────────────────
             try:
                 decision = strat.evaluate(
                     pair        = pair,
@@ -658,26 +673,26 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     current_dt  = ts_utc,
                     macro_theme = active_theme if _is_theme_pair else None,
                 )
-            except Exception as e:
+            except Exception:
                 continue
 
-            dec_record = {
-                "ts":         ts_utc.isoformat(),
-                "pair":       pair,
-                "decision":   decision.decision.value,
-                "confidence": decision.confidence,
-                "reason":     decision.reason,
-                "direction":  decision.direction,
-                "entry_price": decision.entry_price,
-                "stop_loss":  decision.stop_loss,
+            # Log all decisions (WAIT / BLOCKED / ENTER)
+            all_decisions.append({
+                "ts":            ts_utc.isoformat(),
+                "pair":          pair,
+                "decision":      decision.decision.value,
+                "confidence":    decision.confidence,
+                "reason":        decision.reason,
+                "direction":     decision.direction,
+                "entry_price":   decision.entry_price,
+                "stop_loss":     decision.stop_loss,
                 "filters_failed": decision.failed_filters,
-                "balance":    balance,
-            }
-            all_decisions.append(dec_record)
+                "balance":       balance,
+            })
 
-            # ── Gap analysis vs v1 ────────────────────────────────────
-            v1_key  = (pair, ts_utc.isoformat())
-            v1_dec  = v1_decisions.get(v1_key)
+            # Gap analysis vs v1
+            v1_key = (pair, ts_utc.isoformat())
+            v1_dec = v1_decisions.get(v1_key)
             if v1_dec:
                 v1_action = v1_dec.get("decision", "UNKNOWN")
                 v2_action = decision.decision.value
@@ -690,17 +705,13 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     log_gap(ts_utc, pair, v1_action, v2_action, gap_type,
                             f"v2 reason: {decision.reason[:120]}")
 
-            # ── Macro theme direction gate ────────────────────────────
-            # If a macro theme is active and this pair is one of its suggested
-            # trades, block any entry whose direction CONTRADICTS the theme.
-            # E.g. GBP_weak theme → GBP/JPY SHORT is the play.
-            #      If the pattern detector finds a bullish IH&S and wants to go
-            #      LONG, that directly opposes the macro view → skip it.
-            # We only enter if the pattern AGREES with (or is neutral to) the theme.
-            # Controlled by REQUIRE_THEME_GATE lever (default True).
-            if (_sc.REQUIRE_THEME_GATE
-                    and decision.decision == Decision.ENTER
-                    and _is_theme_pair and active_theme):
+            if decision.decision != Decision.ENTER:
+                continue
+
+            # ── Gates that apply only to ENTER decisions ──────────────
+
+            # Theme direction gate
+            if _sc.REQUIRE_THEME_GATE and _is_theme_pair and active_theme:
                 theme_dir_map = dict(active_theme.suggested_trades)
                 theme_dir     = theme_dir_map.get(pair)
                 if theme_dir and theme_dir != decision.direction:
@@ -711,102 +722,103 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                             f"Blocked to avoid contradicting macro view.")
                     continue
 
-            # ── Confidence gate ───────────────────────────────────────
-            if (decision.decision == Decision.ENTER
-                    and decision.confidence < _sc.MIN_CONFIDENCE):
-                log_gap(ts_utc, pair, "ENTER", "BLOCKED",
-                        "low_confidence",
+            # Confidence gate
+            if decision.confidence < _sc.MIN_CONFIDENCE:
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "low_confidence",
                         f"Confidence {decision.confidence:.0%} < {_sc.MIN_CONFIDENCE:.0%} threshold  "
                         f"entry={decision.entry_price:.5f}  reason={decision.reason[:60]}")
-                continue  # skip silently (high-frequency; print only on debug)
+                continue
 
-            # ── Winner rule: don't compete with your winner ───────────
-            # Block new entries only when an open position is genuinely
-            # WINNING right now (≥WINNER_THRESHOLD_R unrealized at current
-            # price). Computed from _max_open_r above — live price check,
-            # not the be_moved flag (which stays True after price drifts back).
-            if decision.decision == Decision.ENTER:
-                win_blocked, win_reason = winner_rule_check(
-                    n_open=len(open_pos),
-                    max_unrealized_r=_max_open_r,
-                )
-                if win_blocked:
-                    log_gap(ts_utc, pair, "ENTER", "BLOCKED",
-                            "winner_rule", win_reason)
-                    continue
+            # Winner rule
+            win_blocked, win_reason = winner_rule_check(
+                n_open=len(open_pos), max_unrealized_r=_max_open_r,
+            )
+            if win_blocked:
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "winner_rule", win_reason)
+                continue
 
-            # ── Stop-distance guard ───────────────────────────────────
-            if (decision.decision == Decision.ENTER
-                    and decision.entry_price and decision.stop_loss
+            # Stop-distance guard
+            if (decision.entry_price and decision.stop_loss
                     and not _stop_ok(pair, decision.entry_price, decision.stop_loss)):
                 atr  = _daily_atr(pair)
                 dist = abs(decision.entry_price - decision.stop_loss)
                 pip  = 0.01 if "JPY" in pair else 0.0001
-                too_wide  = atr is not None and dist > atr * _sc.ATR_STOP_MULTIPLIER
-                gap_type  = "stop_too_wide" if too_wide else "stop_too_tight"
-                if too_wide:
-                    msg = (f"Stop too wide: {dist/pip:.0f}p > max {atr*_sc.ATR_STOP_MULTIPLIER/pip:.0f}p "
-                           f"({_sc.ATR_STOP_MULTIPLIER:.0f}×ATR={atr/pip:.0f}p)")
-                else:
-                    msg = (f"Stop too tight: {dist/pip:.0f}p < min {atr*_sc.ATR_MIN_MULTIPLIER/pip:.0f}p "
-                           f"({_sc.ATR_MIN_MULTIPLIER:.2f}×ATR={atr/pip:.0f}p) — micro-stop, noise will hit it")
+                too_wide = atr is not None and dist > atr * _sc.ATR_STOP_MULTIPLIER
+                gap_type = "stop_too_wide" if too_wide else "stop_too_tight"
+                msg = (
+                    f"Stop too wide: {dist/pip:.0f}p > max {atr*_sc.ATR_STOP_MULTIPLIER/pip:.0f}p "
+                    f"({_sc.ATR_STOP_MULTIPLIER:.0f}×ATR={atr/pip:.0f}p)" if too_wide else
+                    f"Stop too tight: {dist/pip:.0f}p < min {atr*_sc.ATR_MIN_MULTIPLIER/pip:.0f}p "
+                    f"({_sc.ATR_MIN_MULTIPLIER:.2f}×ATR={atr/pip:.0f}p) — micro-stop, noise will hit it"
+                )
                 log_gap(ts_utc, pair, "ENTER", "BLOCKED", gap_type,
                         f"{msg}  entry={decision.entry_price:.5f}  sl={decision.stop_loss:.5f}")
                 print(f"  ⚠ {ts_utc.strftime('%Y-%m-%d %H:%M')} | SKIP {pair} — {msg}  sl={decision.stop_loss:.5f}")
                 continue
 
-            # ── Execute entry ─────────────────────────────────────────
-            if (decision.decision == Decision.ENTER
-                    and decision.entry_price
-                    and decision.stop_loss):
+            if not decision.entry_price or not decision.stop_loss:
+                continue
 
-                rpct  = _risk_pct(balance)
-                # Macro theme stacking: each position gets fraction of normal risk
-                # so TOTAL exposure across all stacked trades = one normal trade.
-                # This is how Alex ran 4 JPY shorts at 1/4 size each = same $ risk as 1 trade.
-                if _is_theme_pair and active_theme:
-                    rpct = rpct * active_theme.position_fraction
-                units = _calc_units(pair, balance, rpct,
-                                    decision.entry_price, decision.stop_loss)
-                if units <= 0:
-                    continue
+            # Valid candidate — queue for pip-equity-ranked entry
+            entry_candidates.append((_pip_equity(decision, pair), pair, decision, _is_theme_pair))
 
-                risk_dist = abs(decision.entry_price - decision.stop_loss)
-                risk_usd    = balance * rpct / 100
+        # ── Phase 2: sort by pip equity, enter highest-potential first ─
+        # When slots are scarce, this ensures the best setup wins, not
+        # whichever pair happened to come first in the dict iteration.
+        entry_candidates.sort(key=lambda x: x[0], reverse=True)
 
-                open_pos[pair] = {
-                    "entry_price": decision.entry_price,
-                    "stop_loss":   decision.stop_loss,
-                    "direction":   decision.direction,
-                    "units":       units,
-                    "bar_idx":     bar_idx,
-                    "entry_ts":    ts_utc,
-                    "pattern":     decision.pattern.pattern_type if decision.pattern else "?",
-                    "notes":       decision.reason[:80],
-                    "be_moved":    False,
-                    "macro_theme": f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
-                }
-                strat.register_open_position(
-                    pair=pair,
-                    entry_price=decision.entry_price,
-                    stop_loss=decision.stop_loss,
-                    direction=decision.direction,
-                    pattern_type=decision.pattern.pattern_type if decision.pattern else None,
-                    neckline_ref=decision.neckline_ref,
-                    risk_pct=rpct,
-                )
+        for pe, pair, decision, _is_theme_pair in entry_candidates:
+            if pair in open_pos:
+                continue  # entered by an earlier candidate this bar
 
-                theme_tag = (
-                    f"  🎯 MACRO THEME: {active_theme.currency} {active_theme.direction.upper()}"
-                    f" (score={active_theme.score:.1f}, {active_theme.trade_count} stacked,"
-                    f" size={active_theme.position_fraction:.0%} of normal)"
-                    if _is_theme_pair and active_theme else ""
-                )
-                print(f"  📈 {ts_utc.strftime('%Y-%m-%d %H:%M')} "
-                      f"| ENTER {pair} {decision.direction.upper()}"
-                      f" @ {decision.entry_price:.5f}  SL={decision.stop_loss:.5f}"
-                      f"  conf={decision.confidence:.0%}"
-                      f"  [{decision.reason[:60]}]{theme_tag}")
+            # Re-check eligibility — earlier entries this bar may have changed
+            # currency overlap or slot counts
+            eligible, _ = _entry_eligible(pair, active_theme)
+            if not eligible:
+                continue
+
+            rpct = _risk_pct(balance)
+            if _is_theme_pair and active_theme:
+                rpct = rpct * active_theme.position_fraction
+            units = _calc_units(pair, balance, rpct,
+                                decision.entry_price, decision.stop_loss)
+            if units <= 0:
+                continue
+
+            strat = strategies[pair]
+            open_pos[pair] = {
+                "entry_price": decision.entry_price,
+                "stop_loss":   decision.stop_loss,
+                "direction":   decision.direction,
+                "units":       units,
+                "bar_idx":     bar_idx,
+                "entry_ts":    ts_utc,
+                "pattern":     decision.pattern.pattern_type if decision.pattern else "?",
+                "notes":       decision.reason[:80],
+                "be_moved":    False,
+                "macro_theme": f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
+            }
+            strat.register_open_position(
+                pair=pair,
+                entry_price=decision.entry_price,
+                stop_loss=decision.stop_loss,
+                direction=decision.direction,
+                pattern_type=decision.pattern.pattern_type if decision.pattern else None,
+                neckline_ref=decision.neckline_ref,
+                risk_pct=rpct,
+            )
+
+            theme_tag = (
+                f"  🎯 MACRO THEME: {active_theme.currency} {active_theme.direction.upper()}"
+                f" (score={active_theme.score:.1f}, {active_theme.trade_count} stacked,"
+                f" size={active_theme.position_fraction:.0%} of normal)"
+                if _is_theme_pair and active_theme else ""
+            )
+            print(f"  📈 {ts_utc.strftime('%Y-%m-%d %H:%M')} "
+                  f"| ENTER {pair} {decision.direction.upper()}"
+                  f" @ {decision.entry_price:.5f}  SL={decision.stop_loss:.5f}"
+                  f"  conf={decision.confidence:.0%}  [{decision.reason[:55]}]"
+                  f"  📊{pe:.0f}p{theme_tag}")
 
     # ── Close any still-open positions at last bar price ──────────────
     last_ts = all_1h[-1] if all_1h else None
