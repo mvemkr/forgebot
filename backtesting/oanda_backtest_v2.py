@@ -485,11 +485,28 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         max_concurrent = STACK_MAX if _is_theme else _sc.MAX_CONCURRENT_TRADES
 
         # Layer 1: max concurrent
-        if len(open_pos) >= max_concurrent:
-            return False, "max_concurrent"
+        # Theme trades use STACK_MAX against total open count.
+        # Non-theme trades only count against other non-theme positions — macro stacks
+        # should not block an unrelated setup like GBP/CHF when GBP/JPY is at BE.
+        if _is_theme:
+            if len(open_pos) >= max_concurrent:
+                return False, "max_concurrent"
+        else:
+            non_theme_count = sum(
+                1 for p in open_pos if open_pos[p].get("macro_theme") is None
+            )
+            if non_theme_count >= _sc.MAX_CONCURRENT_TRADES:
+                return False, "max_concurrent"
         # Layer 2: currency overlap (waived for macro theme pairs — intentionally correlated)
-        if not _is_theme and (_pair_currencies(pair) & _currencies_in_use()):
-            return False, "currency_overlap"
+        # Also waived if ALL conflicting positions have moved to breakeven (risk-free).
+        # Alex takes a second GBP trade when GBP/JPY is already at BE — no real risk.
+        if not _is_theme:
+            overlap_currencies = _pair_currencies(pair) & _currencies_in_use()
+            if overlap_currencies:
+                overlap_pairs = [p for p in open_pos if _pair_currencies(p) & overlap_currencies]
+                all_at_be = all(open_pos[p].get("be_moved", False) for p in overlap_pairs)
+                if not all_at_be:
+                    return False, "currency_overlap"
         return True, ""
 
     # ── Main loop ─────────────────────────────────────────────────────
