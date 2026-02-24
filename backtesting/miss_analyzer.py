@@ -215,12 +215,25 @@ def get_run_meta():
 
 
 def find_bot_trade(trades, pair, direction, window_start, window_end):
-    """Find if bot entered this pair+direction within the window."""
+    """Find if bot entered this pair+direction within (or before) the window.
+
+    A trade counts as 'caught' if:
+      (a) entry was within the window, OR
+      (b) entry was before the window AND exit was after window_start
+          (i.e. the position was still open during the window — same trade context)
+    This handles cases where the bot enters slightly early (e.g. Jul 16 vs Jul 20
+    window start) but takes the same directional trade Alex took in that week.
+    """
     for t in trades:
         if (t.get("pair", "").replace("_", "/") == pair.replace("_", "/")
                 and t.get("direction") == direction):
             entry_ts = t.get("entry_ts", t.get("entry_dt", ""))[:10]
+            exit_ts  = t.get("exit_ts",  t.get("exit_dt",  ""))[:10]
+            # In-window entry
             if window_start <= entry_ts <= window_end:
+                return t
+            # Pre-window entry but still open during the window
+            if entry_ts < window_start and (exit_ts >= window_start or exit_ts == ""):
                 return t
     return None
 

@@ -67,7 +67,7 @@ ATR_LOOKBACK: int = 14
 # ── Concurrency limits ─────────────────────────────────────────────────────
 # Maximum simultaneous open positions (non-theme trades).
 # Macro theme stacking bypasses this — 4 JPY shorts = 1 theme = allowed.
-MAX_CONCURRENT_TRADES: int = 2
+MAX_CONCURRENT_TRADES: int = 4   # Alex runs 4+ simultaneous set-and-forget positions
 
 # ── Winner rule ("don't compete with your winner") ────────────────────────
 # When an open position is past breakeven (≥1R in profit), block all new entries.

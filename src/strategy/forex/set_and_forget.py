@@ -728,7 +728,7 @@ class SetAndForgetStrategy:
                 if 'sweep' not in p.pattern_type
                 and any(k in p.pattern_type for k in
                         ('head_and_shoulders', 'double_top', 'double_bottom',
-                         'inverted_head_and_shoulders'))
+                         'inverted_head_and_shoulders', 'consolidation_breakout'))
             ]
             for p4 in _4h_structural:
                 # MTF confluence: same pattern on BOTH daily and 4H = higher confidence
@@ -779,7 +779,7 @@ class SetAndForgetStrategy:
             is_long  = pat.direction == 'bullish'
             is_reversal_type = any(k in pat.pattern_type for k in
                                    ('head_and_shoulders', 'double_top', 'double_bottom',
-                                    'inverted_head_and_shoulders'))
+                                    'inverted_head_and_shoulders', 'consolidation_breakout'))
 
             # ── OVEREXTENSION BLOCK / BONUS (Feature #1) ──────────────────
             # When price is in the top/bottom OVEREXTENSION_THRESHOLD % of its

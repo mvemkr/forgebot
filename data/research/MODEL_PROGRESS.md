@@ -80,27 +80,43 @@ noise was filling slots before his real setups fired.
 - USD/CHF Wk3: 102% pip capture ✅
 
 ## What's Next (Priority Order)
-1. **Wk2 USD/JPY @157.5** — Pattern detected correctly (double_top at 158.000),
-   2 WAIT windows, but no 1H engulfing fires on OANDA data during retest.
-   Fix: check if H&S @158.258 produces engulfing when double_top at 158 doesn't.
-   May need to lower neckline proximity tolerance for the specific 1H retest hour.
+_Last updated: 2026-02-24 — commit 73b60b9_
+_Miss analyzer baseline: 2/10 Alex trades caught. Bot +914p vs Alex peak +5,905p._
 
-2. **Wk6 GBP/CHF @1.125 vs 1.148** — Bot finds double_top at 1.148 (July).
-   Alex's level was 1.125 (August, when weekly EMA arrived at that level).
-   Fix: EMA-at-level should naturally score 1.125 higher in August.
-   Needs EMA confluence in confidence formula targeting pattern_level not current_price.
+1. **Wk2 USD/JPY @157.5 — ENTER_BLOCKED (per-currency BE tracking)**
+   Signal DOES fire (ENTER decision returned) but blocked in Phase 2.
+   Root cause: NZD/JPY (theme, uses JPY) not at BE on Jul 22 → currency overlap
+   blocks USD/JPY SHORT even though a valid signal is ready.
+   Current `all_at_be` check requires ALL overlapping positions at BE.
+   Fix: per-currency tracking — if GBP/JPY (the OTHER JPY position) is at BE,
+   allow the entry even if NZD/JPY isn't.
+   **PATTERN NOTE**: Alex says "retesting the neckline" — he enters on the RETEST,
+   not the initial break. Bot may be firing on wrong bar. Pull Alex's explicit
+   transcript around Wk2 to confirm exact candle description.
 
-3. **Wk10-11 USD/CAD @1.35** — Break/retest at 1.35 not detecting.
-   Root cause identified: `_mtf_context` has no tier for neutral-trend break_retest.
-   Tier 6 approach was correct but added noise. Needs cleaner reapplication with
-   tighter round-number anchoring.
+2. **Wk6 GBP/CHF @1.125 — LEVEL_MISMATCH (double_top at 1.118 not 1.125)**
+   Pattern detector finds double top peaks at 1.11756, not at 1.125.
+   Alex's tops were literally AT the 1.125 round level.
+   Fix: investigate why the peak clustering puts tops at 1.118 — is it the
+   NECKLINE_CLUSTER_PCT tolerance or the swing high detection window?
 
-4. **Wk13 USD/CHF LONG** — Bullish break/retest not firing.
-   Bot is structurally short-biased. Need to verify bullish break_retest
-   detection for the Oct consolidation breakout.
+3. **Wk12b GBP/CHF — CONSOLIDATION BREAKOUT pattern missing**
+   Alex explicitly says "breakout of the consolidation" — NOT a retest entry.
+   He enters on the 4H engulfing bar that BREAKS below the consolidation floor.
+   Our `break_retest` detector requires a retest (price returns to level).
+   Fix needed: Add `CONSOLIDATION_BREAKOUT` detection — tight range (10+ bars,
+   ~50p width) breaking below floor at round level on 4H engulfing.
+   The "second entry on 15min pullback" is the retest Alex mentions — first entry
+   is pure breakout. Both entry types should be modeled.
 
-5. **Wk12b GBP/CHF** — 4H engulfing at consolidation break. Needs
-   better 4H pattern source detection.
+4. **NOT_EVALUATED ×6 (Wk7, Wk8, Wk10, Wk11, Wk12b, Wk13)**
+   Cascades from #1 and #2 above. Once Wk2/Wk6 slots free up correctly,
+   these weeks become reachable.
+
+5. **Wider window validation (Jan 2025 – Feb 2026)**
+   Previous run: -60.9%, 32 trades, 9% WR — over-trading with low pip equity setups.
+   Run ONLY after Alex window reaches 5+ matched trades.
+   MIN_PIP_EQUITY=100p should help filter noise.
 
 ---
 
@@ -124,3 +140,7 @@ noise was filling slots before his real setups fired.
 | bffe330 | Analysis scripts (no strategy change) |
 | 074fc1a | MIN_CONFIDENCE 0.65→0.75 + ALEX_RUBRIC.md |
 | c0236f5 | MIN_CONFIDENCE 0.75→0.77 + MODEL_PROGRESS.md |
+| 1d35e10 | be_overlap + non_theme_count eligibility fixes → +83.4% |
+| 12ab500 | Pip equity ranker — two-phase entry, highest equity first |
+| db76a1a | miss_analyzer.py — Alex pip-for-pip gap tracker |
+| 73b60b9 | Pip equity dashboard, MIN_PIP_EQUITY=100p |

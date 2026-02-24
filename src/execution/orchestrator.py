@@ -523,6 +523,7 @@ class ForexOrchestrator:
             "conf_required": conf_req,
             "pattern":     decision.pattern.pattern_type if has_pattern else None,
             "pattern_clarity": round(decision.pattern.clarity, 2) if has_pattern else None,
+            "pattern_tf":  getattr(decision.pattern, '_source_tf', 'daily').upper() if has_pattern else None,
             "pip_equity":  round(_pip_equity, 1),
             "level_price": round(decision.nearest_level.price, 5) if has_level else None,
             "level_score": decision.nearest_level.score if has_level else None,

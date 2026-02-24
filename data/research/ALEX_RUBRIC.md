@@ -26,6 +26,8 @@ That's the whole model. No trend gates. No Z-scores. No overextension tiers.
 - Pattern: H&S, neckline at round level **157.5**
 - Trigger: 1H bearish engulfing at neckline + EMA rejection
 - Entry: London session, ~Jul 22
+- **BOT MISS REASON**: NZD/JPY (theme trade, uses JPY) not at BE on Jul 22 — currency overlap blocks USD/JPY SHORT even though a valid ENTER signal fires. Fix needed: per-currency BE tracking so a theme trade on JPY doesn't lock out an unrelated JPY setup once it's risk-free.
+- **PATTERN NOTE**: Alex says "retesting the neckline" — this is a RETEST entry, not the initial break. Bot needs to detect the post-break retest specifically. The H&S fires once, breaks, then price pulls back to the neckline from below — THAT is the entry candle Alex takes. Our pattern detector may be firing on the wrong candle (the initial break, not the retest).
 
 ### Wk3 — USD/CHF SHORT @ ~0.889
 - Pattern: Double top or H&S at **0.889** (0.875 or 0.9 range)
@@ -81,6 +83,9 @@ That's the whole model. No trend gates. No Z-scores. No overextension tiers.
 - Pattern: Consolidation break + double top → break + retest at level
 - Trigger: 4H bearish engulfing at break, then 15m engulfing on pullbacks
 - Entry: ~Oct (Week 12)
+- **BOT MISS REASON**: NO_PATTERN in Oct window. The double_top at 1.125 appeared Sep 25 (WAIT, waiting for engulfing) but price moved away by Oct. Sep 23 EUR/CAD took the non-theme slot (62p equity — blocked by MIN_PIP_EQUITY=100p now) which prevented the Sep 25 entry.
+- **PATTERN NOTE**: Alex explicitly says "breakout of the consolidation" — this is a CONSOLIDATION BREAKOUT pattern, not a classic double top. Price consolidated below 1.125 for weeks, then broke down. Alex entered on the 4H engulfing AT the breakout bar, not a retest. Our `break_retest` detector requires a RETEST (price returns to broken level). For a consolidation breakout, the entry is ON the break itself (4H engulfing closing below the consolidation floor). This is a distinct sub-type the bot doesn't currently detect cleanly. The "second entry on 15min pullback" is the retest — but Alex's first entry is the breakout candle itself.
+- **KEY ADDITION for pattern matcher**: Add `CONSOLIDATION_BREAKOUT` detection — identify tight range (10+ bars within 50p), detect 4H engulfing breaking below range floor at round level. This covers Wk12b exactly.
 
 ### Wk13 — USD/CHF LONG @ ~0.86 area
 > "broke out of that consolidation zone… waiting for the retest… we had the most important thing — our entry signal"

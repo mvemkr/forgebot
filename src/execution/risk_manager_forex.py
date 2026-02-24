@@ -426,34 +426,14 @@ class ForexRiskManager:
         if n == 0:
             return False, ""   # first trade — no further checks needed
 
-        # 2 — Currency overlap (waived for macro theme — correlated exposure intentional)
-        # Also waived if ALL conflicting positions have moved to breakeven (risk-free).
-        # Alex takes a second GBP trade when GBP/JPY is already at BE — no real risk.
-        if not is_macro_theme_pair:
-            proposed = self.pair_currencies(pair)
-            in_use   = self.currencies_in_use(open_positions)
-            overlap  = proposed & in_use
-            if overlap:
-                overlap_pairs = [
-                    p for p in open_positions
-                    if self.pair_currencies(p) & overlap
-                ]
-                def _pos_at_be(pos: dict) -> bool:
-                    entry = pos.get("entry", 0)
-                    stop  = pos.get("stop", pos.get("stop_loss", 0))
-                    direction = pos.get("direction", "")
-                    if direction == "short":
-                        return stop <= entry   # stop at or below entry → risk-free
-                    elif direction == "long":
-                        return stop >= entry   # stop at or above entry → risk-free
-                    return False
-                all_at_be = all(_pos_at_be(open_positions[p]) for p in overlap_pairs)
-                if not all_at_be:
-                    return True, (
-                        f"⛔ CURRENCY OVERLAP: {', '.join(overlap)} already exposed. "
-                        f"Open: {list(open_positions.keys())}. "
-                        f"Can't double-expose the same currency."
-                    )
+        # 2 — Same-pair block only (currency overlap removed — Alex stacks GBP/JPY + GBP/CHF,
+        # USD/JPY + NZD/JPY simultaneously. Broad currency overlap was blocking valid setups.
+        # Only hard rule: don't enter the same instrument twice.)
+        if pair in open_positions:
+            return True, (
+                f"⛔ SAME PAIR OPEN: {pair} already has an open position. "
+                f"Can't enter the same instrument twice."
+            )
 
         # 3 — Book budget
         book_risk = self.get_book_risk_pct(account_balance, open_positions)

@@ -509,16 +509,12 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             )
             if non_theme_count >= _sc.MAX_CONCURRENT_TRADES:
                 return False, "max_concurrent"
-        # Layer 2: currency overlap (waived for macro theme pairs — intentionally correlated)
-        # Also waived if ALL conflicting positions have moved to breakeven (risk-free).
-        # Alex takes a second GBP trade when GBP/JPY is already at BE — no real risk.
-        if not _is_theme:
-            overlap_currencies = _pair_currencies(pair) & _currencies_in_use()
-            if overlap_currencies:
-                overlap_pairs = [p for p in open_pos if _pair_currencies(p) & overlap_currencies]
-                all_at_be = all(open_pos[p].get("be_moved", False) for p in overlap_pairs)
-                if not all_at_be:
-                    return False, "currency_overlap"
+        # Layer 2: same-pair block only — don't enter a pair already open.
+        # Alex never applied a broad currency-overlap rule. He stacked GBP/JPY + GBP/CHF,
+        # USD/JPY + NZD/JPY, etc. His only hard constraint is the slot count above.
+        # Broad currency overlap was blocking Wk2 (JPY) and Wk12b (GBP) entirely.
+        if pair in open_pos:
+            return False, "same_pair_open"
         return True, ""
 
     # ── Main loop ─────────────────────────────────────────────────────

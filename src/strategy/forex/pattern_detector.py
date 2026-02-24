@@ -145,11 +145,12 @@ class PatternDetector:
     def detect_all(self, df: pd.DataFrame) -> List[PatternResult]:
         """Detect all patterns, return sorted by clarity descending."""
         results = []
-        results.extend(self._detect_liquidity_sweep(df))      # institutional sweeps
+        results.extend(self._detect_liquidity_sweep(df))          # institutional sweeps
         results.extend(self._detect_head_and_shoulders(df))
         results.extend(self._detect_double_top_bottom(df))
         results.extend(self._detect_break_retest(df))
-        results.extend(self._detect_engulfing_rejection(df))  # daily/4H candle rejection
+        results.extend(self._detect_consolidation_breakout(df))  # tight range break (Alex Wk12b)
+        results.extend(self._detect_engulfing_rejection(df))     # daily/4H candle rejection
         results.sort(key=lambda r: r.clarity, reverse=True)
         return results
 
@@ -205,6 +206,12 @@ class PatternDetector:
             current_close = closes[-1]
             broke_neckline = current_close < neckline
 
+            # How many bars (after right shoulder) have closed below the neckline?
+            # Alex's rule: enter on the RETEST bar after the break, not the break candle itself.
+            # We require >= 2 bars below neckline before the retest entry zone activates.
+            MIN_BARS_BELOW = 2
+            bars_below_neckline = int(np.sum(closes[rs_idx:] < neckline))
+
             # Clarity: how well-formed is the pattern
             clarity = 1.0
             clarity -= shoulder_diff * 5           # penalize unequal shoulders
@@ -213,13 +220,36 @@ class PatternDetector:
 
             stop = rs + (h - neckline) * 0.3   # just above right shoulder
 
-            notes = "Neckline broken — waiting for retest" if broke_neckline else "Watching for neckline break"
+            if broke_neckline and bars_below_neckline >= MIN_BARS_BELOW:
+                # ── POST-BREAK RETEST STATE ──────────────────────────────────
+                # Neckline confirmed broken (≥2 bars below). Entry zone is the
+                # RETEST area: price returning to neckline from below.
+                # Entry zone sits AT + slightly above neckline so an engulfing
+                # that touches neckline and closes back down through it fires.
+                entry_low  = neckline * (1 - self.tol * 0.5)   # small tolerance below (wick allowance)
+                entry_high = neckline * (1 + self.tol * 2)      # ceiling: 2× tol above (retest touch)
+                notes = f"Neckline broken ({bars_below_neckline}b below) — watching retest at {neckline:.5f}"
+            elif not broke_neckline:
+                # ── PRE-BREAK WATCHING STATE ─────────────────────────────────
+                # Pattern is forming but neckline not broken yet. Show on dashboard
+                # but set entry zone FAR above current price so it won't trigger.
+                # Real entry only after confirmed break + retest.
+                entry_low  = neckline * (1 + self.tol * 3)     # won't reach unless full retest
+                entry_high = neckline * (1 + self.tol * 4)
+                notes = f"H&S forming — watching for neckline break at {neckline:.5f}"
+                clarity *= 0.8  # lower score: pattern not yet confirmed
+            else:
+                # broke_neckline but < MIN_BARS_BELOW: break just happened, too early for retest
+                entry_low  = neckline * (1 + self.tol * 3)
+                entry_high = neckline * (1 + self.tol * 4)
+                notes = f"Neckline just broke ({bars_below_neckline}b) — waiting {MIN_BARS_BELOW - bars_below_neckline} more bar(s) before retest valid"
+
             results.append(PatternResult(
                 pattern_type='head_and_shoulders',
                 direction='bearish',
                 neckline=neckline,
-                entry_zone_low=neckline,
-                entry_zone_high=neckline * (1 + self.tol),
+                entry_zone_low=entry_low,
+                entry_zone_high=entry_high,
                 stop_loss=stop,
                 target_1=neckline - (h - neckline),       # measured move
                 target_2=neckline - (h - neckline) * 1.5,
@@ -253,22 +283,45 @@ class PatternDetector:
             peak2 = max(highs[h_idx:rs_idx+1])
             neckline = (peak1 + peak2) / 2
 
+            current_close = closes[-1]
+            broke_neckline_up = current_close > neckline
+
+            # Bars above neckline since right shoulder (bullish mirror of bearish H&S)
+            bars_above_neckline = int(np.sum(closes[rs_idx:] > neckline))
+
             clarity = 1.0 - shoulder_diff * 5
             clarity = max(0.1, min(1.0, clarity))
 
             stop = rs - abs(neckline - h) * 0.3
 
+            if broke_neckline_up and bars_above_neckline >= MIN_BARS_BELOW:
+                # POST-BREAK RETEST: price returned to neckline from above
+                entry_low  = neckline * (1 - self.tol * 2)     # retest touch below neckline (wick)
+                entry_high = neckline * (1 + self.tol * 0.5)
+                ihs_notes = f"Neckline broken up ({bars_above_neckline}b above) — watching retest at {neckline:.5f}"
+            elif not broke_neckline_up:
+                # PRE-BREAK: pattern forming, won't trigger entry
+                entry_low  = neckline * (1 - self.tol * 4)
+                entry_high = neckline * (1 - self.tol * 3)
+                ihs_notes = f"IH&S forming — watching for neckline break at {neckline:.5f}"
+                clarity *= 0.8
+            else:
+                # Break just happened, wait for retest
+                entry_low  = neckline * (1 - self.tol * 4)
+                entry_high = neckline * (1 - self.tol * 3)
+                ihs_notes = f"Neckline just broke up ({bars_above_neckline}b) — waiting {MIN_BARS_BELOW - bars_above_neckline} more bar(s)"
+
             results.append(PatternResult(
                 pattern_type='inverted_head_and_shoulders',
                 direction='bullish',
                 neckline=neckline,
-                entry_zone_low=neckline * (1 - self.tol),
-                entry_zone_high=neckline,
+                entry_zone_low=entry_low,
+                entry_zone_high=entry_high,
                 stop_loss=stop,
                 target_1=neckline + abs(neckline - h),
                 target_2=neckline + abs(neckline - h) * 1.5,
                 clarity=clarity,
-                notes="Inverted H&S — bullish reversal setup",
+                notes=ihs_notes,
                 pattern_level=neckline,   # neckline is THE level everyone watches on IH&S
             ))
 
@@ -616,6 +669,167 @@ class PatternDetector:
                     pattern_level = swing_low,
                 ))
                 break
+
+        return results
+
+    def _detect_consolidation_breakout(self, df: pd.DataFrame) -> List[PatternResult]:
+        """
+        Consolidation Breakout — Alex's Wk12b GBP/CHF pattern.
+
+        Alex says "breakout of the consolidation" — he enters ON the 4H engulfing
+        candle that breaks the floor (bearish) or ceiling (bullish). NO retest wait.
+        This is distinct from break_retest which waits for price to RETURN after
+        breaking. Here, the break candle itself is the entry signal.
+
+        Detection criteria:
+          1. Tight consolidation: MIN_CONSOL_BARS or more consecutive bars with
+             range ≤ MAX_RANGE_PCT of price (approx 40–60p on major pairs)
+          2. Round number near the floor (bearish) or ceiling (bullish) —
+             structural level that drew consolidation
+          3. Most recent bar's BODY closes through the floor/ceiling
+             (acts as both the break AND the engulfing trigger)
+          4. Entry zone: just below floor (bearish) / above ceiling (bullish)
+             so a 1H confirmation fires immediately after the 4H break
+
+        Stop: opposite side of the consolidation range + buffer.
+        Target: measured move = 1× the consolidation range below floor.
+        """
+        results = []
+        if len(df) < 20:
+            return results
+
+        opens  = df['open'].values
+        highs  = df['high'].values
+        lows   = df['low'].values
+        closes = df['close'].values
+        n      = len(df)
+
+        MIN_CONSOL_BARS = 10
+        MAX_RANGE_PCT   = self.tol * 1.5    # ~0.45% of price ≈ 50p at 1.125
+        ROUND_TOL       = self.tol * 2.0    # tolerance for round-number check
+
+        # Slide a window back from current bar to find the most recent tight range
+        # We look at the last 60 bars maximum and find the longest qualifying window
+        # ending at least 1 bar before current (the break bar is the latest bar).
+        best_consol: Optional[dict] = None
+        for end_i in range(n - 1, max(n - 61, MIN_CONSOL_BARS), -1):
+            # try windows of increasing length starting from end_i going back
+            for start_i in range(end_i - MIN_CONSOL_BARS, max(end_i - 40, -1), -1):
+                if start_i < 0:
+                    break
+                window_highs = highs[start_i:end_i + 1]
+                window_lows  = lows[start_i:end_i + 1]
+                c_high = float(window_highs.max())
+                c_low  = float(window_lows.min())
+                mid    = (c_high + c_low) / 2.0
+                rng    = c_high - c_low
+                if mid <= 0:
+                    continue
+                if rng / mid > MAX_RANGE_PCT:
+                    break   # window too wide — shrinking start_i won't help for this end_i
+                # Valid tight range
+                n_bars = end_i - start_i + 1
+                if best_consol is None or n_bars > best_consol['n_bars']:
+                    best_consol = {
+                        'c_high':  c_high,
+                        'c_low':   c_low,
+                        'n_bars':  n_bars,
+                        'end_idx': end_i,
+                    }
+            if best_consol and best_consol['end_idx'] != end_i:
+                break  # found a window that ends before current bar — use it
+
+        if best_consol is None:
+            return results
+
+        c_high  = best_consol['c_high']
+        c_low   = best_consol['c_low']
+        n_bars  = best_consol['n_bars']
+        consol_range = c_high - c_low
+
+        # The break bar = the candle AFTER the consolidation ends = most recent bar
+        curr_open  = opens[-1]
+        curr_close = closes[-1]
+
+        # Bearish breakout: body closes BELOW the consolidation floor
+        if curr_close < c_low and curr_open > curr_close:
+            # Body closes below floor — bearish break candle
+            floor = c_low
+
+            # Round-number check on the floor
+            def _nearest_round(price: float) -> float:
+                """Nearest round number at 0.5 granularity (e.g. 1.125, 1.150)."""
+                return round(price * 40) / 40   # rounds to nearest 0.025
+
+            nearest = _nearest_round(floor)
+            if abs(floor - nearest) / (floor + 1e-9) > ROUND_TOL:
+                return results   # floor not near a round number — skip
+
+            clarity = min(1.0, 0.5 + n_bars / 40.0)  # longer consol = cleaner setup
+
+            # Entry zone: at/below floor — 1H engulfing in this zone fires entry
+            entry_low  = floor * (1 - self.tol * 2)
+            entry_high = floor * (1 + self.tol * 0.5)
+
+            # Stop: above consolidation ceiling + small buffer
+            stop = c_high * (1 + self.tol)
+
+            # Target: measured move = range below floor
+            target_1 = floor - consol_range
+            target_2 = floor - consol_range * 2.0
+
+            results.append(PatternResult(
+                pattern_type='consolidation_breakout_bearish',
+                direction='bearish',
+                neckline=floor,
+                entry_zone_low=entry_low,
+                entry_zone_high=entry_high,
+                stop_loss=stop,
+                target_1=target_1,
+                target_2=target_2,
+                clarity=clarity,
+                notes=(f"Consol breakout: {n_bars}-bar range "
+                       f"[{c_low:.5f}–{c_high:.5f}] broke floor "
+                       f"at {floor:.5f} — enter on break candle"),
+                pattern_level=floor,
+            ))
+
+        # Bullish breakout: body closes ABOVE the consolidation ceiling
+        elif curr_close > c_high and curr_open < curr_close:
+            ceiling = c_high
+
+            def _nearest_round(price: float) -> float:
+                return round(price * 40) / 40
+
+            nearest = _nearest_round(ceiling)
+            if abs(ceiling - nearest) / (ceiling + 1e-9) > ROUND_TOL:
+                return results
+
+            clarity = min(1.0, 0.5 + n_bars / 40.0)
+
+            entry_low  = ceiling * (1 - self.tol * 0.5)
+            entry_high = ceiling * (1 + self.tol * 2)
+
+            stop = c_low * (1 - self.tol)
+
+            target_1 = ceiling + consol_range
+            target_2 = ceiling + consol_range * 2.0
+
+            results.append(PatternResult(
+                pattern_type='consolidation_breakout_bullish',
+                direction='bullish',
+                neckline=ceiling,
+                entry_zone_low=entry_low,
+                entry_zone_high=entry_high,
+                stop_loss=stop,
+                target_1=target_1,
+                target_2=target_2,
+                clarity=clarity,
+                notes=(f"Consol breakout: {n_bars}-bar range "
+                       f"[{c_low:.5f}–{c_high:.5f}] broke ceiling "
+                       f"at {ceiling:.5f} — enter on break candle"),
+                pattern_level=ceiling,
+            ))
 
         return results
 
