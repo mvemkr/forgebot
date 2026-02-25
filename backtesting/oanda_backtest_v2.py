@@ -611,13 +611,43 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             low   = float(bar["low"])
             close = float(bar["close"])
 
-            # Breakeven at 1:1
-            risk_dist = pos.get("initial_risk") or abs(entry - stop)  # always use entry-time stop for R
-            if not pos.get("be_moved"):
-                if direction == "long"  and high  >= entry + risk_dist:
-                    stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
-                if direction == "short" and low   <= entry - risk_dist:
-                    stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
+            # ── One-way ratchet trailing stop (Option B) ─────────────────────
+            # Replaces hard breakeven lock.
+            # Activates at TRAIL_ACTIVATE_R MFE, then trails TRAIL_DIST_R
+            # behind the running max-favourable price. Never moves backwards.
+            risk_dist      = pos.get("initial_risk") or abs(entry - stop)
+            _trail_act     = _sc.TRAIL_ACTIVATE_R * risk_dist
+            _trail_dist    = _sc.TRAIL_DIST_R     * risk_dist
+
+            if _trail_dist > 0:
+                if direction == "long":
+                    # Update running max-favourable
+                    if high > pos.get("trail_max", entry):
+                        pos["trail_max"] = high
+                    _mfe = pos["trail_max"] - entry
+                    if _mfe >= _trail_act:
+                        _new_stop = pos["trail_max"] - _trail_dist
+                        _new_stop = max(_new_stop, entry + _trail_dist)   # floor at +0.5R
+                        if _new_stop > stop:                               # ratchet only UP
+                            stop = _new_stop
+                            pos["stop_loss"] = stop
+                else:  # short
+                    if low < pos.get("trail_max", entry):
+                        pos["trail_max"] = low
+                    _mfe = entry - pos["trail_max"]
+                    if _mfe >= _trail_act:
+                        _new_stop = pos["trail_max"] + _trail_dist
+                        _new_stop = min(_new_stop, entry - _trail_dist)   # ceiling at −0.5R
+                        if _new_stop < stop:                               # ratchet only DOWN
+                            stop = _new_stop
+                            pos["stop_loss"] = stop
+            else:
+                # Fallback: hard BE at 1:1 (TRAIL_DIST_R = 0 disables trail)
+                if not pos.get("be_moved"):
+                    if direction == "long"  and high  >= entry + risk_dist:
+                        stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
+                    if direction == "short" and low   <= entry - risk_dist:
+                        stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
 
             # ── Target-price exit (Alex's manual close) ───────────────────────
             # Alex closes when price reaches his "next 4H structure low/high"
@@ -988,6 +1018,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "pattern":      decision.pattern.pattern_type if decision.pattern else "?",
                 "notes":        decision.reason[:80],
                 "be_moved":     False,
+                "trail_max":    decision.entry_price,   # running max-favourable price for ratchet
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
                 "target_price": _target,
                 "target_type":  decision.exec_target_type,
@@ -1067,10 +1098,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     # ── Results ───────────────────────────────────────────────────────
     net_pnl  = balance - starting_bal
     ret_pct  = net_pnl / starting_bal * 100
-    wins     = [t for t in trades if t["pnl"] > 0]
-    losses   = [t for t in trades if t["pnl"] <= 0]
-    wr       = len(wins) / len(trades) * 100 if trades else 0
-    avg_r    = (sum(t["r"] for t in trades) / len(trades)) if trades else 0.0
+    # ── 3-bucket classification: Win / Loss / Scratch ─────────────────────
+    # Scratch = |R| < SCRATCH_THRESHOLD (BE exits, tiny weekend partials).
+    # Win/Loss buckets exclude scratches for conditional WR reporting.
+    SCRATCH_R = 0.10   # ≤0.10R in either direction = scratch
+    wins      = [t for t in trades if t["r"] >  SCRATCH_R]
+    losses    = [t for t in trades if t["r"] < -SCRATCH_R]
+    scratches = [t for t in trades if abs(t["r"]) <= SCRATCH_R]
+    directional = wins + losses      # excludes scratches
+    wr       = len(wins) / len(trades)       * 100 if trades     else 0
+    cond_wr  = len(wins) / len(directional)  * 100 if directional else 0
+    avg_r    = (sum(t["r"] for t in trades)   / len(trades))      if trades else 0.0
+    avg_r_w  = (sum(t["r"] for t in wins)     / len(wins))        if wins   else 0.0
+    avg_r_l  = (sum(t["r"] for t in losses)   / len(losses))      if losses else 0.0
+    avg_r_s  = (sum(t["r"] for t in scratches)/ len(scratches))   if scratches else 0.0
     max_r    = max((t["r"] for t in trades), default=0.0)
     # Max drawdown: track running equity peak and worst trough
     _eq = starting_bal
@@ -1092,9 +1133,14 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     print(f"\n{'='*65}")
     print(f"RESULTS — v2 (Real Strategy Code)")
     print(f"{'='*65}")
-    print(f"  Trades:       {len(trades)}  ({len(wins)}W / {len(losses)}L)")
-    print(f"  Win rate:     {wr:.0f}%")
-    print(f"  Avg R:        {avg_r:>+.2f}R")
+    print(f"  Trades:       {len(trades)}  "
+          f"({len(wins)}W / {len(losses)}L / {len(scratches)}S)")
+    print(f"  Win rate:     {wr:.0f}%  (all)    "
+          f"Conditional (excl scratch): {cond_wr:.0f}%")
+    print(f"  Scratch rate: {len(scratches)/len(trades)*100:.0f}%  "
+          f"({len(scratches)} of {len(trades)} trades)")
+    print(f"  Avg R:        {avg_r:>+.2f}R  "
+          f"(W: {avg_r_w:>+.1f}R  L: {avg_r_l:>+.1f}R  S: {avg_r_s:>+.1f}R)")
     print(f"  Best R:       {max_r:>+.1f}R")
     print(f"  Max DD:       {_max_dd_pct:.1f}%")
     print(f"  Starting:     ${starting_bal:>10,.2f}")

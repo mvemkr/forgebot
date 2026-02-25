@@ -306,6 +306,22 @@ DD_L2_PCT: float = 25.0    # second cap threshold (harder brake)
 DD_L2_CAP: float = 6.0     # max risk % when DD ≥ L2
 DD_RESUME_PCT: float = 0.95 # equity must recover to 95% of peak to lift the cap
 
+# ── One-way ratchet trailing stop ─────────────────────────────────────────
+# Option B: replaces hard breakeven lock at 1:1.
+# When price moves TRAIL_ACTIVATE_R in our favour, the stop trails
+# TRAIL_DIST_R behind the running max-favourable price (never moves backward).
+#
+# Example (default 1R activate, 0.5R trail distance):
+#   MFE=0.9R  → stop stays at initial stop (not activated yet)
+#   MFE=1.0R  → trail activates; stop = max_fav - 0.5R = entry+0.5R (floor)
+#   MFE=2.0R  → stop = entry + 1.5R (trailing 0.5R behind max)
+#   MFE=3.5R  → stop = entry + 3.0R
+#   MFE pulls back → stop stays locked at whatever it ratcheted to
+#
+# Set TRAIL_DIST_R = 0.0 to disable trailing (reverts to hard BE lock).
+TRAIL_ACTIVATE_R: float = 1.0   # start trailing once MFE reaches this R multiple
+TRAIL_DIST_R:     float = 0.5   # trail this many R-multiples behind running max MFE
+
 # ── D1 strong-opposite veto for reversal patterns ─────────────────────────
 # For reversal patterns (H&S, DT, DB, IH&S): only apply a hard block when the
 # Daily timeframe is STRONGLY trending opposite to the trade direction.
