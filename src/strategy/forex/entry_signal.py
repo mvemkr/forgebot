@@ -22,7 +22,7 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
-from .strategy_config import ENGULFING_ONLY
+from . import strategy_config as _cfg   # module-ref so apply_levers() patches propagate
 
 
 @dataclass
@@ -116,9 +116,9 @@ class EntrySignalDetector:
                 ))
 
             # Pin bar — controlled by ENGULFING_ONLY config flag.
-            # Alex's rule: "No engulfing candle = no trade." Every video.
-            # Default: ENGULFING_ONLY=True → pin bars are NOT valid entry signals.
-            if not ENGULFING_ONLY:
+            # When ENGULFING_ONLY=False, pin bars are valid IF they meet the
+            # tight spec in _pin_bar() (wick ≥ 2× body, close in outer 30%).
+            if not _cfg.ENGULFING_ONLY:
                 pb = self._pin_bar(current)
                 if pb:
                     signals.append(pb)

@@ -110,10 +110,28 @@ ALLOWED_PAIRS: frozenset = frozenset({
 BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = False
 
 # ── Entry signal quality ────────────────────────────────────────────────────
-# Alex's rule: "No engulfing candle = no trade." Every video. Absolute rule.
-# When True: only bearish_engulfing / bullish_engulfing trigger entry.
-# Pin bars, rejection wicks, etc. are NOT valid entry signals.
-ENGULFING_ONLY: bool = True
+# Alex's rule: "No engulfing candle = no trade." Every video.
+# ENGULFING_ONLY=True: only bearish_engulfing / bullish_engulfing trigger entry.
+# ENGULFING_ONLY=False: also allows pin bars that meet PIN_BAR_* spec below.
+#
+# Why False now: Alex uses pin rejections on retests, especially at clean round
+# levels. Keeping engulf-only biases the sample by undertrading retests where
+# price wicks through the level and snaps back — a very common Alex entry.
+# The pin bar spec below is intentionally tight to avoid opening the floodgates.
+ENGULFING_ONLY: bool = False
+
+# ── Pin bar entry spec ─────────────────────────────────────────────────────
+# Only active when ENGULFING_ONLY=False.
+# Tight spec prevents noise pin bars from triggering entries:
+#   1. Rejection wick must be ≥ PIN_BAR_MIN_WICK_BODY_RATIO × body size
+#   2. Close must be in the outer PIN_BAR_CLOSE_OUTER_PCT of candle range
+#      in the trade direction (bearish pin: close near bottom; long pin: near top)
+#   3. Candle must have wicked into the zone (verified in set_and_forget zone check)
+#
+# Alex pin bar examples: USD/JPY retest of 157.5 — wick poked through, closed
+# clean back on sell side. Classic rejection. Body was ~20% of range.
+PIN_BAR_MIN_WICK_BODY_RATIO: float = 2.0   # wick ≥ 2× body
+PIN_BAR_CLOSE_OUTER_PCT:     float = 0.30  # close in outer 30% (trade-direction end)
 
 # Unrealized-R threshold that defines a "winner running."
 # A position must be THIS many R's in profit RIGHT NOW (at current price)
@@ -251,6 +269,57 @@ TIER3_REQUIRE_WEEKLY_STALL: bool = True
 # Recent weekly range must be < this fraction of 4-week avg to count as stalling.
 # 0.65 = recent week range less than 65% of prior average = compression/doji.
 TIER3_WEEKLY_STALL_RATIO: float = 0.65
+
+# ── Zone touch + reject gate ──────────────────────────────────────────────
+# Before checking for an entry trigger (engulf / pin), verify that recent price
+# action actually wicked into the zone around the pattern level.
+#
+# Two tests:
+#   1. Touch test: wick reaches within ZONE_TOUCH_ATR_MULT × ATR of the level
+#      (0.35×ATR for majors; 0.5×ATR for crosses — broader spreads + noisier)
+#   2. Reject test: enforced by the trigger candle itself (engulf body / pin wick)
+#
+# "Touch" is tested on the last ZONE_TOUCH_LOOKBACK_BARS 1H bars.
+# This stops engulfing candles from firing well away from the level —
+# a valid setup must have price at least approaching the zone first.
+ZONE_REQUIRE_TOUCH: bool = True
+ZONE_TOUCH_ATR_MULT: float = 0.35    # majors (EUR/USD, GBP/USD, USD/JPY, etc.)
+ZONE_TOUCH_ATR_MULT_CROSS: float = 0.50  # crosses (GBP/JPY, GBP/CHF, EUR/CAD, etc.)
+ZONE_TOUCH_LOOKBACK_BARS: int = 5    # look back this many 1H bars for a zone touch
+
+# ── Drawdown circuit breaker ───────────────────────────────────────────────
+# Graduated risk caps when account draws down from peak equity.
+# Does NOT replace the 40% REGROUP killswitch — works alongside it.
+#
+# Tiers (applied against peak_equity, not starting balance):
+#   DD ≥ DD_L1_PCT → cap risk at DD_L1_CAP_PCT (default 10%)
+#   DD ≥ DD_L2_PCT → cap risk at DD_L2_CAP_PCT (default 6%)
+#   DD ≥ 40%       → REGROUP killswitch (existing, unchanged)
+#
+# Full risk resumes only when equity recovers to DD_RESUME_PCT of peak.
+# Default 0.95 = must recover to 95% of prior peak before full risk returns.
+# This prevents "recovered 1% above the L1 threshold → full risk immediately."
+DD_CIRCUIT_BREAKER_ENABLED: bool = True
+DD_L1_PCT: float = 15.0    # first cap threshold (% drawdown from peak)
+DD_L1_CAP: float = 10.0    # max risk % when DD ≥ L1
+DD_L2_PCT: float = 25.0    # second cap threshold (harder brake)
+DD_L2_CAP: float = 6.0     # max risk % when DD ≥ L2
+DD_RESUME_PCT: float = 0.95 # equity must recover to 95% of peak to lift the cap
+
+# ── D1 strong-opposite veto for reversal patterns ─────────────────────────
+# For reversal patterns (H&S, DT, DB, IH&S): only apply a hard block when the
+# Daily timeframe is STRONGLY trending opposite to the trade direction.
+# A regular "bullish" daily is not sufficient to veto a double top SHORT —
+# the pattern IS the reversal signal. Over-blocking here causes us to miss
+# the best setups (Alex's most profitable trades are counter-weekly-trend).
+#
+# "Strongly opposite" = daily trend is STRONG_BULLISH for a SHORT, or
+# STRONG_BEARISH for a LONG. Regular BULLISH / BEARISH daily → allowed with penalty.
+#
+# For continuation patterns (break_retest, consolidation_breakout):
+# keep the existing weekly alignment requirement — continuations should flow
+# with trend, not fight it.
+D1_VETO_ONLY_STRONG_OPPOSITE: bool = True
 
 # ── News filter lever ─────────────────────────────────────────────────────
 # Whether to block entries when the triggering candle forms during a
@@ -434,6 +503,26 @@ def get_model_tags() -> list:
 
     # ── Entry signal ────────────────────────────────────────────────────────
     tags.append("engulfing_only" if m.ENGULFING_ONLY else "pin_bars_allowed")
+    if not m.ENGULFING_ONLY:
+        tags.append(f"pin_wick_{m.PIN_BAR_MIN_WICK_BODY_RATIO:.1f}x")
+
+    # ── Zone touch gate ──────────────────────────────────────────────────────
+    if not m.ZONE_REQUIRE_TOUCH:
+        tags.append("no_zone_touch")
+    else:
+        tags.append(f"zone_{m.ZONE_TOUCH_ATR_MULT:.2f}atr")
+
+    # ── DD circuit breaker ──────────────────────────────────────────────────
+    if m.DD_CIRCUIT_BREAKER_ENABLED:
+        tags.append(f"dd_brake_{int(m.DD_L1_PCT)}pct_cap{int(m.DD_L1_CAP)}")
+    else:
+        tags.append("no_dd_brake")
+
+    # ── D1 veto ──────────────────────────────────────────────────────────────
+    if m.D1_VETO_ONLY_STRONG_OPPOSITE:
+        tags.append("d1_strong_veto")
+    else:
+        tags.append("weekly_veto")
 
     # ── Pattern types ───────────────────────────────────────────────────────
     if not m.ALLOW_BREAK_RETEST:

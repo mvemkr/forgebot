@@ -260,6 +260,8 @@ class PatternDetector:
         if len(df) < self.min_bars:
             return results
 
+        MIN_BARS_BELOW = 2   # bars that must close through neckline before retest entry valid
+
         highs  = df['high'].values
         lows   = df['low'].values
         closes = df['close'].values
@@ -304,7 +306,7 @@ class PatternDetector:
             MIN_BARS_BELOW = 1
             bars_below_neckline = int(np.sum(closes[rs_idx:] < neckline))
 
-            # Clarity: how well-formed is the pattern
+            # Clarity
             clarity = 1.0
             clarity -= shoulder_diff * 5           # penalize unequal shoulders
             clarity -= abs(trough1 - trough2) / h  # penalize uneven troughs
