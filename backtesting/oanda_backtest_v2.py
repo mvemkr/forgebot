@@ -453,13 +453,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
 
     # ── State ─────────────────────────────────────────────────────────
     balance       = starting_bal
+    peak_balance  = starting_bal    # tracks equity high-water mark for DD circuit breaker
     open_pos: Dict[str, dict] = {}   # pair → position dict
     trades        = []
     all_decisions = []
     v1_decisions  = _load_v1_decisions()
 
     def _risk_pct(bal):
-        return risk.get_risk_pct(bal)
+        """DD-aware risk: applies graduated caps when equity is below peak."""
+        pct, _dd_flag = risk.get_risk_pct_with_dd(bal, peak_equity=peak_balance)
+        return pct
+
+    def _risk_pct_with_flag(bal):
+        """Returns (pct, dd_flag) — use for per-trade diagnostics."""
+        return risk.get_risk_pct_with_dd(bal, peak_equity=peak_balance)
 
     def _calc_units(pair, bal, rpct, entry, stop):
         pip    = 0.01 if "JPY" in pair else 0.0001
@@ -688,6 +695,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                                     else (close_price - entry))
                     pnl = delta * units
                     balance += pnl
+                    peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
                     close_reason = ("weekend_proximity" if is_late_week
                                     else "target_reached")
                     risk_r = delta / risk_dist if risk_dist else 0
@@ -703,6 +711,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                         "pattern":     pos.get("pattern", "?"),
                         "notes":       pos.get("notes", ""),
                         "macro_theme": pos.get("macro_theme"),
+                        "signal_type": pos.get("signal_type", "unknown"),
                         "target_1":    target,
                     })
                     r_sign   = "+" if risk_r >= 0 else ""
@@ -725,6 +734,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 delta    = (exit_p - entry) if direction == "long" else (entry - exit_p)
                 pnl      = delta * units
                 balance += pnl
+                peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
                 reason   = "stop_hit" if stopped else "max_hold"
                 risk_r   = delta / risk_dist if risk_dist else 0
 
@@ -738,6 +748,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     "pattern": pos.get("pattern", "?"),
                     "notes": pos.get("notes", ""),
                     "macro_theme": pos.get("macro_theme"),
+                    "signal_type": pos.get("signal_type", "unknown"),
                 })
 
                 r_sign = "+" if risk_r >= 0 else ""
@@ -965,7 +976,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                             f"{elig_reason2}")
                 continue
 
-            rpct = _risk_pct(balance)
+            _base_rpct, _dd_flag = _risk_pct_with_flag(balance)
+            rpct = _base_rpct
             if _is_theme_pair and active_theme:
                 rpct = rpct * active_theme.position_fraction
             units = _calc_units(pair, balance, rpct,
@@ -1006,6 +1018,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
                 "target_price": _target,   # measured move close target
                 "initial_risk": abs(decision.entry_price - decision.stop_loss),
+                "base_risk_pct": _base_rpct,
+                "dd_flag":       _dd_flag,   # "" | "DD_CAP_10" | "DD_CAP_6"
+                "signal_type":   (decision.entry_signal.signal_type
+                                  if decision.entry_signal else "unknown"),
             }
             strat.register_open_position(
                 pair=pair,
@@ -1048,10 +1064,12 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         pnl     = delta * units
         r       = delta / abs(entry - stop) if abs(entry - stop) else 0
         balance += pnl
+        peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
         trades.append({
             "pair": pair, "direction": direction,
             "entry": entry, "exit": close_p,
             "pnl": pnl, "r": r, "reason": "runout_expired",
+            "signal_type": pos.get("signal_type", "unknown"),
             "entry_ts": pos["entry_ts"].isoformat(),
             "exit_ts":  last_ts.isoformat() if last_ts else "",
             "bars_held": len(all_1h) - pos["bar_idx"],
@@ -1067,16 +1085,63 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     wins     = [t for t in trades if t["pnl"] > 0]
     losses   = [t for t in trades if t["pnl"] <= 0]
     wr       = len(wins) / len(trades) * 100 if trades else 0
+    avg_r    = (sum(t["r"] for t in trades) / len(trades)) if trades else 0.0
+    max_r    = max((t["r"] for t in trades), default=0.0)
+    # Max drawdown: track running equity peak and worst trough
+    _eq = starting_bal
+    _pk = starting_bal
+    _max_dd_pct = 0.0
+    for t in trades:
+        _eq += t["pnl"]
+        _pk  = max(_pk, _eq)
+        _dd  = (_pk - _eq) / _pk * 100 if _pk > 0 else 0
+        _max_dd_pct = max(_max_dd_pct, _dd)
+    # Trigger type counts
+    from collections import Counter
+    _trigger_counts = Counter(
+        t.get("signal_type", "unknown") for t in trades
+    )
+    # DD cap usage
+    _dd_cap_trades = [t for t in trades if t.get("dd_flag")]
 
     print(f"\n{'='*65}")
     print(f"RESULTS — v2 (Real Strategy Code)")
     print(f"{'='*65}")
-    print(f"  Trades:       {len(trades)}  ({len(wins)} wins / {len(losses)} losses)")
+    print(f"  Trades:       {len(trades)}  ({len(wins)}W / {len(losses)}L)")
     print(f"  Win rate:     {wr:.0f}%")
+    print(f"  Avg R:        {avg_r:>+.2f}R")
+    print(f"  Best R:       {max_r:>+.1f}R")
+    print(f"  Max DD:       {_max_dd_pct:.1f}%")
     print(f"  Starting:     ${starting_bal:>10,.2f}")
     print(f"  Net P&L:      ${net_pnl:>+10,.2f}")
     print(f"  Final:        ${balance:>10,.2f}")
     print(f"  Return:       {ret_pct:>+.1f}%")
+
+    if _trigger_counts:
+        print(f"\n  ── Trigger types ──────────────────────────────────────")
+        for sig_type, count in sorted(_trigger_counts.items(), key=lambda x: -x[1]):
+            pct = count / len(trades) * 100 if trades else 0
+            print(f"    {sig_type:<30} {count:>3}  ({pct:.0f}%)")
+
+    if _dd_cap_trades:
+        print(f"\n  ── DD circuit breaker applied ─────────────────────────")
+        _cap_counts = Counter(t["dd_flag"] for t in _dd_cap_trades)
+        for flag, cnt in _cap_counts.items():
+            print(f"    {flag}: {cnt} trade(s) affected")
+
+    # Rejection reason summary (top 10 from all_decisions WAIT decisions)
+    _wait_reasons = [
+        f
+        for d in all_decisions
+        if d.get("decision") == "WAIT"
+        for f in d.get("failed_filters", [])
+        if f
+    ]
+    if _wait_reasons:
+        _reason_counts = Counter(_wait_reasons).most_common(10)
+        print(f"\n  ── Top rejection reasons (WAIT decisions) ─────────────")
+        for reason, count in _reason_counts:
+            print(f"    {reason:<40} {count:>4}x")
 
     print(f"\n  Trade log:")
     for t in trades:

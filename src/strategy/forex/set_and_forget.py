@@ -937,6 +937,23 @@ class SetAndForgetStrategy:
                 if is_long and _w_neutral:
                     return True, 0.0 + _ext_bonus, False
 
+            # ── TIER 3.5: D1 soft veto (D1_VETO_ONLY_STRONG_OPPOSITE lever) ──
+            # For structural reversal patterns at psych levels: if weekly is
+            # opposing but D1 is only MILDLY trending against us (not STRONG),
+            # allow the entry with a larger confidence penalty.
+            # Rationale: a double top at 205 with weekly=bullish + daily=bullish
+            # (but not STRONG_BULLISH) is a valid reversal — the pattern IS the
+            # signal. Only hard-veto when D1 is fresh, strongly opposite momentum.
+            # Controlled by D1_VETO_ONLY_STRONG_OPPOSITE lever (default True).
+            if is_reversal_type and _cfg.D1_VETO_ONLY_STRONG_OPPOSITE:
+                d1_strongly_opposite = (
+                    (is_short and trend_d == Trend.STRONG_BULLISH) or
+                    (is_long  and trend_d == Trend.STRONG_BEARISH)
+                )
+                if not d1_strongly_opposite:
+                    # Mildly opposing daily — allow with larger penalty (-10% conf adj)
+                    return True, -0.10 + _ext_bonus, True
+
             # ── BLOCK: insufficient context for all other cases ────────────
             return False, 0.0, False
 
@@ -1207,6 +1224,58 @@ class SetAndForgetStrategy:
                 )
 
         # ─────────────────────────────────────────────
+        # FILTER 4.5: Zone touch gate
+        # Price must have wicked into the zone (within ATR tolerance of the
+        # neckline) in the last ZONE_TOUCH_LOOKBACK_BARS 1H candles.
+        # Prevents engulfing candles that fire far away from the actual level.
+        # Tolerance: 0.35×ATR for majors, 0.50×ATR for crosses.
+        # ─────────────────────────────────────────────
+        if _cfg.ZONE_REQUIRE_TOUCH and len(df_1h) >= 15:
+            _h1_h = df_1h['high'].values
+            _h1_l = df_1h['low'].values
+            _h1_c = df_1h['close'].values
+            _tr   = np.maximum(
+                _h1_h[-14:] - _h1_l[-14:],
+                np.abs(_h1_h[-14:] - _h1_c[-15:-1]),
+                np.abs(_h1_l[-14:] - _h1_c[-15:-1]),
+            )
+            _atr_1h = float(np.mean(_tr)) if len(_tr) > 0 else None
+
+            if _atr_1h and _atr_1h > 0:
+                _pair_ccys  = pair.replace("_", "/").split("/")
+                _is_cross   = "USD" not in _pair_ccys
+                _zone_mult  = _cfg.ZONE_TOUCH_ATR_MULT_CROSS if _is_cross else _cfg.ZONE_TOUCH_ATR_MULT
+                _zone_tol   = _atr_1h * _zone_mult
+                _level      = matching_pattern.neckline
+                _lookback   = min(_cfg.ZONE_TOUCH_LOOKBACK_BARS, len(df_1h))
+                _recent     = df_1h.iloc[-_lookback:]
+                _touched    = any(
+                    row['low']  <= _level + _zone_tol and
+                    row['high'] >= _level - _zone_tol
+                    for _, row in _recent.iterrows()
+                )
+                if not _touched:
+                    pip = 0.01 if "JPY" in pair else 0.0001
+                    failed_filters.append("no_zone_touch")
+                    return TradeDecision(
+                        decision=Decision.WAIT,
+                        pair=pair,
+                        direction=trade_direction,
+                        reason=(
+                            f"No zone touch in last {_lookback} bars: price not within "
+                            f"{_zone_tol/pip:.0f}p of neckline {_level:.5f} "
+                            f"(tol={_zone_mult:.2f}×ATR={_atr_1h/pip:.0f}p). "
+                            f"Wait for price to reach the level."
+                        ),
+                        confidence=0.15,
+                        failed_filters=failed_filters,
+                        pattern=matching_pattern,
+                        trend_weekly=trend_w,
+                        trend_daily=trend_d,
+                        trend_4h=trend_4,
+                    )
+
+        # ─────────────────────────────────────────────
         # FILTER 5: Engulfing candle — THE PATIENCE FILTER
         # THE most critical check. No signal = NO ENTRY. Ever.
         #
@@ -1214,7 +1283,7 @@ class SetAndForgetStrategy:
         # A 200-pip NFP spike looks like a perfect engulfing candle.
         # It isn't. It's a data release — not tradeable price action.
         # ─────────────────────────────────────────────
-        has_signal, signal = self.signal_detector.has_signal(df_1h, trade_direction)
+        has_signal, signal, _sig_reason = self.signal_detector.has_signal(df_1h, trade_direction)
 
         # Check if the triggering candle is a news candle — if so, treat as no signal
         if has_signal and signal and len(df_1h) > 0:
@@ -1247,15 +1316,21 @@ class SetAndForgetStrategy:
              'inverted_head_and_shoulders', 'consolidation_breakout',
              'tweezer_top', 'tweezer_bottom', 'evening_star', 'morning_star'))
         if (not has_signal or signal is None) and _is_reversal_pattern and len(df_4h) >= 2:
-            has_signal_4h, signal_4h = self.signal_detector.has_signal(df_4h, trade_direction)
+            has_signal_4h, signal_4h, _sig_reason_4h = self.signal_detector.has_signal(df_4h, trade_direction)
             if has_signal_4h and signal_4h:
                 signal_4h.signal_type = signal_4h.signal_type + '_4h'
                 has_signal = True
                 signal = signal_4h
+            else:
+                # Combine 1H + 4H reason codes for diagnostics
+                if _sig_reason_4h and _sig_reason_4h not in _sig_reason:
+                    _sig_reason = f"{_sig_reason}|{_sig_reason_4h}"
 
         if not has_signal or signal is None:
             # Setup is valid but we're waiting for the candle
             # This is the correct state 90% of the time
+            if _sig_reason:
+                failed_filters.append(_sig_reason)
             _level_str = (
                 f"level {nearest_level.price:.5f} (score={nearest_level.score})"
                 if nearest_level else
@@ -1267,10 +1342,11 @@ class SetAndForgetStrategy:
                 direction=trade_direction,
                 reason=(
                     f"Setup ACTIVE — {matching_pattern.pattern_type} at {_level_str}. "
-                    f"Trend aligned. WAITING FOR ENGULFING CANDLE. Do not enter without it."
+                    f"Trend aligned. WAITING FOR TRIGGER [{_sig_reason or 'NO_TRIGGER'}]. "
+                    f"No entry without engulfing or qualifying pin bar."
                 ),
                 confidence=0.70,
-                failed_filters=["awaiting_entry_signal"],
+                failed_filters=[_sig_reason or "awaiting_entry_signal"],
                 nearest_level=nearest_level,
                 pattern=matching_pattern,
                 trend_weekly=trend_w,

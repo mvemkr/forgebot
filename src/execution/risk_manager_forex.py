@@ -124,11 +124,53 @@ class ForexRiskManager:
     # ── Risk Scaling ───────────────────────────────────────────────────
 
     def get_risk_pct(self, account_balance: float) -> float:
+        """Base tier risk — no drawdown adjustment. Use get_risk_pct_with_dd for live trading."""
         for max_bal, risk_pct in self.RISK_TIERS:
             if account_balance < max_bal:
                 logger.debug(f"Risk tier: {risk_pct}% (balance ${account_balance:,.0f})")
                 return risk_pct
         return 25.0  # fallback
+
+    def get_risk_pct_with_dd(self, account_balance: float,
+                              peak_equity: Optional[float] = None) -> tuple[float, str]:
+        """
+        Returns (final_risk_pct, reason_flag) with graduated drawdown caps applied.
+
+        DD ≥ DD_L2_PCT (25%) → cap at DD_L2_CAP (6%)   flag: DD_CAP_6
+        DD ≥ DD_L1_PCT (15%) → cap at DD_L1_CAP (10%)  flag: DD_CAP_10
+        Otherwise             → full tier risk           flag: ""
+
+        Caps lift only when equity recovers above DD_RESUME_PCT (95%) of peak.
+        peak_equity defaults to self._peak_balance when not supplied.
+        """
+        from src.strategy.forex.strategy_config import (DD_CIRCUIT_BREAKER_ENABLED,
+                                                         DD_L1_PCT, DD_L1_CAP,
+                                                         DD_L2_PCT, DD_L2_CAP,
+                                                         DD_RESUME_PCT)
+        base = self.get_risk_pct(account_balance)
+
+        if not DD_CIRCUIT_BREAKER_ENABLED:
+            return base, ""
+
+        peak = peak_equity if peak_equity is not None else self._peak_balance
+        if peak <= 0:
+            return base, ""
+
+        dd = (peak - account_balance) / peak   # 0.0 → 1.0
+
+        if dd >= DD_L2_PCT / 100:
+            capped = min(base, DD_L2_CAP)
+            logger.warning(f"DD circuit breaker L2: DD={dd:.1%} ≥ {DD_L2_PCT}% "
+                           f"→ risk capped {base:.1f}%→{capped:.1f}%")
+            return capped, "DD_CAP_6"
+
+        if dd >= DD_L1_PCT / 100:
+            capped = min(base, DD_L1_CAP)
+            logger.warning(f"DD circuit breaker L1: DD={dd:.1%} ≥ {DD_L1_PCT}% "
+                           f"→ risk capped {base:.1f}%→{capped:.1f}%")
+            return capped, "DD_CAP_10"
+
+        return base, ""
 
     def get_tier_label(self, account_balance: float) -> str:
         # Note: use &lt; not < — these labels are sent via Telegram HTML parse mode

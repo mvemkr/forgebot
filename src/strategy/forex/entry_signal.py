@@ -119,7 +119,7 @@ class EntrySignalDetector:
             # When ENGULFING_ONLY=False, pin bars are valid IF they meet the
             # tight spec in _pin_bar() (wick ≥ 2× body, close in outer 30%).
             if not _cfg.ENGULFING_ONLY:
-                pb = self._pin_bar(current)
+                pb = self._pin_bar(current, direction="")
                 if pb:
                     signals.append(pb)
 
@@ -130,16 +130,70 @@ class EntrySignalDetector:
         signals.sort(key=lambda s: s.strength, reverse=True)
         return signals[0]
 
-    def has_signal(self, df: pd.DataFrame, direction: str) -> tuple[bool, Optional[EntrySignal]]:
+    def has_signal(self, df: pd.DataFrame, direction: str) -> tuple[bool, Optional[EntrySignal], str]:
         """
         Check if there's a valid entry signal in the given direction.
-        Returns (True/False, signal_or_None).
-        direction: 'long' or 'short'
+        Returns (found, signal_or_None, reason_code).
+
+        reason_code when False:
+          NO_ENGULF       — engulfing tried, not found (ENGULFING_ONLY=True)
+          NO_ENGULF|NO_PIN — both tried, neither found (ENGULFING_ONLY=False)
+          NO_TRIGGER      — signal found but wrong direction or below strength threshold
         """
-        signal = self.detect(df)
-        if signal and signal.direction == direction and signal.is_valid:
-            return True, signal
-        return False, None
+        if len(df) < 3:
+            return False, None, "NO_TRIGGER"
+
+        tried_pin   = not _cfg.ENGULFING_ONLY
+        found_engulf = False
+        found_pin    = False
+        best: Optional[EntrySignal] = None
+
+        for i in range(-self.lookback, 0):
+            try:
+                current = df.iloc[i]
+                prev    = df.iloc[i - 1]
+            except IndexError:
+                continue
+
+            # ── Engulfing ──────────────────────────────────────────────
+            if direction == "short":
+                s = self._bearish_engulfing(current, prev)
+                if s:
+                    found_engulf = True
+                    sig = EntrySignal('bearish_engulfing', 'short', s, i,
+                                      current['close'],
+                                      abs(current['open'] - current['close']),
+                                      f"Bearish engulfing at {current['close']:.5f}")
+                    if best is None or sig.strength > best.strength:
+                        best = sig
+            else:
+                s = self._bullish_engulfing(current, prev)
+                if s:
+                    found_engulf = True
+                    sig = EntrySignal('bullish_engulfing', 'long', s, i,
+                                      current['close'],
+                                      abs(current['open'] - current['close']),
+                                      f"Bullish engulfing at {current['close']:.5f}")
+                    if best is None or sig.strength > best.strength:
+                        best = sig
+
+            # ── Pin bar (only when ENGULFING_ONLY=False) ───────────────
+            if tried_pin:
+                pb = self._pin_bar(current, direction)
+                if pb:
+                    found_pin = True
+                    if best is None or pb.strength > best.strength:
+                        best = pb
+
+        if best and best.direction == direction and best.is_valid:
+            return True, best, ""
+
+        # ── Diagnostic reason ──────────────────────────────────────────
+        if tried_pin:
+            reason = "NO_ENGULF|NO_PIN" if (not found_engulf and not found_pin) else "NO_TRIGGER"
+        else:
+            reason = "NO_ENGULF" if not found_engulf else "NO_TRIGGER"
+        return False, None, reason
 
     # ------------------------------------------------------------------ #
     # Individual signal detectors
@@ -235,55 +289,76 @@ class EntrySignalDetector:
 
         return strength
 
-    def _pin_bar(self, current: pd.Series) -> Optional[EntrySignal]:
+    def _pin_bar(self, current: pd.Series, direction: str = "") -> Optional[EntrySignal]:
         """
-        Pin bar / rejection wick.
-        Long wick in one direction with small body at the other end.
+        Pin bar / rejection wick — tight spec (all three rules must pass):
+          1. Rejection wick ≥ PIN_BAR_MIN_WICK_BODY_RATIO × body (default 2×)
+          2. Close in outer PIN_BAR_CLOSE_OUTER_PCT of candle range in
+             the trade direction (bearish = lower 30%, bullish = upper 30%)
+          3. Directional: upper wick only for shorts, lower wick only for longs
+
+        Why tight: prevents noise wicks (NFP spikes, overnight gaps) from
+        triggering entries. Alex's pin bars are textbook — wick dominant,
+        body clearly at the far end, clean close-back.
         """
+        from .strategy_config import PIN_BAR_MIN_WICK_BODY_RATIO, PIN_BAR_CLOSE_OUTER_PCT
+
         o = current['open']
         h = current['high']
         l = current['low']
         c = current['close']
 
         candle_range = h - l
-        if candle_range == 0:
+        if candle_range < 1e-8:
             return None
 
-        body = abs(c - o)
-        body_ratio = body / candle_range
+        body       = abs(c - o)
+        body_high  = max(o, c)
+        body_low   = min(o, c)
+        upper_wick = h - body_high
+        lower_wick = body_low - l
 
-        # Body must be small (pin bar = mostly wick)
-        if body_ratio > 0.35:
-            return None
+        # Minimum body floor: 0.5% of candle range to avoid divide-by-near-zero
+        # (doji candles with 0-pip bodies pass wick≥2×body trivially — exclude them)
+        body_floor = max(body, candle_range * 0.005)
 
-        upper_wick = h - max(o, c)
-        lower_wick = min(o, c) - l
+        # ── Bearish pin (SHORT): dominant upper wick ────────────────────
+        # Upper wick drove into resistance then price closed back down.
+        # Close must be in the LOWER 30% of the candle range.
+        if direction in ("", "short"):
+            if (upper_wick >= PIN_BAR_MIN_WICK_BODY_RATIO * body_floor
+                    and upper_wick > lower_wick              # upper dominates
+                    and c <= l + PIN_BAR_CLOSE_OUTER_PCT * candle_range):
+                strength = min(1.0, (upper_wick / candle_range) - 0.05) * 0.85
+                return EntrySignal(
+                    signal_type='pin_bar_bearish',
+                    direction='short',
+                    strength=strength,
+                    candle_index=-1,
+                    close=c,
+                    body_size=body,
+                    notes=(f"Bearish pin — wick {upper_wick/candle_range:.0%} of range, "
+                           f"wick/body={upper_wick/body_floor:.1f}×, close lower {(c-l)/candle_range:.0%}"),
+                )
 
-        # Bearish pin bar: large upper wick, body at bottom
-        if upper_wick > candle_range * 0.6 and upper_wick > lower_wick * 2:
-            strength = min(1.0, upper_wick / candle_range - 0.1)
-            return EntrySignal(
-                signal_type='pin_bar_bearish',
-                direction='short',
-                strength=strength * 0.8,  # pin bars slightly weaker than engulfing
-                candle_index=-1,
-                close=c,
-                body_size=body,
-                notes=f"Bearish pin bar — rejection wick at {h:.5f}",
-            )
-
-        # Bullish pin bar: large lower wick, body at top
-        if lower_wick > candle_range * 0.6 and lower_wick > upper_wick * 2:
-            strength = min(1.0, lower_wick / candle_range - 0.1)
-            return EntrySignal(
-                signal_type='pin_bar_bullish',
-                direction='long',
-                strength=strength * 0.8,
-                candle_index=-1,
-                close=c,
-                body_size=body,
-                notes=f"Bullish pin bar — rejection wick at {l:.5f}",
-            )
+        # ── Bullish pin (LONG): dominant lower wick ─────────────────────
+        # Lower wick drove into support then price closed back up.
+        # Close must be in the UPPER 30% of the candle range.
+        if direction in ("", "long"):
+            if (lower_wick >= PIN_BAR_MIN_WICK_BODY_RATIO * body_floor
+                    and lower_wick > upper_wick              # lower dominates
+                    and c >= h - PIN_BAR_CLOSE_OUTER_PCT * candle_range):
+                strength = min(1.0, (lower_wick / candle_range) - 0.05) * 0.85
+                return EntrySignal(
+                    signal_type='pin_bar_bullish',
+                    direction='long',
+                    strength=strength,
+                    candle_index=-1,
+                    close=c,
+                    body_size=body,
+                    notes=(f"Bullish pin — wick {lower_wick/candle_range:.0%} of range, "
+                           f"wick/body={lower_wick/body_floor:.1f}×, close upper {(h-c)/candle_range:.0%}"),
+                )
 
         return None
 
