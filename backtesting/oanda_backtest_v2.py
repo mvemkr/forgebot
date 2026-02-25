@@ -29,11 +29,13 @@ Usage:
 import sys
 import json
 import time
+import pickle
 import argparse
 import requests
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
 
@@ -334,48 +336,119 @@ def _load_v1_decisions():
         return {}
 
 
+# ── Trail arm configurations ──────────────────────────────────────────────────
+# Used by ab9 multi-arm comparison.  Each arm overrides only the trail params.
+#
+# Two-stage trail (Arm C):
+#   Stage 1 — at TRAIL_ACTIVATE_R MFE: lock stop to entry + TRAIL_LOCK_R (one-time)
+#   Stage 2 — at TRAIL_STAGE2_R  MFE: start trailing at (trail_max − TRAIL_STAGE2_DIST_R)
+#
+# Standard trail (Arms A/B):
+#   At TRAIL_ACTIVATE_R MFE: trail continuously at (trail_max − TRAIL_LOCK_R),
+#   floor at entry + TRAIL_LOCK_R.  (TRAIL_STAGE2_R = None → stage 2 disabled)
+TRAIL_ARMS: Dict[str, dict] = {
+    "A": {
+        "label":               "Arm A — activate 1.0R, trail 0.5R  (ab8 baseline)",
+        "TRAIL_ACTIVATE_R":    1.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      None,
+        "TRAIL_STAGE2_DIST_R": None,
+    },
+    "B": {
+        "label":               "Arm B — activate 1.5R, trail 0.5R",
+        "TRAIL_ACTIVATE_R":    1.5,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      None,
+        "TRAIL_STAGE2_DIST_R": None,
+    },
+    "C": {
+        "label":               "Arm C — 2-stage: lock +0.5R at 2R, trail 1.0R after 3R",
+        "TRAIL_ACTIVATE_R":    2.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 1.0,
+    },
+}
+_DEFAULT_ARM = "A"   # used when trail_cfg=None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data cache helpers
+# ─────────────────────────────────────────────────────────────────────────────
+_CACHE_PATH = Path("/tmp/backtest_candle_cache.pkl")
+
+def _save_cache(candle_data: dict, meta: dict) -> None:
+    with open(_CACHE_PATH, "wb") as f:
+        pickle.dump({"candle_data": candle_data, "meta": meta}, f)
+    print(f"  💾 Cache saved → {_CACHE_PATH}")
+
+def _load_cache() -> Optional[tuple]:
+    """Returns (candle_data, meta) or None if cache missing / stale."""
+    if not _CACHE_PATH.exists():
+        return None
+    try:
+        with open(_CACHE_PATH, "rb") as f:
+            obj = pickle.load(f)
+        print(f"  ⚡ Cache loaded ← {_CACHE_PATH}  "
+              f"(saved {obj['meta'].get('saved_at', '?')})")
+        return obj["candle_data"], obj["meta"]
+    except Exception as e:
+        print(f"  ⚠ Cache load failed ({e}), re-fetching.")
+        return None
+
 # ── Main backtest ─────────────────────────────────────────────────────────────
-def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, starting_bal: float = STARTING_BAL, notes: str = ""):
+def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
+                 starting_bal: float = STARTING_BAL, notes: str = "",
+                 trail_cfg: Optional[dict] = None,
+                 preloaded_candle_data: Optional[dict] = None):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     # Extend data fetch so open positions can run to natural close after the entry window.
     # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
     RUNOUT_DAYS = 180
     runout_dt  = (end_dt + pd.Timedelta(days=RUNOUT_DAYS)).replace(tzinfo=timezone.utc) if end_dt else None
 
+    _tcfg  = trail_cfg or TRAIL_ARMS[_DEFAULT_ARM]
+    _tlabel = _tcfg.get("label", "")
+
     print(f"\n{'='*65}")
     print(f"OANDA 1H BACKTEST v2 — Real Strategy Code")
     print(f"Start: {start_dt.date()}  |  End: {end_dt.date() if end_dt else 'today'}  |  Capital: ${starting_bal:,.2f}")
+    if _tlabel:
+        print(f"Trail: {_tlabel}")
     print(f"{'='*65}")
 
-    # ── Fetch candle data ─────────────────────────────────────────────
-    print("\nFetching OANDA historical candles...")
-    candle_data = {}
-    # Use date-range fetch when start_dt is more than 200 days ago (beyond count=5000 H1 window)
-    # Always fetch 6 months of daily context before start for pattern/trend detection
-    data_start = (start_dt - pd.Timedelta(days=180)).replace(tzinfo=timezone.utc)
-    data_end   = end_naive   # may be None for live use
-    use_range  = (datetime.now(tz=timezone.utc) - start_dt).days > 200
+    # ── Fetch candle data (or use preloaded) ──────────────────────────
+    if preloaded_candle_data is not None:
+        candle_data = preloaded_candle_data
+        print(f"\n  ⚡ Using preloaded candle data ({len(candle_data)} pairs)")
+    else:
+        print("\nFetching OANDA historical candles...")
+        candle_data = {}
+        # Use date-range fetch when start_dt is more than 200 days ago (beyond count=5000 H1 window)
+        # Always fetch 6 months of daily context before start for pattern/trend detection
+        data_start = (start_dt - pd.Timedelta(days=180)).replace(tzinfo=timezone.utc)
+        data_end   = end_naive   # may be None for live use
+        use_range  = (datetime.now(tz=timezone.utc) - start_dt).days > 200
 
-    for pair in WATCHLIST:
-        if use_range:
-            # Paginated date-range fetch — handles any historical window.
-            # Fetch to runout_dt so we can let positions close naturally after window end.
-            df_1h = _fetch_range(pair, "H1", from_dt=data_start, to_dt=runout_dt)
-            df_4h = _fetch_range(pair, "H4", from_dt=data_start, to_dt=runout_dt)
-            df_d  = _fetch_range(pair, "D",  from_dt=(start_dt - pd.Timedelta(days=730)).replace(tzinfo=timezone.utc), to_dt=runout_dt)
-        else:
-            df_1h = _fetch(pair, "H1", 5000)   # ~208 days of hourly bars
-            df_4h = _fetch(pair, "H4", 1500)   # ~250 days of 4H bars
-            df_d  = _fetch(pair, "D",  500)    # ~500 trading days (~2 years)
-        if df_1h is None or len(df_1h) < 50:
-            print(f"  ✗ {pair}: insufficient data, skipping")
-            continue
-        df_w = _resample_weekly(df_d) if df_d is not None else None
-        candle_data[pair] = {"1h": df_1h, "4h": df_4h, "d": df_d, "w": df_w}
-        time.sleep(0.3)   # OANDA rate limit
-        print(f"  ✓ {pair}: {len(df_1h)} 1H | {len(df_4h) if df_4h is not None else 0} 4H"
-              f" | {len(df_d) if df_d is not None else 0} D"
-              f" | {len(df_w) if df_w is not None else 0} W")
+        for pair in WATCHLIST:
+            if use_range:
+                # Paginated date-range fetch — handles any historical window.
+                # Fetch to runout_dt so we can let positions close naturally after window end.
+                df_1h = _fetch_range(pair, "H1", from_dt=data_start, to_dt=runout_dt)
+                df_4h = _fetch_range(pair, "H4", from_dt=data_start, to_dt=runout_dt)
+                df_d  = _fetch_range(pair, "D",  from_dt=(start_dt - pd.Timedelta(days=730)).replace(tzinfo=timezone.utc), to_dt=runout_dt)
+            else:
+                df_1h = _fetch(pair, "H1", 5000)   # ~208 days of hourly bars
+                df_4h = _fetch(pair, "H4", 1500)   # ~250 days of 4H bars
+                df_d  = _fetch(pair, "D",  500)    # ~500 trading days (~2 years)
+            if df_1h is None or len(df_1h) < 50:
+                print(f"  ✗ {pair}: insufficient data, skipping")
+                continue
+            df_w = _resample_weekly(df_d) if df_d is not None else None
+            candle_data[pair] = {"1h": df_1h, "4h": df_4h, "d": df_d, "w": df_w}
+            time.sleep(0.3)   # OANDA rate limit
+            print(f"  ✓ {pair}: {len(df_1h)} 1H | {len(df_4h) if df_4h is not None else 0} 4H"
+                  f" | {len(df_d) if df_d is not None else 0} D"
+                  f" | {len(df_w) if df_w is not None else 0} W")
 
     if not candle_data:
         print("No data loaded. Exiting.")
@@ -611,45 +684,89 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             low   = float(bar["low"])
             close = float(bar["close"])
 
-            # ── One-way ratchet trailing stop (Option B) ─────────────────────
-            # Replaces hard breakeven lock.
-            # Activates at TRAIL_ACTIVATE_R MFE, then trails TRAIL_DIST_R
-            # behind the running max-favourable price. Never moves backwards.
-            risk_dist      = pos.get("initial_risk") or abs(entry - stop)
-            _trail_act     = _sc.TRAIL_ACTIVATE_R * risk_dist
-            _trail_dist    = _sc.TRAIL_DIST_R     * risk_dist
+            # ── Parameterized trailing stop ───────────────────────────────────
+            # Trail behaviour is controlled by _tcfg (trail arm config dict).
+            #
+            # Two-stage trail (Arm C):
+            #   Stage 1 at TRAIL_ACTIVATE_R: lock stop to entry + TRAIL_LOCK_R once
+            #   Stage 2 at TRAIL_STAGE2_R:   trail continuously at trail_max ± TRAIL_STAGE2_DIST_R
+            #
+            # Standard trail (Arms A/B):
+            #   At TRAIL_ACTIVATE_R: trail at trail_max ± TRAIL_LOCK_R, floor at entry+TRAIL_LOCK_R
+            #   (TRAIL_STAGE2_R is None → stage 2 disabled)
+            risk_dist        = pos.get("initial_risk") or abs(entry - stop)
+            _act_r           = _tcfg.get("TRAIL_ACTIVATE_R", 1.0)
+            _lock_r          = _tcfg.get("TRAIL_LOCK_R",     0.5)
+            _stage2_r        = _tcfg.get("TRAIL_STAGE2_R")        # None → one-stage
+            _stage2_dist_r   = _tcfg.get("TRAIL_STAGE2_DIST_R",  _lock_r)
 
-            if _trail_dist > 0:
-                if direction == "long":
-                    # Update running max-favourable
-                    if high > pos.get("trail_max", entry):
-                        pos["trail_max"] = high
-                    _mfe = pos["trail_max"] - entry
-                    if _mfe >= _trail_act:
-                        _new_stop = pos["trail_max"] - _trail_dist
-                        _new_stop = max(_new_stop, entry + _trail_dist)   # floor at +0.5R
-                        if _new_stop > stop:                               # ratchet only UP
+            _act_dist        = _act_r    * risk_dist
+            _lock_dist       = _lock_r   * risk_dist
+            _stage2_dist     = _stage2_dist_r * risk_dist if _stage2_r else None
+
+            if direction == "long":
+                if high > pos.get("trail_max", entry):
+                    pos["trail_max"] = high
+                _mfe = pos["trail_max"] - entry
+
+                if _mfe >= _act_dist:
+                    if _stage2_r is None:
+                        # Standard trail: trail continuously (Arms A/B)
+                        _new_stop = pos["trail_max"] - _lock_dist
+                        _new_stop = max(_new_stop, entry + _lock_dist)  # floor at +lock_r
+                        if _new_stop > stop:
                             stop = _new_stop
                             pos["stop_loss"] = stop
-                            pos["ratchet_moved"] = True          # flag: stop moved by trail
-                else:  # short
-                    if low < pos.get("trail_max", entry):
-                        pos["trail_max"] = low
-                    _mfe = entry - pos["trail_max"]
-                    if _mfe >= _trail_act:
-                        _new_stop = pos["trail_max"] + _trail_dist
-                        _new_stop = min(_new_stop, entry - _trail_dist)   # ceiling at −0.5R
-                        if _new_stop < stop:                               # ratchet only DOWN
+                            pos["ratchet_moved"] = True
+                    else:
+                        # Two-stage trail (Arm C)
+                        # Stage 1: lock stop once at entry + TRAIL_LOCK_R
+                        if not pos.get("trail_locked"):
+                            _lock_stop = entry + _lock_dist
+                            if _lock_stop > stop:
+                                stop = _lock_stop
+                                pos["stop_loss"] = stop
+                                pos["ratchet_moved"] = True
+                            pos["trail_locked"] = True
+                        # Stage 2: trail from trail_max − TRAIL_STAGE2_DIST_R
+                        if _mfe >= _stage2_r * risk_dist:
+                            _new_stop = pos["trail_max"] - _stage2_dist
+                            _new_stop = max(_new_stop, stop)  # never go backward
+                            if _new_stop > stop:
+                                stop = _new_stop
+                                pos["stop_loss"] = stop
+                                pos["ratchet_moved"] = True
+
+            else:  # short
+                if low < pos.get("trail_max", entry):
+                    pos["trail_max"] = low
+                _mfe = entry - pos["trail_max"]
+
+                if _mfe >= _act_dist:
+                    if _stage2_r is None:
+                        # Standard trail: trail continuously (Arms A/B)
+                        _new_stop = pos["trail_max"] + _lock_dist
+                        _new_stop = min(_new_stop, entry - _lock_dist)  # ceiling at −lock_r
+                        if _new_stop < stop:
                             stop = _new_stop
                             pos["stop_loss"] = stop
-                            pos["ratchet_moved"] = True          # flag: stop moved by trail
-            else:
-                # Fallback: hard BE at 1:1 (TRAIL_DIST_R = 0 disables trail)
-                if not pos.get("be_moved"):
-                    if direction == "long"  and high  >= entry + risk_dist:
-                        stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
-                    if direction == "short" and low   <= entry - risk_dist:
-                        stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
+                            pos["ratchet_moved"] = True
+                    else:
+                        # Two-stage trail (Arm C)
+                        if not pos.get("trail_locked"):
+                            _lock_stop = entry - _lock_dist
+                            if _lock_stop < stop:
+                                stop = _lock_stop
+                                pos["stop_loss"] = stop
+                                pos["ratchet_moved"] = True
+                            pos["trail_locked"] = True
+                        if _mfe >= _stage2_r * risk_dist:
+                            _new_stop = pos["trail_max"] + _stage2_dist
+                            _new_stop = min(_new_stop, stop)  # never go backward
+                            if _new_stop < stop:
+                                stop = _new_stop
+                                pos["stop_loss"] = stop
+                                pos["ratchet_moved"] = True
 
             # ── Target-price exit (Alex's manual close) ───────────────────────
             # Alex closes when price reaches his "next 4H structure low/high"
@@ -1026,6 +1143,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "notes":        decision.reason[:80],
                 "be_moved":     False,
                 "trail_max":    decision.entry_price,   # running max-favourable price for ratchet
+                "trail_locked": False,                  # True after stage-1 lock fires (Arm C)
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
                 "target_price": _target,
                 "target_type":  decision.exec_target_type,
@@ -1380,7 +1498,9 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     # Only fires when running the Jul 15 – Oct 31 2024 window so we
     # always get an up-to-date Alex vs bot scorecard.
     _is_alex_window = (
-        str(args.start)[:7] == "2024-07" and str(args.end)[:7] == "2024-10"
+        start_dt.strftime("%Y-%m")[:7] == "2024-07"
+        and end_dt is not None
+        and end_dt.strftime("%Y-%m")[:7] == "2024-10"
     )
     if _is_alex_window:
         try:
@@ -1390,7 +1510,30 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         except Exception as _me:
             print(f"  [miss analyzer error: {_me}]")
 
-    return trades, balance, gap_log
+    # ── Return result dict (used by multi-arm comparison) ─────────────
+    _wins   = [t for t in trades if t["r"] >  0.10]
+    _losses = [t for t in trades if t["r"] < -0.10]
+    _ec     = Counter(t["reason"] for t in trades)
+    _rrs    = sorted([t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0])
+
+    return {
+        "trades":        trades,
+        "balance":       balance,
+        "gap_log":       gap_log,
+        "candle_data":   candle_data,
+        "n_trades":      len(trades),
+        "win_rate":      len(_wins) / len(trades) if trades else 0,
+        "avg_r":         sum(t["r"] for t in trades) / len(trades) if trades else 0,
+        "best_r":        max((t["r"] for t in trades), default=0),
+        "avg_r_win":     sum(t["r"] for t in _wins)   / len(_wins)   if _wins   else 0,
+        "avg_r_loss":    sum(t["r"] for t in _losses) / len(_losses) if _losses else 0,
+        "n_target":      _ec.get("target_reached", 0) + _ec.get("weekend_proximity", 0),
+        "n_ratchet":     _ec.get("ratchet_stop_hit", 0),
+        "n_sl":          _ec.get("stop_hit", 0),
+        "exec_rr_p50":   _rrs[len(_rrs) // 2] if _rrs else 0,
+        "max_dd":        _max_dd_pct,
+        "ret_pct":       (balance - starting_bal) / starting_bal * 100,
+    }
 
 
 if __name__ == "__main__":
@@ -1424,6 +1567,12 @@ Examples:
                         help="Override a strategy_config lever (e.g. --lever MIN_CONFIDENCE=0.70)")
     parser.add_argument("--news-filter", action="store_true", default=False,
                         help="Enable historical news filter (CSV from data/news/). Alex never used this.")
+    parser.add_argument("--arm",   default="A",
+                        help="Trail arm: A | B | C | all  (default: A). "
+                             "A=activate1R trail0.5R  B=activate1.5R  C=2-stage 2R+3R")
+    parser.add_argument("--cache", action="store_true", default=False,
+                        help="Save candle data after first fetch; reuse on subsequent runs. "
+                             "Eliminates 12-13 min OANDA fetch. Cache: /tmp/backtest_candle_cache.pkl")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -1478,4 +1627,79 @@ Examples:
     if extra:
         notes = (notes + " [levers: " + ", ".join(extra) + "]").strip()
 
-    run_backtest(start_dt=start, end_dt=end, starting_bal=args.balance, notes=notes)
+    # ── Validate --arm ────────────────────────────────────────────────────────
+    _arm_arg = args.arm.upper()
+    if _arm_arg not in ("A", "B", "C", "ALL"):
+        parser.error(f"--arm must be A | B | C | all, got '{args.arm}'")
+    _arms_to_run = list(TRAIL_ARMS.keys()) if _arm_arg == "ALL" else [_arm_arg]
+
+    # ── Handle data cache ─────────────────────────────────────────────────────
+    _preloaded = None
+    if args.cache:
+        cached = _load_cache()
+        if cached:
+            _preloaded, _cmeta = cached
+            # Invalidate if window changed
+            if (_cmeta.get("start") != args.start or
+                    _cmeta.get("end") != args.end):
+                print(f"  ⚠ Cache window mismatch "
+                      f"(cached {_cmeta.get('start')}–{_cmeta.get('end')}, "
+                      f"requested {args.start}–{args.end}). Re-fetching.")
+                _preloaded = None
+        if _preloaded is None:
+            # Fetch once, then save for subsequent arm runs
+            print("\n  First run — fetching data and saving to cache...")
+
+    # ── Run arms ──────────────────────────────────────────────────────────────
+    _arm_results = {}
+    for _arm_key in _arms_to_run:
+        _tcfg = TRAIL_ARMS[_arm_key]
+        _arm_notes = f"{notes} [arm={_arm_key}]".strip()
+
+        result = run_backtest(
+            start_dt=start, end_dt=end, starting_bal=args.balance,
+            notes=_arm_notes, trail_cfg=_tcfg,
+            preloaded_candle_data=_preloaded,
+        )
+
+        # After first arm: save cache if requested
+        if args.cache and _preloaded is None and result is not None:
+            _preloaded = result.get("candle_data")
+            if _preloaded:
+                _save_cache(_preloaded, {
+                    "start": args.start, "end": args.end,
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                })
+
+        if result:
+            _arm_results[_arm_key] = result
+
+    # ── Multi-arm comparison table ────────────────────────────────────────────
+    if len(_arm_results) > 1:
+        print(f"\n{'='*75}")
+        print("MULTI-ARM COMPARISON SUMMARY")
+        print(f"{'='*75}")
+        hdr = f"{'Metric':<28}" + "".join(f"{'Arm '+k:>14}" for k in _arm_results)
+        print(hdr)
+        print("-" * len(hdr))
+
+        def _row(label, key, fmt=lambda x: str(x)):
+            vals = [_arm_results[k].get(key) for k in _arm_results]
+            row = f"  {label:<26}" + "".join(
+                f"{fmt(v) if v is not None else 'n/a':>14}" for v in vals
+            )
+            print(row)
+
+        _row("Trades",        "n_trades",      lambda x: str(x))
+        _row("Win rate",      "win_rate",       lambda x: f"{x:.0%}")
+        _row("Avg R",         "avg_r",          lambda x: f"{x:+.2f}R")
+        _row("Best R",        "best_r",         lambda x: f"{x:+.1f}R")
+        _row("Avg win R",     "avg_r_win",      lambda x: f"{x:+.2f}R")
+        _row("Avg loss R",    "avg_r_loss",     lambda x: f"{x:+.2f}R")
+        _row("Target reached","n_target",       lambda x: str(x))
+        _row("Ratchet stops", "n_ratchet",      lambda x: str(x))
+        _row("Stop hits",     "n_sl",           lambda x: str(x))
+        _row("Exec RR p50",   "exec_rr_p50",    lambda x: f"{x:.1f}R")
+        _row("Max DD",        "max_dd",         lambda x: f"{x:.1f}%")
+        _row("Return",        "ret_pct",        lambda x: f"{x:+.1f}%")
+        print(f"{'='*75}")
