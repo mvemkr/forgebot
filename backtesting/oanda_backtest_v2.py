@@ -631,6 +631,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                         if _new_stop > stop:                               # ratchet only UP
                             stop = _new_stop
                             pos["stop_loss"] = stop
+                            pos["ratchet_moved"] = True          # flag: stop moved by trail
                 else:  # short
                     if low < pos.get("trail_max", entry):
                         pos["trail_max"] = low
@@ -641,6 +642,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                         if _new_stop < stop:                               # ratchet only DOWN
                             stop = _new_stop
                             pos["stop_loss"] = stop
+                            pos["ratchet_moved"] = True          # flag: stop moved by trail
             else:
                 # Fallback: hard BE at 1:1 (TRAIL_DIST_R = 0 disables trail)
                 if not pos.get("be_moved"):
@@ -734,7 +736,12 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 pnl      = delta * units
                 balance += pnl
                 peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
-                reason   = "stop_hit" if stopped else "max_hold"
+                if stopped and pos.get("ratchet_moved"):
+                    reason = "ratchet_stop_hit"
+                elif stopped:
+                    reason = "stop_hit"
+                else:
+                    reason = "max_hold"
                 risk_r   = delta / risk_dist if risk_dist else 0
 
                 trades.append({
@@ -1171,8 +1178,17 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     print(f"    Avg MFE:              {_avg_mfe:+.2f}R")
     print(f"    Avg MAE:              {_avg_mae:+.2f}R")
     print(f"\n  ── Exit reason counts ────────────────────────────────────")
-    for reason, cnt in sorted(_exit_counts.items(), key=lambda x: -x[1]):
-        print(f"    {reason:<30} {cnt:>3}  ({cnt/len(trades)*100:.0f}%)")
+    _reason_order = ["target_reached", "weekend_proximity",
+                     "ratchet_stop_hit", "stop_hit", "max_hold", "runout_expired"]
+    _all_reasons  = set(_exit_counts.keys())
+    _sorted_reasons = ([r for r in _reason_order if r in _all_reasons] +
+                       sorted(_all_reasons - set(_reason_order)))
+    for reason in _sorted_reasons:
+        cnt = _exit_counts[reason]
+        avg_r = (sum(t["r"] for t in trades if t["reason"] == reason) / cnt
+                 if cnt else 0.0)
+        print(f"    {reason:<30} {cnt:>3}  ({cnt/len(trades)*100:.0f}%)  "
+              f"avg {avg_r:+.2f}R")
 
     if _trigger_counts:
         print(f"\n  ── Trigger types ──────────────────────────────────────")

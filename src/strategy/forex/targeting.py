@@ -8,23 +8,33 @@ Functions:
   get_structure_stop()    — Compute a tight structure-based stop from pattern.stop_anchor.
   find_next_structure_level() — Nearest prior 4H swing level (Alex's TP method).
 
-Stop selection order (tightest valid first):
-  H&S / IH&S        1. right shoulder extreme + buffer
-                    2. ATR fallback (3× 1H ATR)
-  Double top/bottom 1. second peak/trough extreme + buffer
+Stop selection order (PRIORITY-first, not tightest-first):
+  H&S / IH&S        1. H1 retest rejection extreme near neckline  (6-bar window; 30-bar fallback)
+                    2. Right shoulder anchor + buffer
+                    3. ATR fallback (3× 1H ATR) — only if structural candidates fail bounds
+  Double top/bottom 1. Second peak/trough extreme + buffer
                     2. ATR fallback
-  Break/retest      1. retest rejection swing extreme + buffer
-                    2. broken level + buffer
+  Break/retest      1. H1 retest rejection extreme near broken level  (same)
+                    2. Broken level + buffer
                     3. ATR fallback
-  Consol breakout   1. range boundary + buffer
+  Consol breakout   1. Range boundary + buffer
                     2. ATR fallback
-  Liquidity sweep   1. sweep wick extreme + buffer
+  Liquidity sweep   1. Sweep wick extreme + buffer
                     2. ATR fallback
   Any               Legacy pattern.stop_loss as absolute last resort
 
+Key insight (ab7 → ab8): candidates used to be sorted tightest-first, so 3×1H ATR
+(~48p on GBP/JPY) almost always beat structural candidates that were further away.
+Fix: evaluate candidates IN PRIORITY ORDER; use the first one that passes bounds check.
+ATR fallback is the safety net, not the default.
+
+Bounds check (applied to every candidate):
+  Too tight: dist_pips < max(8p, MIN_FRAC_ATR × 1H ATR)  → noise will hit it; skip
+  Too wide:  dist_pips > MAX_FRAC_ATR × 1H ATR            → oversized; continue to next
+
 Buffer spec (per Alex's tight invalidation style):
-  Majors: 3 pips   (pip_size=0.0001 → buffer=0.0003)
-  JPY / crosses: 5 pips
+  Majors: max(2×spread, 3 pips)    (pip_size=0.0001 → min buffer=0.0003)
+  JPY / crosses: max(2×spread, 5 pips)
 """
 
 from typing import Optional, List, Tuple, TYPE_CHECKING
@@ -33,6 +43,15 @@ import numpy as np
 
 if TYPE_CHECKING:
     from .pattern_detector import PatternResult
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stop bounds constants
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimum stop as fraction of 1H ATR (below this = micro-stop, noise will hit it)
+_MIN_FRAC_ATR: float = 0.15   # 0.15 × ATR(1H, 14)
+_MIN_ABS_PIPS: float = 8.0    # hard floor regardless of ATR (avoids zero-ATR edge cases)
+# Maximum stop as fraction of 1H ATR (above this = oversized; try next candidate)
+_MAX_FRAC_ATR: float = 10.0   # generous cap — only blocks truly degenerate stops
 
 
 def select_target(
@@ -146,10 +165,21 @@ def find_next_structure_level(
 # Structure Stop Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _stop_buffer(pip_size: float, is_jpy_or_cross: bool) -> float:
-    """Tight structure buffer: 3 pips for majors, 5 pips for JPY/crosses."""
+def _stop_buffer(pip_size: float, is_jpy_or_cross: bool,
+                 spread: Optional[float] = None) -> float:
+    """
+    Tight structure buffer: max(2×spread, n_pips) for correct invalidation padding.
+
+    Majors:       max(2×spread, 3 pips)
+    JPY/crosses:  max(2×spread, 5 pips)
+
+    If spread is None (live feed unavailable), uses flat pip buffer only.
+    """
     n_pips = 5 if is_jpy_or_cross else 3
-    return n_pips * pip_size
+    flat_buf = n_pips * pip_size
+    if spread is not None and spread > 0:
+        return max(flat_buf, 2.0 * spread)
+    return flat_buf
 
 
 def _compute_atr_1h(df: pd.DataFrame, n: int = 14) -> float:
@@ -166,25 +196,33 @@ def _compute_atr_1h(df: pd.DataFrame, n: int = 14) -> float:
     return float(np.mean(tr[-n:]))
 
 
-def _find_retest_rejection_extreme(
+def _find_h1_retest_rejection_extreme(
     df_1h: pd.DataFrame,
     direction: str,
-    anchor: float,
-    n_bars: int = 25,
-    tol: float = 0.003,
+    level: float,
+    n_bars_primary: int = 6,
+    n_bars_fallback: int = 30,
+    tol: float = 0.005,
 ) -> Optional[float]:
     """
-    For break/retest patterns: find the retest rejection swing extreme.
+    Find the H1 retest rejection extreme near a key level (neckline, broken level).
 
-    SHORT break/retest:
-      Price broke DOWN through anchor, then RETESTED from below.
-      Find the highest bar HIGH in the retest zone (within tol of anchor, last n_bars).
-      Stop goes above that high + buffer.
+    For SHORT entry (H&S break / bearish break-retest):
+      Price broke DOWN through level, retested from BELOW.
+      Find H1 candle(s) touching the level zone in the last n_bars.
+      Anchor = max(high of touching candles)  ← stop goes just above this
 
-    LONG break/retest:
-      Price broke UP through anchor, then RETESTED from above.
-      Find the lowest bar LOW in the retest zone.
-      Stop goes below that low + buffer.
+    For LONG entry (IH&S break / bullish break-retest):
+      Price broke UP through level, retested from ABOVE.
+      Find H1 candle(s) touching the level zone in the last n_bars.
+      Anchor = min(low of touching candles)  ← stop goes just below this
+
+    Two-pass search:
+      Pass 1: last n_bars_primary (6) bars — most recent retest
+      Pass 2: last n_bars_fallback (30) bars — wider search if retest older
+
+    Zone definition: level ± tol×level (default ±0.5%)
+    Returns: raw rejection extreme (no buffer applied here — caller adds buffer)
     """
     if df_1h is None or len(df_1h) < 3:
         return None
@@ -192,19 +230,47 @@ def _find_retest_rejection_extreme(
     highs = df_1h["high"].values  if "high"  in df_1h.columns else df_1h["High"].values
     lows  = df_1h["low"].values   if "low"   in df_1h.columns else df_1h["Low"].values
     n     = len(highs)
-    start = max(0, n - n_bars)
 
-    if direction == "short":
-        # Zone: slightly above / below the broken level (retest comes from below)
-        zone_hi = anchor * (1 + tol * 3)
-        zone_lo = anchor * (1 - tol)
-        retest_highs = [h for h in highs[start:] if zone_lo <= h <= zone_hi * 1.01]
-        return max(retest_highs) if retest_highs else None
-    else:
-        zone_lo = anchor * (1 - tol * 3)
-        zone_hi = anchor * (1 + tol)
-        retest_lows = [lo for lo in lows[start:] if zone_lo * 0.99 <= lo <= zone_hi]
-        return min(retest_lows) if retest_lows else None
+    zone_lo = level * (1.0 - tol)
+    zone_hi = level * (1.0 + tol)
+
+    def _search(n_bars: int) -> Optional[float]:
+        start = max(0, n - n_bars)
+        if direction == "short":
+            # Retest from below: HIGH of bar touches the level zone
+            touching = [highs[i] for i in range(start, n)
+                        if zone_lo <= highs[i] <= zone_hi * 1.005]
+            return max(touching) if touching else None
+        else:
+            # Retest from above: LOW of bar touches the level zone
+            touching = [lows[i] for i in range(start, n)
+                        if zone_lo * 0.995 <= lows[i] <= zone_hi]
+            return min(touching) if touching else None
+
+    # Pass 1: tight recent window
+    result = _search(n_bars_primary)
+    if result is not None:
+        return result
+
+    # Pass 2: wider fallback (retest may be older)
+    return _search(n_bars_fallback)
+
+
+def _find_retest_rejection_extreme(
+    df_1h: pd.DataFrame,
+    direction: str,
+    anchor: float,
+    n_bars: int = 30,
+    tol: float = 0.005,
+) -> Optional[float]:
+    """
+    Alias: same logic as _find_h1_retest_rejection_extreme with single window.
+    Kept for backward-compat with break/retest patterns that call this directly.
+    """
+    return _find_h1_retest_rejection_extreme(
+        df_1h, direction, anchor,
+        n_bars_primary=6, n_bars_fallback=n_bars, tol=tol,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,12 +287,20 @@ def get_structure_stop(
     is_jpy_or_cross: bool = False,
     atr_fallback_mult: float = 3.0,
     stop_log: Optional[list] = None,
+    spread: Optional[float] = None,
 ) -> Tuple[float, str, float]:
     """
-    Compute the tightest valid structure-based stop for a trade.
+    Compute the best structure-based stop for a trade using PRIORITY-FIRST selection.
 
-    Uses pattern.stop_anchor (the raw structural extreme) + a tight pip buffer.
-    Falls back to ATR-based stop, then to pattern.stop_loss (legacy) as last resort.
+    Candidates are evaluated in semantic priority order (most preferred first).
+    The first candidate that passes bounds check is used — ATR is NOT preferred
+    just because it happens to be numerically tighter.
+
+    Bounds check per candidate:
+      Too tight: dist_pips < max(_MIN_ABS_PIPS, _MIN_FRAC_ATR × 1H ATR) → skip
+      Too wide:  dist_pips > _MAX_FRAC_ATR × 1H ATR                     → skip (continue)
+    If all structural candidates fail bounds, ATR fallback is used.
+    Legacy pattern.stop_loss is absolute last resort.
 
     Parameters:
         pattern_type        — e.g. "head_and_shoulders", "double_top"
@@ -236,119 +310,120 @@ def get_structure_stop(
         pattern             — PatternResult with stop_anchor set
         pip_size            — 0.01 for JPY pairs, 0.0001 for others
         is_jpy_or_cross     — True for JPY pairs or currency crosses
-        atr_fallback_mult   — ATR multiplier for fallback (default 3.0; Alex uses ~1.5–2.0)
-        stop_log            — optional list; gets appended with STOP_CANDIDATE_REJECTED
-                              and STOP_SELECTED entries for diagnostics
+        atr_fallback_mult   — ATR multiplier for fallback stop (default 3.0)
+        stop_log            — optional list for STOP_CANDIDATE_REJECTED / STOP_SELECTED entries
+        spread              — current bid/ask spread (used for max(2×spread, n_pips) buffer)
 
     Returns:
         (stop_price, stop_type, stop_pips)
     """
-    buf = _stop_buffer(pip_size, is_jpy_or_cross)
-    candidates: List[Tuple[float, str]] = []
+    buf = _stop_buffer(pip_size, is_jpy_or_cross, spread)
+    atr = _compute_atr_1h(df_1h)
+
+    # Compute bounds in price terms for fast comparison
+    min_dist = max(_MIN_ABS_PIPS * pip_size,
+                   _MIN_FRAC_ATR * atr if atr > 0 else _MIN_ABS_PIPS * pip_size)
+    max_dist = _MAX_FRAC_ATR * atr if atr > 0 else 1e9
 
     def _log(label: str, price: float, reason: str) -> None:
         if stop_log is not None:
             pips = abs(price - entry) / pip_size if pip_size > 0 else 0
             stop_log.append({
-                "action": reason,   # "STOP_SELECTED" or "STOP_CANDIDATE_REJECTED:<why>"
+                "action": reason,
                 "type":   label,
                 "price":  round(price, 6),
                 "pips":   round(pips, 1),
             })
 
-    # ── Build candidate list ──────────────────────────────────────────────────
+    def _stop_side(price: float, label: str) -> Optional[Tuple[float, str, float]]:
+        """
+        Validate a candidate stop price:
+          1. Must be on the correct side of entry (wrong-side guard)
+          2. Must pass bounds check (not too tight, not too wide)
+        Returns (price, label, dist_pips) if valid, None if rejected.
+        """
+        if direction == "short" and price <= entry:
+            _log(label, price, "STOP_CANDIDATE_REJECTED:wrong_side")
+            return None
+        if direction == "long" and price >= entry:
+            _log(label, price, "STOP_CANDIDATE_REJECTED:wrong_side")
+            return None
+
+        dist = abs(price - entry)
+        if dist < min_dist:
+            _log(label, price, f"STOP_CANDIDATE_REJECTED:too_tight({dist/pip_size:.1f}p)")
+            return None
+        if dist > max_dist:
+            _log(label, price, f"STOP_CANDIDATE_REJECTED:too_wide({dist/pip_size:.1f}p)")
+            return None
+
+        dist_pips = dist / pip_size
+        _log(label, price, f"STOP_SELECTED:{label}")
+        return (price, label, dist_pips)
+
+    # ── Build candidate list IN PRIORITY ORDER ───────────────────────────────
     anchor   = pattern.stop_anchor
     neckline = pattern.neckline
+    ordered_candidates: List[Tuple[float, str]] = []
 
     if anchor is not None:
-        if "break_retest" in pattern_type:
-            # Break/retest: entry is at neckline retest.
-            # Stop = retest rejection bar high/low near the neckline + buffer.
-            retest_ext = _find_retest_rejection_extreme(df_1h, direction, anchor)
+        if "head_and_shoulders" in pattern_type:
+            # Priority order for H&S / IH&S entries (entering at neckline retest):
+            #   1. H1 retest rejection extreme near neckline  ← Alex's invalidation
+            #   2. Right shoulder anchor + buffer             ← structural fallback
+            retest_ext = _find_h1_retest_rejection_extreme(df_1h, direction, neckline)
             if retest_ext is not None:
-                candidates.append((
-                    retest_ext + buf if direction == "short" else retest_ext - buf,
-                    "retest_swing",
-                ))
-            # Fallback: broken level + buffer
-            candidates.append((
-                anchor + buf if direction == "short" else anchor - buf,
-                "broken_level",
-            ))
-
-        elif "head_and_shoulders" in pattern_type:
-            # H&S / IH&S: entry is at the NECKLINE RETEST (not at the shoulder).
-            # Alex's stop goes just above/below the retest rejection bar near
-            # the neckline — NOT at the right shoulder which can be 100-200p away.
-            # Two candidates (tightest wins):
-            #   1. Retest rejection bar extreme near neckline (preferred — Alex's method)
-            #   2. Right shoulder anchor + buf (structural fallback if no retest bar found)
-            retest_ext = _find_retest_rejection_extreme(df_1h, direction, neckline)
-            if retest_ext is not None:
-                candidates.append((
+                ordered_candidates.append((
                     retest_ext + buf if direction == "short" else retest_ext - buf,
                     "neckline_retest_swing",
                 ))
-            # Right shoulder as secondary (often farther, but correctly structural)
-            candidates.append((
+            ordered_candidates.append((
                 anchor + buf if direction == "short" else anchor - buf,
                 "shoulder_anchor",
             ))
 
+        elif "break_retest" in pattern_type:
+            # Priority order for break/retest entries:
+            #   1. H1 retest rejection extreme near the broken level
+            #   2. Broken level itself + buffer
+            retest_ext = _find_h1_retest_rejection_extreme(df_1h, direction, anchor)
+            if retest_ext is not None:
+                ordered_candidates.append((
+                    retest_ext + buf if direction == "short" else retest_ext - buf,
+                    "neckline_retest_swing",
+                ))
+            ordered_candidates.append((
+                anchor + buf if direction == "short" else anchor - buf,
+                "broken_level",
+            ))
+
         else:
-            # DT: second peak high + buf  → stop above the actual peak
-            # DB: second trough low + buf → stop below the actual trough
-            # CB: range boundary + buf
-            # Sweep: wick extreme + buf
-            candidates.append((
+            # DT / DB / CB / Sweep: structural anchor is the natural stop
+            #   1. Peak/trough/range boundary + buffer
+            ordered_candidates.append((
                 anchor + buf if direction == "short" else anchor - buf,
                 "structural_anchor",
             ))
 
-    # ATR fallback (3× tighter than the old 8× used in pattern_detector)
-    atr = _compute_atr_1h(df_1h)
+    # ATR fallback — only reaches here if all structural candidates fail bounds
     if atr > 0:
-        candidates.append((
+        ordered_candidates.append((
             entry + atr * atr_fallback_mult if direction == "short"
             else entry - atr * atr_fallback_mult,
             "atr_fallback",
         ))
 
     # Absolute last resort: legacy pattern.stop_loss
-    candidates.append((pattern.stop_loss, "legacy_pattern_stop"))
+    ordered_candidates.append((pattern.stop_loss, "legacy_pattern_stop"))
 
-    # ── Choose tightest valid stop ─────────────────────────────────────────────
-    # Valid = on the correct side of entry.
-    # Tightest = smallest distance from entry (closest invalidation level).
-    valid: List[Tuple[float, str, float]] = []
-    for price, label in candidates:
-        if direction == "short" and price <= entry:
-            _log(label, price, "STOP_CANDIDATE_REJECTED:wrong_side")
-            continue
-        if direction == "long" and price >= entry:
-            _log(label, price, "STOP_CANDIDATE_REJECTED:wrong_side")
-            continue
-        dist_pips = abs(price - entry) / pip_size
-        valid.append((price, label, dist_pips))
+    # ── Select first candidate that passes bounds check ───────────────────────
+    # Priority-first: structural anchors preferred over ATR, ATR over legacy.
+    for price, label in ordered_candidates:
+        result = _stop_side(price, label)
+        if result is not None:
+            return result
 
-    if not valid:
-        # Shouldn't happen — legacy_pattern_stop always in candidates
-        _log("no_valid_fallback", pattern.stop_loss, "STOP_CANDIDATE_REJECTED:none_valid")
-        dist_pips = abs(entry - pattern.stop_loss) / pip_size
-        return pattern.stop_loss, "no_valid_fallback", dist_pips
-
-    # Sort ascending by distance → tightest first
-    valid.sort(key=lambda x: x[2])
-
-    # Reject any with identical or near-zero distance (degenerate)
-    for price, label, dist_pips in valid:
-        if dist_pips < 1.0:
-            _log(label, price, "STOP_CANDIDATE_REJECTED:too_tight(<1pip)")
-            continue
-        _log(label, price, f"STOP_SELECTED:{label}")
-        return price, label, dist_pips
-
-    # All candidates degenerate — use the widest valid one
-    price, label, dist_pips = valid[-1]
-    _log(label, price, f"STOP_SELECTED:{label}_fallback")
-    return price, label, dist_pips
+    # All candidates rejected — emergency fallback: use legacy stop regardless of bounds
+    _log("emergency_fallback", pattern.stop_loss, "STOP_SELECTED:emergency_fallback")
+    dist_pips = abs(pattern.stop_loss - entry) / pip_size
+    return pattern.stop_loss, "emergency_fallback", dist_pips
