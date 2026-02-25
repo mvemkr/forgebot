@@ -656,7 +656,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             close = float(bar["close"])
 
             # Breakeven at 1:1
-            risk_dist = abs(entry - stop)
+            risk_dist = pos.get("initial_risk") or abs(entry - stop)  # always use entry-time stop for R
             if not pos.get("be_moved"):
                 if direction == "long"  and high  >= entry + risk_dist:
                     stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
@@ -711,8 +711,12 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                         "pattern":     pos.get("pattern", "?"),
                         "notes":       pos.get("notes", ""),
                         "macro_theme": pos.get("macro_theme"),
-                        "signal_type": pos.get("signal_type", "unknown"),
-                        "target_1":    target,
+                        "signal_type":  pos.get("signal_type", "unknown"),
+                        "planned_rr":   pos.get("planned_rr", 0.0),
+                        "mfe_r":        pos.get("mfe_r", 0.0),
+                        "mae_r":        pos.get("mae_r", 0.0),
+                        "dd_flag":      pos.get("dd_flag", ""),
+                        "target_1":     target,
                     })
                     r_sign   = "+" if risk_r >= 0 else ""
                     pnl_sign = "+" if pnl >= 0 else ""
@@ -723,6 +727,13 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     strategies[pair].close_position(pair, close_price)
                     del open_pos[pair]
                     continue
+
+            # Track MFE / MAE every bar (in R units)
+            _init_r = pos.get("initial_risk") or 1e-9
+            _fav  = ((high - entry) if direction == "long" else (entry - low))  / _init_r
+            _adv  = ((entry - low)  if direction == "long" else (high - entry)) / _init_r
+            pos["mfe_r"] = max(pos.get("mfe_r", 0.0), _fav)
+            pos["mae_r"] = min(pos.get("mae_r", 0.0), -abs(_adv))
 
             # Stop hit?
             stopped = (direction == "long"  and low  <= stop) or \
@@ -748,7 +759,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     "pattern": pos.get("pattern", "?"),
                     "notes": pos.get("notes", ""),
                     "macro_theme": pos.get("macro_theme"),
-                    "signal_type": pos.get("signal_type", "unknown"),
+                    "signal_type":  pos.get("signal_type", "unknown"),
+                    "planned_rr":   pos.get("planned_rr", 0.0),
+                    "mfe_r":        pos.get("mfe_r", 0.0),
+                    "mae_r":        pos.get("mae_r", 0.0),
+                    "dd_flag":      pos.get("dd_flag", ""),
                 })
 
                 r_sign = "+" if risk_r >= 0 else ""
@@ -864,7 +879,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "direction":     decision.direction,
                 "entry_price":   decision.entry_price,
                 "stop_loss":     decision.stop_loss,
-                "filters_failed": decision.failed_filters,
+                "failed_filters": decision.failed_filters,
                 "balance":       balance,
             })
 
@@ -1022,6 +1037,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "dd_flag":       _dd_flag,   # "" | "DD_CAP_10" | "DD_CAP_6"
                 "signal_type":   (decision.entry_signal.signal_type
                                   if decision.entry_signal else "unknown"),
+                "planned_rr":    (abs((_target - decision.entry_price) / (decision.entry_price - decision.stop_loss))
+                                  if _target and decision.stop_loss and abs(decision.entry_price - decision.stop_loss) > 1e-8
+                                  else 0.0),
+                "mfe_r":  0.0,
+                "mae_r":  0.0,
             }
             strat.register_open_position(
                 pair=pair,
@@ -1069,7 +1089,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             "pair": pair, "direction": direction,
             "entry": entry, "exit": close_p,
             "pnl": pnl, "r": r, "reason": "runout_expired",
-            "signal_type": pos.get("signal_type", "unknown"),
+            "signal_type":  pos.get("signal_type", "unknown"),
+            "planned_rr":   pos.get("planned_rr", 0.0),
+            "mfe_r":        pos.get("mfe_r", 0.0),
+            "mae_r":        pos.get("mae_r", 0.0),
+            "dd_flag":      pos.get("dd_flag", ""),
             "entry_ts": pos["entry_ts"].isoformat(),
             "exit_ts":  last_ts.isoformat() if last_ts else "",
             "bars_held": len(all_1h) - pos["bar_idx"],
@@ -1117,6 +1141,26 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     print(f"  Final:        ${balance:>10,.2f}")
     print(f"  Return:       {ret_pct:>+.1f}%")
 
+    # ── Per-trade postmortem ──────────────────────────────────────────
+    _low_rr    = [t for t in trades if t.get("planned_rr", 0) < 2.8 and t.get("planned_rr", 0) > 0]
+    _zero_rr   = [t for t in trades if t.get("planned_rr", 0) == 0]
+    _exit_counts = Counter(t["reason"] for t in trades)
+    _avg_mfe   = sum(t.get("mfe_r", 0) for t in trades) / len(trades) if trades else 0
+    _avg_mae   = sum(t.get("mae_r", 0) for t in trades) / len(trades) if trades else 0
+    _avg_plan_rr = sum(t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0)
+    _plan_rr_n   = sum(1 for t in trades if t.get("planned_rr", 0) > 0)
+    _avg_plan_rr = _avg_plan_rr / _plan_rr_n if _plan_rr_n else 0
+
+    print(f"\n  ── Per-trade postmortem ───────────────────────────────────")
+    print(f"    Planned RR avg:       {_avg_plan_rr:.2f}R  (n={_plan_rr_n})")
+    print(f"    Planned RR < 2.8:     {len(_low_rr)} trades ({len(_low_rr)/len(trades)*100:.0f}%)  ← should be ~0")
+    print(f"    Planned RR = 0 (N/A): {len(_zero_rr)} trades  ← no target found at entry")
+    print(f"    Avg MFE:              {_avg_mfe:+.2f}R")
+    print(f"    Avg MAE:              {_avg_mae:+.2f}R")
+    print(f"\n  ── Exit reason counts ────────────────────────────────────")
+    for reason, cnt in sorted(_exit_counts.items(), key=lambda x: -x[1]):
+        print(f"    {reason:<30} {cnt:>3}  ({cnt/len(trades)*100:.0f}%)")
+
     if _trigger_counts:
         print(f"\n  ── Trigger types ──────────────────────────────────────")
         for sig_type, count in sorted(_trigger_counts.items(), key=lambda x: -x[1]):
@@ -1129,19 +1173,21 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         for flag, cnt in _cap_counts.items():
             print(f"    {flag}: {cnt} trade(s) affected")
 
-    # Rejection reason summary (top 10 from all_decisions WAIT decisions)
-    _wait_reasons = [
-        f
-        for d in all_decisions
-        if d.get("decision") == "WAIT"
+    # ── Funnel: rejection reasons from WAIT decisions ─────────────────
+    _wait_decisions = [d for d in all_decisions if d.get("decision") == "WAIT"]
+    _wait_reasons   = [
+        f for d in _wait_decisions
         for f in d.get("failed_filters", [])
         if f
     ]
+    _n_wait = len(set((d["ts"], d["pair"]) for d in _wait_decisions))
+    _n_enter = len([d for d in all_decisions if d.get("decision") == "ENTER"])
+    print(f"\n  ── Entry funnel ({_n_enter} entered / {_n_wait} unique setups blocked) ─────")
     if _wait_reasons:
-        _reason_counts = Counter(_wait_reasons).most_common(10)
-        print(f"\n  ── Top rejection reasons (WAIT decisions) ─────────────")
-        for reason, count in _reason_counts:
-            print(f"    {reason:<40} {count:>4}x")
+        for reason, count in Counter(_wait_reasons).most_common(15):
+            print(f"    {reason:<45} {count:>5}x")
+    else:
+        print("    (no WAIT reasons recorded — check failed_filters population)")
 
     print(f"\n  Trade log:")
     for t in trades:
