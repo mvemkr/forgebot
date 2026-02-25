@@ -151,8 +151,10 @@ class PatternDetector:
         results.extend(self._detect_break_retest(df))             # break & retest (Wk3/10/11/13)
         results.extend(self._detect_consolidation_breakout(df))   # tight range break (Wk12b/13)
         results.extend(self._detect_engulfing_rejection(df))      # daily/4H candle rejection
-        results.extend(self._detect_tweezer_top_bottom(df))       # tweezer top/bottom (Wk2 explicit)
-        results.extend(self._detect_evening_star(df))             # evening/morning star (Wk8 explicit)
+        # NOTE: tweezer + evening/morning star are NOT primary patterns.
+        # They are secondary confirmations — checked via detect_secondary_confirmations()
+        # after a primary pattern is already matched. Running them as primaries
+        # generates noise trades at arbitrary levels with no structural context.
         results.sort(key=lambda r: r.clarity, reverse=True)
         return results
 
@@ -160,6 +162,94 @@ class PatternDetector:
         """Return the highest-clarity pattern, or None."""
         results = self.detect_all(df)
         return results[0] if results else None
+
+    def detect_secondary_confirmations(
+        self,
+        df: pd.DataFrame,
+        direction: str,
+        near_price: float,
+        df_higher: Optional[pd.DataFrame] = None,
+        proximity_pct: float = 0.008,
+    ) -> dict:
+        """
+        Check for secondary confirmation signals at a known structural level.
+
+        Called AFTER a primary pattern is matched — secondaries add conviction
+        but never generate a trade on their own. Alex uses these to confirm:
+          - Wk2:  Tweezer top + bearish engulfing at H&S neckline 157.5
+          - Wk7:  Daily doji at GBP/CHF double-top neckline
+          - Wk8:  Evening star at H&S retest (30-min + 1H)
+          - Wk10/11: Weekly double doji at USD/CAD level
+
+        Returns:
+          {
+            'tweezer':      bool,   # tweezer top (short) / bottom (long) near level
+            'evening_star': bool,   # evening star (short) / morning star (long)
+            'doji':         bool,   # doji on this tf
+            'doji_count':   int,    # number of doji candles in recent lookback
+            'higher_doji':  bool,   # doji on the higher tf (e.g. weekly/daily)
+            'score':        float,  # 0.0 – 1.0  aggregate confirmation strength
+            'labels':       list,   # human-readable list of what fired
+          }
+        """
+        result = {
+            'tweezer': False, 'evening_star': False,
+            'doji': False, 'doji_count': 0, 'higher_doji': False,
+            'score': 0.0, 'labels': [],
+        }
+        if df is None or len(df) < 3:
+            return result
+
+        is_short = direction in ('short', 'bearish')
+
+        # ── Tweezer ──────────────────────────────────────────────────────────
+        tweezers = self._detect_tweezer_top_bottom(df)
+        for t in tweezers:
+            right_dir = (is_short and t.direction == 'bearish') or \
+                        (not is_short and t.direction == 'bullish')
+            near_lvl  = abs(t.pattern_level - near_price) / near_price < proximity_pct
+            if right_dir and near_lvl:
+                result['tweezer'] = True
+                result['labels'].append(f"tweezer_{'top' if is_short else 'bottom'} @{t.pattern_level:.5f}")
+                break
+
+        # ── Evening / Morning Star ────────────────────────────────────────────
+        stars = self._detect_evening_star(df)
+        for s in stars:
+            right_dir = (is_short and s.direction == 'bearish') or \
+                        (not is_short and s.direction == 'bullish')
+            near_lvl  = abs(s.pattern_level - near_price) / near_price < proximity_pct
+            if right_dir and near_lvl:
+                result['evening_star'] = True
+                label = 'evening_star' if is_short else 'morning_star'
+                result['labels'].append(f"{label} @{s.pattern_level:.5f}")
+                break
+
+        # ── Doji on primary tf ────────────────────────────────────────────────
+        result['doji_count'] = self.count_doji(df, lookback=3)
+        result['doji']       = result['doji_count'] >= 1
+
+        # ── Doji on higher tf (weekly / daily) ────────────────────────────────
+        if df_higher is not None and len(df_higher) >= 2:
+            h_count = self.count_doji(df_higher, lookback=2)
+            result['higher_doji'] = h_count >= 1
+            if h_count >= 2:
+                result['labels'].append(f"double_doji_higher_tf")
+            elif h_count == 1:
+                result['labels'].append(f"doji_higher_tf")
+
+        if result['doji']:
+            result['labels'].append(f"doji_x{result['doji_count']}")
+
+        # ── Aggregate score ───────────────────────────────────────────────────
+        score = 0.0
+        if result['tweezer']:      score += 0.40
+        if result['evening_star']: score += 0.35
+        if result['higher_doji']:  score += 0.20 * min(result['doji_count'], 2)
+        if result['doji']:         score += 0.10
+        result['score'] = min(1.0, score)
+
+        return result
 
     # ------------------------------------------------------------------ #
     # Head & Shoulders

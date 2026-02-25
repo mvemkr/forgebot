@@ -1357,16 +1357,29 @@ class SetAndForgetStrategy:
         )
         _level_score = nearest_level.score if nearest_level else 2
 
-        # Doji context bonus: Alex explicitly uses daily/weekly doji as confirmation.
-        # "Daily doji → next candle fills the wick" (Wk7/10/11/12b). A doji at the
-        # level means indecision resolved; double doji = even stronger stall signal.
-        _daily_doji_count  = self.pattern_detector.count_doji(df_daily,  lookback=3)
-        _weekly_doji_count = self.pattern_detector.count_doji(df_weekly, lookback=2)
-        _doji_bonus = 0.0
-        if _weekly_doji_count >= 2:
-            _doji_bonus = 0.06   # weekly double doji (Wk10/11 explicit)
-        elif _weekly_doji_count == 1 or _daily_doji_count >= 1:
-            _doji_bonus = 0.03   # single doji confirmation
+        # ── Secondary confirmations ───────────────────────────────────────────
+        # Tweezer top/bottom, evening/morning star, doji are NOT standalone
+        # entry patterns — they're confirmation signals that a known structural
+        # level is being respected. Run them here, after primary is matched.
+        #
+        # Alex's explicit usage:
+        #   Wk2:    Tweezer top + bearish engulfing AT H&S neckline 157.5
+        #   Wk7:    Daily doji confirming GBP/CHF double-top level
+        #   Wk8:    Evening star at H&S neckline retest (30-min entry bar)
+        #   Wk10/11: Weekly double doji at USD/CAD break/retest level
+        _sec_level = getattr(matching_pattern, 'pattern_level', None) or neckline_ref
+        _secondary  = self.pattern_detector.detect_secondary_confirmations(
+            df             = df_4h if len(df_4h) >= 5 else df_daily,
+            direction      = trade_direction,
+            near_price     = _sec_level,
+            df_higher      = df_weekly,
+            proximity_pct  = 0.008,
+        )
+        # Secondary bonus: scales with confirmation strength (0–10%)
+        # Capped at 0.10 to avoid secondaries overriding weak primaries.
+        _secondary_bonus = round(_secondary['score'] * 0.10, 4)
+        if _secondary['labels']:
+            pass  # labels surfaced in notes below
 
         confidence = min(1.0, max(0.0, (
             0.26 * min(1.0, _level_score / 4)    # level quality
@@ -1377,7 +1390,7 @@ class SetAndForgetStrategy:
           + _mtf_bonus                             # MTF pattern confluence bonus
           + _context_adj                           # multi-TF context adjustment
           + _4h_penalty                            # 4H-source pattern (less mature than daily)
-          + _doji_bonus                            # daily/weekly doji at level (Alex Wk7/10/11)
+          + _secondary_bonus                       # secondary confirmations (tweezer/star/doji)
         )))
 
         # Macro theme position sizing: if this is a stacked macro theme trade,
@@ -1444,7 +1457,8 @@ class SetAndForgetStrategy:
                 f"Session: {session} | "
                 f"R:R (T1) = 1:{rr_1:.1f} | "
                 f"Risk: ${risk_dollars:.2f}"
-                f"{_macro_note}"
+                + (f" | Confirm: {', '.join(_secondary['labels'])}" if _secondary['labels'] else "")
+                + f"{_macro_note}"
             ),
             confidence=confidence,
             entry_price=entry_price,
