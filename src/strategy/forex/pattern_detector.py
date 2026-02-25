@@ -146,11 +146,13 @@ class PatternDetector:
         """Detect all patterns, return sorted by clarity descending."""
         results = []
         results.extend(self._detect_liquidity_sweep(df))          # institutional sweeps
-        results.extend(self._detect_head_and_shoulders(df))
-        results.extend(self._detect_double_top_bottom(df))
-        results.extend(self._detect_break_retest(df))
-        results.extend(self._detect_consolidation_breakout(df))  # tight range break (Alex Wk12b)
-        results.extend(self._detect_engulfing_rejection(df))     # daily/4H candle rejection
+        results.extend(self._detect_head_and_shoulders(df))       # H&S / IH&S (Wk1/2/8)
+        results.extend(self._detect_double_top_bottom(df))        # double top/bottom (Wk6/7)
+        results.extend(self._detect_break_retest(df))             # break & retest (Wk3/10/11/13)
+        results.extend(self._detect_consolidation_breakout(df))   # tight range break (Wk12b/13)
+        results.extend(self._detect_engulfing_rejection(df))      # daily/4H candle rejection
+        results.extend(self._detect_tweezer_top_bottom(df))       # tweezer top/bottom (Wk2 explicit)
+        results.extend(self._detect_evening_star(df))             # evening/morning star (Wk8 explicit)
         results.sort(key=lambda r: r.clarity, reverse=True)
         return results
 
@@ -208,8 +210,8 @@ class PatternDetector:
 
             # How many bars (after right shoulder) have closed below the neckline?
             # Alex's rule: enter on the RETEST bar after the break, not the break candle itself.
-            # We require >= 2 bars below neckline before the retest entry zone activates.
-            MIN_BARS_BELOW = 2
+            # 1 bar below is sufficient — waiting for 2 misses the fast retest on USD/JPY Wk2.
+            MIN_BARS_BELOW = 1
             bars_below_neckline = int(np.sum(closes[rs_idx:] < neckline))
 
             # Clarity: how well-formed is the pattern
@@ -287,6 +289,7 @@ class PatternDetector:
             broke_neckline_up = current_close > neckline
 
             # Bars above neckline since right shoulder (bullish mirror of bearish H&S)
+            MIN_BARS_BELOW = 1  # same 1-bar rule as bearish H&S
             bars_above_neckline = int(np.sum(closes[rs_idx:] > neckline))
 
             clarity = 1.0 - shoulder_diff * 5
@@ -987,6 +990,211 @@ class PatternDetector:
                 ))
 
         return results
+
+    def _detect_tweezer_top_bottom(self, df: pd.DataFrame) -> List[PatternResult]:
+        """
+        Tweezer Top / Tweezer Bottom — two-candle reversal pattern.
+
+        Alex explicitly names "Maru tweezer top rejection bearish engulfing" on
+        USD/JPY Wk2 at the 157.5 neckline retest.  The pattern is:
+
+        BEARISH Tweezer Top:
+          Candle[i-1]: reaches a local high H at resistance
+          Candle[i]:   opens near H, rejects hard, closes lower (bearish body)
+          Both highs within pip_tol of each other → matching highs = rejection.
+
+        BULLISH Tweezer Bottom (mirror): matching lows at support, second candle bullish.
+        """
+        results = []
+        if len(df) < 5:
+            return results
+
+        opens  = df['open'].values
+        highs  = df['high'].values
+        lows   = df['low'].values
+        closes = df['close'].values
+        is_jpy = 'JPY' in str(df.columns.tolist())   # crude check; caller passes pair context
+
+        # pip tolerance: highs must be within 3 pips
+        pip_tol_pct = 0.0003   # ~3 pips on non-JPY; OK approximation
+
+        for i in range(2, len(df) - 1):
+            h1, h2 = highs[i-1], highs[i]
+            l1, l2 = lows[i-1],  lows[i]
+            ref    = (h1 + h2) / 2
+
+            # ── Bearish Tweezer Top ──────────────────────────────────────────
+            matching_highs = abs(h1 - h2) / ref < pip_tol_pct
+            bearish_close  = closes[i] < opens[i]                     # second candle bearish
+            meaningful_rej = (h2 - closes[i]) > (closes[i] - lows[i]) # upper wick > lower wick
+
+            if matching_highs and bearish_close and meaningful_rej:
+                body_ratio = abs(closes[i] - opens[i]) / (highs[i] - lows[i] + 1e-10)
+                clarity    = min(1.0, 0.5 * body_ratio + 0.5 * (1 - abs(h1 - h2) / ref / pip_tol_pct))
+                struct_low = float(np.min(lows[max(0, i-10):i+1]))
+                stop       = h2 * (1 + self.tol)
+                target_1   = closes[i] - (h2 - struct_low)
+                results.append(PatternResult(
+                    pattern_type   = 'tweezer_top',
+                    direction      = 'bearish',
+                    neckline       = h2,
+                    entry_zone_low = closes[i] * (1 - self.tol),
+                    entry_zone_high= closes[i],
+                    stop_loss      = stop,
+                    target_1       = target_1,
+                    target_2       = closes[i] - (h2 - struct_low) * 1.5,
+                    clarity        = clarity,
+                    pattern_level  = h2,
+                    notes          = f"Tweezer top at {h2:.5f} — matching highs Δ={abs(h1-h2):.5f}",
+                ))
+
+            # ── Bullish Tweezer Bottom ───────────────────────────────────────
+            matching_lows  = abs(l1 - l2) / (l1 + 1e-10) < pip_tol_pct
+            bullish_close  = closes[i] > opens[i]
+            meaningful_sup = (closes[i] - l2) > (highs[i] - closes[i])
+
+            if matching_lows and bullish_close and meaningful_sup:
+                body_ratio = abs(closes[i] - opens[i]) / (highs[i] - lows[i] + 1e-10)
+                clarity    = min(1.0, 0.5 * body_ratio + 0.5 * (1 - abs(l1 - l2) / (l1 + 1e-10) / pip_tol_pct))
+                struct_high = float(np.max(highs[max(0, i-10):i+1]))
+                stop        = l2 * (1 - self.tol)
+                target_1    = closes[i] + (struct_high - l2)
+                results.append(PatternResult(
+                    pattern_type   = 'tweezer_bottom',
+                    direction      = 'bullish',
+                    neckline       = l2,
+                    entry_zone_low = closes[i],
+                    entry_zone_high= closes[i] * (1 + self.tol),
+                    stop_loss      = stop,
+                    target_1       = target_1,
+                    target_2       = closes[i] + (struct_high - l2) * 1.5,
+                    clarity        = clarity,
+                    pattern_level  = l2,
+                    notes          = f"Tweezer bottom at {l2:.5f} — matching lows Δ={abs(l1-l2):.5f}",
+                ))
+        return results
+
+    def _detect_evening_star(self, df: pd.DataFrame) -> List[PatternResult]:
+        """
+        Evening Star (bearish) / Morning Star (bullish) — 3-candle reversal.
+
+        Alex calls out "30 minute bearish engulfing Evening Star formation" on
+        USD/JPY Wk8 at the H&S neckline retest.  Classic definition:
+
+        BEARISH Evening Star:
+          Candle[i-2]: large bullish body (advance into resistance)
+          Candle[i-1]: small body / doji at the top (indecision)
+          Candle[i]:   large bearish body closing below midpoint of candle[i-2]
+
+        BULLISH Morning Star (mirror): large bearish → doji → large bullish.
+        """
+        results = []
+        if len(df) < 5:
+            return results
+
+        opens  = df['open'].values
+        highs  = df['high'].values
+        lows   = df['low'].values
+        closes = df['close'].values
+
+        for i in range(2, len(df)):
+            # candle sizes
+            body_a = closes[i-2] - opens[i-2]   # positive = bullish
+            body_b = abs(closes[i-1] - opens[i-1])
+            body_c = opens[i] - closes[i]        # positive = bearish
+            range_a = highs[i-2] - lows[i-2]
+            range_b = highs[i-1] - lows[i-1]
+            range_c = highs[i]   - lows[i]
+
+            if range_a < 1e-10 or range_c < 1e-10:
+                continue
+
+            # ── Bearish Evening Star ─────────────────────────────────────────
+            large_bullish = body_a / range_a > 0.5 and body_a > 0         # candle A: big green
+            small_middle  = body_b / (range_b + 1e-10) < 0.35            # candle B: small / doji
+            large_bearish = body_c / range_c > 0.5 and body_c > 0        # candle C: big red
+            # C closes below midpoint of A
+            closes_below_mid = closes[i] < (opens[i-2] + closes[i-2]) / 2
+
+            if large_bullish and small_middle and large_bearish and closes_below_mid:
+                clarity = min(1.0, (
+                    0.4 * (body_a / range_a)
+                  + 0.2 * (1 - body_b / (range_b + 1e-10))   # smaller middle = better
+                  + 0.4 * (body_c / range_c)
+                ))
+                level  = highs[i-2]
+                stop   = level * (1 + self.tol)
+                target_range = level - closes[i]
+                results.append(PatternResult(
+                    pattern_type   = 'evening_star',
+                    direction      = 'bearish',
+                    neckline       = closes[i-2],              # top of the advance
+                    entry_zone_low = closes[i] * (1 - self.tol),
+                    entry_zone_high= closes[i] * (1 + self.tol * 0.5),
+                    stop_loss      = stop,
+                    target_1       = closes[i] - target_range,
+                    target_2       = closes[i] - target_range * 1.5,
+                    clarity        = clarity,
+                    pattern_level  = highs[i-1],
+                    notes          = f"Evening Star — 3-candle reversal at {highs[i-1]:.5f}",
+                ))
+
+            # ── Bullish Morning Star ─────────────────────────────────────────
+            large_bearish_a  = (-body_a) / range_a > 0.5 and body_a < 0
+            large_bullish_c  = (-body_c) / range_c > 0.5 and body_c < 0  # note: body_c = open-close, neg = bullish
+            closes_above_mid = closes[i] > (opens[i-2] + closes[i-2]) / 2
+
+            if large_bearish_a and small_middle and large_bullish_c and closes_above_mid:
+                clarity = min(1.0, (
+                    0.4 * ((-body_a) / range_a)
+                  + 0.2 * (1 - body_b / (range_b + 1e-10))
+                  + 0.4 * ((-body_c) / range_c)
+                ))
+                level  = lows[i-2]
+                stop   = level * (1 - self.tol)
+                target_range = closes[i] - level
+                results.append(PatternResult(
+                    pattern_type   = 'morning_star',
+                    direction      = 'bullish',
+                    neckline       = closes[i-2],
+                    entry_zone_low = closes[i] * (1 - self.tol * 0.5),
+                    entry_zone_high= closes[i] * (1 + self.tol),
+                    stop_loss      = stop,
+                    target_1       = closes[i] + target_range,
+                    target_2       = closes[i] + target_range * 1.5,
+                    clarity        = clarity,
+                    pattern_level  = lows[i-1],
+                    notes          = f"Morning Star — 3-candle reversal at {lows[i-1]:.5f}",
+                ))
+        return results
+
+    def has_doji_context(self, df: pd.DataFrame, lookback: int = 3) -> bool:
+        """
+        Returns True if any of the last `lookback` candles is a doji.
+
+        Alex uses "weekly double doji" and "daily doji" as confirmation that
+        momentum is stalling at a level before entering (Wk7, Wk10, Wk11, Wk12b).
+
+        Doji = |close - open| / (high - low) ≤ 15%.  A "double doji" is two
+        consecutive doji candles — Alex says this means indecision resolved.
+        """
+        if df is None or len(df) < lookback:
+            return False
+        recent = df.iloc[-lookback:]
+        body_ratio = (recent['close'] - recent['open']).abs() / (
+            (recent['high'] - recent['low']).replace(0, float('nan'))
+        )
+        return bool((body_ratio <= 0.15).any())
+
+    def count_doji(self, df: pd.DataFrame, lookback: int = 3) -> int:
+        """Count doji candles in the last `lookback` bars (for 'double doji' detection)."""
+        if df is None or len(df) < lookback:
+            return 0
+        recent = df.iloc[-lookback:]
+        body_ratio = (recent['close'] - recent['open']).abs() / (
+            (recent['high'] - recent['low']).replace(0, float('nan'))
+        )
+        return int((body_ratio <= 0.15).sum())
 
     # ------------------------------------------------------------------ #
     # Helpers

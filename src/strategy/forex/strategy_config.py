@@ -80,16 +80,15 @@ MAX_CONCURRENT_TRADES: int = 4   # Alex runs 4+ simultaneous set-and-forget posi
 # Added: GBP/CAD, AUD/JPY, CAD/JPY, EUR/JPY (on his list, were missing from bot)
 # JPY crosses: Alex watches ALL 6 — key for theme stacking (Week 7-8 $70K)
 ALLOWED_PAIRS: frozenset = frozenset({
-    # USD majors
-    "GBP/USD", "EUR/USD", "USD/JPY", "USD/CHF", "USD/CAD", "NZD/USD", "AUD/USD",
-    # GBP crosses
-    "GBP/JPY", "GBP/CHF", "GBP/NZD", "GBP/CAD",
-    # EUR crosses
-    "EUR/AUD", "EUR/CAD", "EUR/JPY",
-    # JPY crosses (all 6 for theme stacking)
-    "AUD/JPY", "CAD/JPY", "NZD/JPY",
-    # Commodity crosses
-    "AUD/CAD", "NZD/CAD",
+    # Alex's exact trading universe — extracted from full transcript.
+    # He trades ONLY these 7 pairs across all 13 weeks. No exceptions.
+    "GBP/JPY",   # Wk1 (short 205), largest position
+    "USD/JPY",   # Wk2 (short 157.5), Wk8 (short 144)
+    "USD/CHF",   # Wk3 (short 0.88), Wk13 (long 0.876)
+    "GBP/CHF",   # Wk6/7 (short 1.125), Wk12b (short 1.124)
+    "USD/CAD",   # Wk10/11 (short 1.37)
+    "EUR/USD",   # mentioned as reference pair, Wk4 skip
+    "GBP/USD",   # mentioned in channel discussion
 })
 
 # ── Winner rule ("don't compete with your winner") ────────────────────────

@@ -797,6 +797,9 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         entry_candidates = []  # (pip_equity, pair, decision, _is_theme_pair)
 
         for pair, pdata in candle_data.items():
+            if pair not in _sc.ALLOWED_PAIRS:
+                continue   # not in Alex's trading universe
+
             if pair in open_pos:
                 continue   # already in this pair
 

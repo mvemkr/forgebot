@@ -971,6 +971,27 @@ class SetAndForgetStrategy:
             # Default True (Alex uses them). False = core reversal patterns only.
             if not _cfg.ALLOW_BREAK_RETEST and 'break_retest' in p.pattern_type:
                 continue
+
+            # ── Round level gate for new reversal patterns ────────────────
+            # Tweezer top/bottom, evening star, morning star are high-noise
+            # reversal signals — they appear everywhere. Alex ONLY takes
+            # reversals at ROUND PSYCHOLOGICAL LEVELS (157.5, 205, 1.125, etc.)
+            # with EMA confluence. Without a round level anchor = noise. Hard block.
+            _ROUND_ONLY_PATTERNS = ('tweezer_top', 'tweezer_bottom',
+                                    'evening_star', 'morning_star')
+            if p.pattern_type in _ROUND_ONLY_PATTERNS:
+                _lev_ref = p.pattern_level or p.neckline or current_price
+                # Check proximity to round psychological levels inline.
+                # Use same increment logic as LevelDetector._round_increment().
+                _inc   = self.level_detector._round_increment(_lev_ref, pair)
+                _below = round(_lev_ref / _inc) * _inc        # nearest round below
+                _above = _below + _inc                         # nearest round above
+                _is_at_round = (
+                    abs(_lev_ref - _below) / _lev_ref < 0.004 or
+                    abs(_lev_ref - _above) / _lev_ref < 0.004
+                )
+                if not _is_at_round:
+                    continue   # tweezer/star not at a round level = skip
             # Proximity window: how far from the neckline can current price be?
             # Standard:  2.0% — price is near the neckline (break or retest)
             # Sweep:     3.5% — liquidity sweeps can pull price further
@@ -1223,7 +1244,8 @@ class SetAndForgetStrategy:
         # cleanly rejects the double-top level.
         _is_reversal_pattern = any(k in matching_pattern.pattern_type for k in
             ('head_and_shoulders', 'double_top', 'double_bottom',
-             'inverted_head_and_shoulders', 'consolidation_breakout'))
+             'inverted_head_and_shoulders', 'consolidation_breakout',
+             'tweezer_top', 'tweezer_bottom', 'evening_star', 'morning_star'))
         if (not has_signal or signal is None) and _is_reversal_pattern and len(df_4h) >= 2:
             has_signal_4h, signal_4h = self.signal_detector.has_signal(df_4h, trade_direction)
             if has_signal_4h and signal_4h:
@@ -1334,6 +1356,18 @@ class SetAndForgetStrategy:
             -0.05 if getattr(matching_pattern, '_source_tf', 'daily') == '4h' else 0.0
         )
         _level_score = nearest_level.score if nearest_level else 2
+
+        # Doji context bonus: Alex explicitly uses daily/weekly doji as confirmation.
+        # "Daily doji → next candle fills the wick" (Wk7/10/11/12b). A doji at the
+        # level means indecision resolved; double doji = even stronger stall signal.
+        _daily_doji_count  = self.pattern_detector.count_doji(df_daily,  lookback=3)
+        _weekly_doji_count = self.pattern_detector.count_doji(df_weekly, lookback=2)
+        _doji_bonus = 0.0
+        if _weekly_doji_count >= 2:
+            _doji_bonus = 0.06   # weekly double doji (Wk10/11 explicit)
+        elif _weekly_doji_count == 1 or _daily_doji_count >= 1:
+            _doji_bonus = 0.03   # single doji confirmation
+
         confidence = min(1.0, max(0.0, (
             0.26 * min(1.0, _level_score / 4)    # level quality
           + 0.20 * matching_pattern.clarity        # pattern quality
@@ -1343,6 +1377,7 @@ class SetAndForgetStrategy:
           + _mtf_bonus                             # MTF pattern confluence bonus
           + _context_adj                           # multi-TF context adjustment
           + _4h_penalty                            # 4H-source pattern (less mature than daily)
+          + _doji_bonus                            # daily/weekly doji at level (Alex Wk7/10/11)
         )))
 
         # Macro theme position sizing: if this is a stacked macro theme trade,
