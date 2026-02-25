@@ -27,7 +27,7 @@ from .session_filter import SessionFilter
 from .level_detector import LevelDetector, KeyLevel
 from .pattern_detector import PatternDetector, PatternResult, Trend
 from .entry_signal import EntrySignalDetector, EntrySignal
-from .targeting import select_target, find_next_structure_level
+from .targeting import select_target, find_next_structure_level, get_structure_stop
 from . import strategy_config as _cfg   # module-ref import so apply_levers() patches propagate
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,8 @@ class TradeDecision:
     exec_target: Optional[float] = None   # final TP chosen by select_target() — backtester uses this verbatim
     exec_rr: float               = 0.0    # R:R to exec_target — must be ≥ MIN_RR to enter
     exec_target_type: str        = ""     # "4h_structure" | "measured_move" | "measured_move_t2"
+    stop_type: str               = ""     # "structural_anchor" | "retest_swing" | "atr_fallback" | "legacy_pattern_stop"
+    initial_stop_pips: float     = 0.0    # stop distance in pips at entry — fixed for R accounting even after BE move
     risk_pct: Optional[float]    = None   # % of account to risk
     lot_size: Optional[float]    = None
 
@@ -187,6 +189,14 @@ class SetAndForgetStrategy:
         # that same formation is exhausted — don't trade it again even if it re-forms.
         self.NECKLINE_CLUSTER_PCT: float = 0.003   # 0.3% — merges nearby necklines into one bucket
         self.traded_patterns: Dict[str, str] = {}
+
+        # Signal deduplication — block re-firing ENTER for the same setup on
+        # every bar.  Key: (pair, pattern_type, rounded_neckline, direction)
+        # Value: last-seen pandas Timestamp (or None).
+        # DUPLICATE_SIGNAL fires if the same key was last generated < DEDUP_HOURS ago.
+        # This stops "15 bars in a row at USD/CAD IH&S 1.40" spam.
+        self.DEDUP_HOURS: int = 6          # 6 hours = 6 bars on 1H data
+        self._recent_enter_ts: Dict[str, object] = {}    # key → pd.Timestamp
 
     def update_balance(self, balance: float):
         self.account_balance = balance
@@ -1409,6 +1419,37 @@ class SetAndForgetStrategy:
             pattern=matching_pattern,
         )
 
+        # ── Structure-based stop (replaces wide ATR/tol*N stop from pattern_detector) ──
+        # get_structure_stop() uses pattern.stop_anchor (the raw structural extreme
+        # stored by the pattern detector) + a tight pip buffer (3p majors / 5p crosses).
+        # Tighter stop → higher exec_rr for the same measured move → MIN_RR gate passes.
+        _is_jpy        = "JPY" in pair.upper()
+        _is_usd_cross  = "USD" not in pair.replace("_", "/").split("/")
+        _pip_size      = 0.01 if _is_jpy else 0.0001
+        _stop_log: list = []
+        _struct_stop, _stop_type, _stop_pips = get_structure_stop(
+            pattern_type     = matching_pattern.pattern_type,
+            direction        = trade_direction,
+            entry            = entry_price,
+            df_1h            = df_1h,
+            pattern          = matching_pattern,
+            pip_size         = _pip_size,
+            is_jpy_or_cross  = _is_jpy or _is_usd_cross,
+            atr_fallback_mult = 3.0,
+            stop_log         = _stop_log,
+        )
+        if _struct_stop != stop_loss:
+            stop_loss = _struct_stop
+            # Recompute lot_size with the new (tighter) stop
+            _risk_dollars = self.account_balance * (self.risk_pct / 100)
+            _risk_per_pip = abs(entry_price - stop_loss)
+            if _risk_per_pip > 0:
+                _risk_pips = _risk_per_pip * (100 if _is_jpy else 10000)
+                lot_size   = max(0.01, round(_risk_dollars / max(_risk_pips * 10, 0.01), 2))
+            else:
+                lot_size = 0.01
+        _stop_selected = next((e["type"] for e in _stop_log if "STOP_SELECTED" in e.get("action","")), _stop_type)
+
         # Final confidence score
         # Components:
         #   level quality      : how strong is the key level (round number, tested, EMA)
@@ -1552,6 +1593,44 @@ class SetAndForgetStrategy:
             f"Round number {matching_pattern.pattern_level:.5f}"
         )
 
+        # ── Signal deduplication gate ─────────────────────────────────────────
+        # Prevents the same pattern from firing ENTER on every bar while waiting
+        # for a position to open. E.g. USD/CAD IH&S at 1.40 would otherwise
+        # generate 15 consecutive ENTER decisions. Block if the same
+        # (pair, pattern_type, neckline, direction) was generated < DEDUP_HOURS ago.
+        import pandas as _pd
+        _dedup_key = (
+            f"{pair}|{matching_pattern.pattern_type}"
+            f"|{round(neckline_ref or matching_pattern.neckline, 3)}"
+            f"|{trade_direction}"
+        )
+        _now_ts    = df_1h.index[-1] if len(df_1h) > 0 else None
+        _last_ts   = self._recent_enter_ts.get(_dedup_key)
+        if (_now_ts is not None and _last_ts is not None):
+            try:
+                _elapsed_h = (_now_ts - _last_ts).total_seconds() / 3600
+            except Exception:
+                _elapsed_h = 999
+            if _elapsed_h < self.DEDUP_HOURS:
+                return TradeDecision(
+                    decision=Decision.WAIT,
+                    pair=pair,
+                    direction=trade_direction,
+                    reason=(
+                        f"DUPLICATE_SIGNAL: {matching_pattern.pattern_type.upper()} at "
+                        f"{neckline_ref or matching_pattern.neckline:.5f} last fired "
+                        f"{_elapsed_h:.1f}h ago (< {self.DEDUP_HOURS}h dedup window). "
+                        f"One entry per setup."
+                    ),
+                    confidence=0.0,
+                    failed_filters=["duplicate_signal"],
+                    nearest_level=nearest_level,
+                    pattern=matching_pattern,
+                )
+        # Record this as the last ENTER fire time for this setup
+        if _now_ts is not None:
+            self._recent_enter_ts[_dedup_key] = _now_ts
+
         return TradeDecision(
             decision=Decision.ENTER,
             pair=pair,
@@ -1564,6 +1643,7 @@ class SetAndForgetStrategy:
                 f"Trend: W={trend_w.value} D={trend_d.value} 4H={trend_4.value} | "
                 f"Session: {session} | "
                 f"R:R ({_exec_target_type}) = 1:{_exec_rr:.1f} | "
+                f"Stop: {_stop_selected} {_stop_pips:.0f}p | "
                 f"Risk: ${risk_dollars:.2f}"
                 + (f" | Confirm: {', '.join(_secondary['labels'])}" if _secondary['labels'] else "")
                 + f"{_macro_note}"
@@ -1576,6 +1656,8 @@ class SetAndForgetStrategy:
             exec_target=_exec_target,
             exec_rr=_exec_rr,
             exec_target_type=_exec_target_type,
+            stop_type=_stop_selected,
+            initial_stop_pips=_stop_pips,
             risk_pct=_effective_risk_pct,
             lot_size=lot_size,
             nearest_level=nearest_level,

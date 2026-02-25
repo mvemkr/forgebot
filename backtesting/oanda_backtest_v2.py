@@ -984,7 +984,9 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
                 "target_price": _target,
                 "target_type":  decision.exec_target_type,
+                "stop_type":    decision.stop_type,
                 "initial_risk": abs(decision.entry_price - decision.stop_loss),
+                "initial_stop_pips": decision.initial_stop_pips,
                 "base_risk_pct": _base_rpct,
                 "dd_flag":       _dd_flag,
                 "signal_type":   (decision.entry_signal.signal_type
@@ -1122,6 +1124,19 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         for sig_type, count in sorted(_trigger_counts.items(), key=lambda x: -x[1]):
             pct = count / len(trades) * 100 if trades else 0
             print(f"    {sig_type:<30} {count:>3}  ({pct:.0f}%)")
+
+    # Stop type distribution
+    _stop_types = Counter(pos.get("stop_type", "unknown") for pos in trades)
+    if _stop_types:
+        print(f"\n  ── Stop type distribution ─────────────────────────────")
+        for stype, cnt in _stop_types.most_common():
+            pct = cnt / len(trades) * 100
+            print(f"    {stype:<35} {cnt:>3}  ({pct:.0f}%)")
+        _sp_vals = [t.get("initial_stop_pips", 0) for t in trades if t.get("initial_stop_pips", 0) > 0]
+        if _sp_vals:
+            _sp_vals.sort()
+            print(f"    Stop pips:  min={_sp_vals[0]:.0f}p  p50={_sp_vals[len(_sp_vals)//2]:.0f}p  "
+                  f"p90={_sp_vals[int(len(_sp_vals)*0.9)]:.0f}p  max={_sp_vals[-1]:.0f}p")
 
     if _dd_cap_trades:
         print(f"\n  ── DD circuit breaker applied ─────────────────────────")
