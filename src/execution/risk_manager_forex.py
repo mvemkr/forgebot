@@ -160,14 +160,10 @@ class ForexRiskManager:
 
         if dd >= DD_L2_PCT / 100:
             capped = min(base, DD_L2_CAP)
-            logger.warning(f"DD circuit breaker L2: DD={dd:.1%} ≥ {DD_L2_PCT}% "
-                           f"→ risk capped {base:.1f}%→{capped:.1f}%")
             return capped, "DD_CAP_6"
 
         if dd >= DD_L1_PCT / 100:
             capped = min(base, DD_L1_CAP)
-            logger.warning(f"DD circuit breaker L1: DD={dd:.1%} ≥ {DD_L1_PCT}% "
-                           f"→ risk capped {base:.1f}%→{capped:.1f}%")
             return capped, "DD_CAP_10"
 
         return base, ""
