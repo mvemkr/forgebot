@@ -41,6 +41,7 @@ from typing import Optional, Dict, List
 from src.exchange.oanda_client import OandaClient, INSTRUMENT_MAP
 from src.strategy.forex.set_and_forget   import SetAndForgetStrategy, Decision
 from src.strategy.forex.news_filter      import NewsFilter
+from src.strategy.forex.targeting        import select_target, find_next_structure_level
 from src.execution.risk_manager_forex    import ForexRiskManager
 from src.execution.trade_journal         import TradeJournal
 from src.strategy.forex.currency_strength import CurrencyStrengthAnalyzer, CurrencyTheme, STACK_MAX
@@ -299,51 +300,6 @@ def _resample_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
 
 # ── 4H structure target ───────────────────────────────────────────────────────
 
-def _find_next_structure_level(
-    df_4h: pd.DataFrame,
-    direction: str,
-    reference_price: float,
-    swing_bars: int = 5,
-) -> Optional[float]:
-    """
-    Find the nearest prior 4H swing level beyond the neckline in trade direction.
-
-    Alex explicitly places his target at "the next 4-hour low/high" visible on
-    the chart at entry time — not the geometric measured move.
-
-    For SHORT: nearest swing LOW strictly below reference_price
-    For LONG:  nearest swing HIGH strictly above reference_price
-
-    Returns the level, or None if no swing found.
-    """
-    if df_4h is None or len(df_4h) < swing_bars * 2 + 1:
-        return None
-
-    lows  = df_4h["low"].values  if "low"  in df_4h.columns else df_4h["Low"].values
-    highs = df_4h["high"].values if "high" in df_4h.columns else df_4h["High"].values
-    n     = len(df_4h)
-
-    candidates: List[float] = []
-    for i in range(swing_bars, n - swing_bars):
-        if direction == "short":
-            price = lows[i]
-            if price >= reference_price:
-                continue
-            if (all(price <= lows[i - j] for j in range(1, swing_bars + 1)) and
-                    all(price <= lows[i + j] for j in range(1, swing_bars + 1))):
-                candidates.append(price)
-        else:  # long
-            price = highs[i]
-            if price <= reference_price:
-                continue
-            if (all(price >= highs[i - j] for j in range(1, swing_bars + 1)) and
-                    all(price >= highs[i + j] for j in range(1, swing_bars + 1))):
-                candidates.append(price)
-
-    if not candidates:
-        return None
-    # nearest = highest swing low (SHORT) or lowest swing high (LONG)
-    return max(candidates) if direction == "short" else min(candidates)
 
 
 # ── Gap logger ────────────────────────────────────────────────────────────────
@@ -1002,23 +958,18 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
 
             strat = strategies[pair]
 
-            # ── Target: next 4H structure level (Alex's actual method) ────────
-            # Alex says "take profit was very strategically placed at this next
-            # 4-hour low" — he looks at prior 4H swing structure, not a geometric
-            # measured move. Find nearest swing low/high beyond the neckline.
-            # Fall back to pattern.target_1 (measured move) if no swing found.
-            # NOTE: recompute hist_4h for THIS pair — Phase 1 left a stale value.
-            _pat       = decision.pattern
-            _neckline  = getattr(decision, "neckline_ref", None) or decision.entry_price
-            _df4h_entry = candle_data[pair].get("4h")
-            _hist4h_entry = (
-                _df4h_entry[_df4h_entry.index < ts]
-                if _df4h_entry is not None else pd.DataFrame()
-            )
-            _target    = _find_next_structure_level(_hist4h_entry, decision.direction, _neckline)
+            # ── Target: use exec_target from strategy (single source of truth) ──
+            # The strategy's select_target() already chose the best qualifying
+            # target (4H structure → measured_move → T2) and gated on MIN_RR.
+            # We use decision.exec_target verbatim — no override, no divergence.
+            # If exec_target is missing (legacy path), this is a hard bug, not a
+            # graceful fallback — log it and skip so we don't enter at 0.3R.
+            _target = decision.exec_target
             if _target is None:
-                _target = (_pat.target_1 if _pat and _pat.target_1 else
-                           _pat.target_2 if _pat and _pat.target_2 else None)
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "no_exec_target",
+                        f"decision.exec_target is None — strategy should have blocked this. "
+                        f"Skipping to avoid uncontrolled RR. pattern={decision.pattern.pattern_type if decision.pattern else '?'}")
+                continue
 
             open_pos[pair] = {
                 "entry_price":  decision.entry_price,
@@ -1031,15 +982,14 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "notes":        decision.reason[:80],
                 "be_moved":     False,
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
-                "target_price": _target,   # measured move close target
+                "target_price": _target,
+                "target_type":  decision.exec_target_type,
                 "initial_risk": abs(decision.entry_price - decision.stop_loss),
                 "base_risk_pct": _base_rpct,
-                "dd_flag":       _dd_flag,   # "" | "DD_CAP_10" | "DD_CAP_6"
+                "dd_flag":       _dd_flag,
                 "signal_type":   (decision.entry_signal.signal_type
                                   if decision.entry_signal else "unknown"),
-                "planned_rr":    (abs((_target - decision.entry_price) / (decision.entry_price - decision.stop_loss))
-                                  if _target and decision.stop_loss and abs(decision.entry_price - decision.stop_loss) > 1e-8
-                                  else 0.0),
+                "planned_rr":    decision.exec_rr,
                 "mfe_r":  0.0,
                 "mae_r":  0.0,
             }
@@ -1151,10 +1101,16 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     _plan_rr_n   = sum(1 for t in trades if t.get("planned_rr", 0) > 0)
     _avg_plan_rr = _avg_plan_rr / _plan_rr_n if _plan_rr_n else 0
 
+    # exec_rr distribution
+    _rr_vals = sorted(t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0)
+    _rr_p50  = _rr_vals[len(_rr_vals)//2] if _rr_vals else 0
+    _rr_p95  = _rr_vals[int(len(_rr_vals)*0.95)] if _rr_vals else 0
+
     print(f"\n  ── Per-trade postmortem ───────────────────────────────────")
-    print(f"    Planned RR avg:       {_avg_plan_rr:.2f}R  (n={_plan_rr_n})")
-    print(f"    Planned RR < 2.8:     {len(_low_rr)} trades ({len(_low_rr)/len(trades)*100:.0f}%)  ← should be ~0")
-    print(f"    Planned RR = 0 (N/A): {len(_zero_rr)} trades  ← no target found at entry")
+    print(f"    Exec RR avg:          {_avg_plan_rr:.2f}R  (n={_plan_rr_n})")
+    print(f"    Exec RR p50/p95:      {_rr_p50:.2f}R / {_rr_p95:.2f}R")
+    print(f"    Exec RR < 2.8:        {len(_low_rr)} trades ({len(_low_rr)/len(trades)*100:.0f}%)  ← should be ~0 after fix")
+    print(f"    Exec RR = 0 (N/A):    {len(_zero_rr)} trades  ← no qualifying target at entry")
     print(f"    Avg MFE:              {_avg_mfe:+.2f}R")
     print(f"    Avg MAE:              {_avg_mae:+.2f}R")
     print(f"\n  ── Exit reason counts ────────────────────────────────────")

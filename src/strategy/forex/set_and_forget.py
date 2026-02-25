@@ -27,6 +27,7 @@ from .session_filter import SessionFilter
 from .level_detector import LevelDetector, KeyLevel
 from .pattern_detector import PatternDetector, PatternResult, Trend
 from .entry_signal import EntrySignalDetector, EntrySignal
+from .targeting import select_target, find_next_structure_level
 from . import strategy_config as _cfg   # module-ref import so apply_levers() patches propagate
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ class TradeDecision:
     stop_loss: Optional[float]   = None
     target_1: Optional[float]    = None
     target_2: Optional[float]    = None
+    exec_target: Optional[float] = None   # final TP chosen by select_target() — backtester uses this verbatim
+    exec_rr: float               = 0.0    # R:R to exec_target — must be ≥ MIN_RR to enter
+    exec_target_type: str        = ""     # "4h_structure" | "measured_move" | "measured_move_t2"
     risk_pct: Optional[float]    = None   # % of account to risk
     lot_size: Optional[float]    = None
 
@@ -1482,36 +1486,64 @@ class SetAndForgetStrategy:
                           f"{_effective_risk_pct:.1f}% risk each)")
 
         risk_dollars = self.account_balance * (_effective_risk_pct / 100)
-        # For consolidation_breakout: measured T1 = 1× range, stop = range + buffer.
-        # R:R at T1 ≈ 0.57 (always <1.0 by construction). Alex runs these for 2-3×
-        # the range minimum — use T2 (2× measured move) as the R:R quality reference.
-        _rr_target = (
-            target_2
-            if 'consolidation_breakout' in matching_pattern.pattern_type
-            else target_1
+        # ── Shared target selection + exec RR gate ────────────────────────────
+        # Uses targeting.select_target() — same function as the backtester.
+        # This is the single source of truth: strategy and backtester always
+        # choose the same target and apply the same RR gate. No more divergence.
+        #
+        # Candidate priority (Alex's method first):
+        #   1. Nearest 4H swing structure level  ("next 4-hour low/high")
+        #   2. Pattern measured move T1           (geometric fallback)
+        #   3. Pattern measured move T2           (CB patterns only)
+        #
+        # Wrong-side sanity is inside select_target() — SHORT target must be
+        # < entry, LONG target must be > entry. Fixes the Wk3 direction bug class.
+        _4h_cutoff  = df_1h.index[-1] if len(df_1h) > 0 else None
+        _4h_hist    = (df_4h[df_4h.index < _4h_cutoff]
+                       if df_4h is not None and _4h_cutoff is not None and len(df_4h) > 0
+                       else pd.DataFrame())
+        _struct_tgt = find_next_structure_level(
+            _4h_hist, trade_direction, neckline_ref or entry_price
         )
-        rr_1 = abs(entry_price - _rr_target) / max(abs(entry_price - stop_loss), 0.000001)
 
-        # ── Minimum R:R quality gate ───────────────────────────────────────
-        # If the pattern's measured move (T1 amplitude) is less than MIN_RR× the
-        # stop distance, the pattern is geometrically weak — either stop is
-        # too wide or the measured move is tiny. Both are quality failures.
-        # Alex's trades all had measured moves well beyond their stop distances.
-        # 1:0.4 R:R (like AUD/CAD IH&S Jul 2024) = clear junk setup.
-        # Controlled by MIN_RR lever in strategy_config (default 1.0).
-        if rr_1 < _cfg.MIN_RR:
+        _tgt_candidates = []
+        if _struct_tgt:
+            _tgt_candidates.append((_struct_tgt, "4h_structure"))
+        if target_1:
+            _tgt_candidates.append((target_1, "measured_move"))
+        if target_2:
+            _tgt_candidates.append((target_2, "measured_move_t2"))
+
+        _exec_target, _exec_target_type, _exec_rr = select_target(
+            direction=trade_direction,
+            entry=entry_price,
+            stop=stop_loss,
+            candidates=_tgt_candidates,
+            min_rr=_cfg.MIN_RR,
+        )
+
+        if _exec_target is None:
+            _best = max(
+                (abs(p - entry_price) / max(abs(entry_price - stop_loss), 1e-8)
+                 for p, _ in _tgt_candidates if p is not None),
+                default=0.0,
+            )
             return TradeDecision(
                 decision=Decision.WAIT,
                 pair=pair,
                 direction=trade_direction,
                 reason=(
-                    f"R:R too low ({rr_1:.2f} < {_cfg.MIN_RR:.1f} minimum). "
-                    f"Pattern amplitude too small vs stop distance. "
-                    f"{matching_pattern.pattern_type.upper()} at {entry_price:.5f} "
-                    f"SL={stop_loss:.5f} T1={target_1:.5f}"
+                    f"exec_rr_min: no qualifying target ≥ {_cfg.MIN_RR}R "
+                    f"(best available: {_best:.2f}R). "
+                    f"4H structure too close or measured move too tight vs stop."
                 ),
-                confidence=confidence * 0.5,
-                failed_filters=["rr_minimum"],
+                confidence=confidence * 0.4,
+                failed_filters=["exec_rr_min"],
+                nearest_level=nearest_level,
+                pattern=matching_pattern,
+                trend_weekly=trend_w,
+                trend_daily=trend_d,
+                trend_4h=trend_4,
             )
 
         _level_desc = (
@@ -1531,7 +1563,7 @@ class SetAndForgetStrategy:
                 f"{signal.signal_type} (strength={signal.strength:.2f}) | "
                 f"Trend: W={trend_w.value} D={trend_d.value} 4H={trend_4.value} | "
                 f"Session: {session} | "
-                f"R:R (T1) = 1:{rr_1:.1f} | "
+                f"R:R ({_exec_target_type}) = 1:{_exec_rr:.1f} | "
                 f"Risk: ${risk_dollars:.2f}"
                 + (f" | Confirm: {', '.join(_secondary['labels'])}" if _secondary['labels'] else "")
                 + f"{_macro_note}"
@@ -1541,6 +1573,9 @@ class SetAndForgetStrategy:
             stop_loss=stop_loss,
             target_1=target_1,
             target_2=target_2,
+            exec_target=_exec_target,
+            exec_rr=_exec_rr,
+            exec_target_type=_exec_target_type,
             risk_pct=_effective_risk_pct,
             lot_size=lot_size,
             nearest_level=nearest_level,
