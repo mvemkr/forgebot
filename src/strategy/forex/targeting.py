@@ -31,6 +31,7 @@ def select_target(
     stop: float,
     candidates: List[Tuple[float, str]],
     min_rr: float,
+    rejected_log: Optional[List[dict]] = None,
 ) -> Tuple[Optional[float], str, float]:
     """
     Pick the first candidate target that satisfies ALL of:
@@ -40,12 +41,17 @@ def select_target(
     Candidates are evaluated IN ORDER — first qualifying one wins.
     Recommended order: [4h_structure, measured_move, measured_move_t2]
 
+    Optional: pass a list as `rejected_log` to capture all rejected candidates
+    with their reason codes (for funnel/report diagnostics).
+
     Returns:
         (chosen_target, target_type, exec_rr)
         (None, "no_qualifying_target", 0.0)  — block this entry
     """
     risk = abs(entry - stop)
     if risk < 1e-8:
+        if rejected_log is not None:
+            rejected_log.append({"type": "all", "reason": "zero_risk", "rr": 0.0})
         return None, "zero_risk", 0.0
 
     for price, target_type in candidates:
@@ -57,13 +63,24 @@ def select_target(
         # One-liner fix: a SHORT target must be strictly below entry;
         # a LONG target must be strictly above entry. If not, discard silently.
         if direction == "short" and price >= entry:
+            if rejected_log is not None:
+                rejected_log.append({"type": target_type, "price": price,
+                                     "reason": "wrong_side", "rr": 0.0})
             continue
         if direction == "long"  and price <= entry:
+            if rejected_log is not None:
+                rejected_log.append({"type": target_type, "price": price,
+                                     "reason": "wrong_side", "rr": 0.0})
             continue
 
         exec_rr = abs(price - entry) / risk
         if exec_rr >= min_rr:
             return price, target_type, exec_rr
+
+        # Target valid side but RR too low
+        if rejected_log is not None:
+            rejected_log.append({"type": target_type, "price": price,
+                                 "reason": "rr_too_low", "rr": round(exec_rr, 3)})
 
     return None, "no_qualifying_target", 0.0
 

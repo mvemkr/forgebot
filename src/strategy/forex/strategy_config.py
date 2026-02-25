@@ -52,7 +52,7 @@ TARGET_PROXIMITY_PIPS: float = 15.0
 # Minimum R:R ratio based on pattern amplitude vs stop distance.
 # Not a take-profit target — geometric quality check only.
 # Blocks patterns where the measured move is smaller than the stop.
-MIN_RR: float = 1.0
+MIN_RR: float = 2.5   # minimum exec R:R — select_target() rejects any candidate below this
 
 # ── ATR stop filter ────────────────────────────────────────────────────────
 # Stop must be ≤ ATR_STOP_MULTIPLIER × 14-day ATR.

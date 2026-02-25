@@ -1514,28 +1514,28 @@ class SetAndForgetStrategy:
         if target_2:
             _tgt_candidates.append((target_2, "measured_move_t2"))
 
+        _tgt_rejected: list = []
         _exec_target, _exec_target_type, _exec_rr = select_target(
             direction=trade_direction,
             entry=entry_price,
             stop=stop_loss,
             candidates=_tgt_candidates,
             min_rr=_cfg.MIN_RR,
+            rejected_log=_tgt_rejected,
         )
 
         if _exec_target is None:
-            _best = max(
-                (abs(p - entry_price) / max(abs(entry_price - stop_loss), 1e-8)
-                 for p, _ in _tgt_candidates if p is not None),
-                default=0.0,
-            )
+            _rejected_detail = "; ".join(
+                f"{r['type']}={r['rr']:.2f}R ({r['reason']})"
+                for r in _tgt_rejected
+            ) or "no candidates"
             return TradeDecision(
                 decision=Decision.WAIT,
                 pair=pair,
                 direction=trade_direction,
                 reason=(
-                    f"exec_rr_min: no qualifying target ≥ {_cfg.MIN_RR}R "
-                    f"(best available: {_best:.2f}R). "
-                    f"4H structure too close or measured move too tight vs stop."
+                    f"exec_rr_min: no qualifying target ≥ {_cfg.MIN_RR}R. "
+                    f"Tried: {_rejected_detail}"
                 ),
                 confidence=confidence * 0.4,
                 failed_filters=["exec_rr_min"],

@@ -1145,6 +1145,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     else:
         print("    (no WAIT reasons recorded — check failed_filters population)")
 
+    # exec_rr_min breakdown: which candidate type was the bottleneck
+    _rr_blocked = [d for d in _wait_decisions if "exec_rr_min" in d.get("failed_filters", [])]
+    if _rr_blocked:
+        import re as _re
+        _cand_fail_types: list = []
+        for d in _rr_blocked:
+            # Parse "Tried: 4h_structure=1.20R (rr_too_low); measured_move=0.80R (rr_too_low)"
+            for m in _re.finditer(r'(\w+)=([\d.]+)R \((\w+)\)', d.get("reason", "")):
+                _cand_fail_types.append(f"{m.group(1)}:{m.group(3)}")
+        if _cand_fail_types:
+            print(f"\n  ── exec_rr_min detail ({len(_rr_blocked)} blocks, MIN_RR={_sc.MIN_RR}) ──────────")
+            for ct, cnt in Counter(_cand_fail_types).most_common():
+                print(f"    {ct:<40} {cnt:>5}x")
+
     print(f"\n  Trade log:")
     for t in trades:
         r_sign   = "+" if t["r"] >= 0 else ""
