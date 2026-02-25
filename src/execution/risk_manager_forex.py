@@ -131,22 +131,39 @@ class ForexRiskManager:
                 return risk_pct
         return 25.0  # fallback
 
-    def get_risk_pct_with_dd(self, account_balance: float,
-                              peak_equity: Optional[float] = None) -> tuple[float, str]:
+    def get_risk_pct_with_dd(
+        self,
+        account_balance: float,
+        peak_equity: Optional[float] = None,
+        consecutive_losses: int = 0,
+    ) -> tuple[float, str]:
         """
-        Returns (final_risk_pct, reason_flag) with graduated drawdown caps applied.
+        Returns (final_risk_pct, reason_flag) with all four risk controls applied
+        in priority order:
 
-        DD ≥ DD_L2_PCT (25%) → cap at DD_L2_CAP (6%)   flag: DD_CAP_6
-        DD ≥ DD_L1_PCT (15%) → cap at DD_L1_CAP (10%)  flag: DD_CAP_10
-        Otherwise             → full tier risk           flag: ""
+          1. DD kill-switch  (DD ≥ 40%) → returns (0.0, "DD_KILLSWITCH")
+             Caller MUST treat 0.0 as "block entry entirely" — not a small bet.
+          2. DD graduated caps (15% → cap 10%, 25% → cap 6%)
+          3. Loss-streak brake (2 losses → cap 6%, 3+ losses → cap 3%)
+          4. Absolute dollar risk cap (prevents $ blowups at high equity)
 
-        Caps lift only when equity recovers above DD_RESUME_PCT (95%) of peak.
+        Final risk = min(base_tier, dd_cap, streak_cap, dollar_cap)
+
+        Caps lift only when equity recovers above DD_RESUME_PCT × peak.
         peak_equity defaults to self._peak_balance when not supplied.
         """
-        from src.strategy.forex.strategy_config import (DD_CIRCUIT_BREAKER_ENABLED,
-                                                         DD_L1_PCT, DD_L1_CAP,
-                                                         DD_L2_PCT, DD_L2_CAP,
-                                                         DD_RESUME_PCT)
+        from src.strategy.forex.strategy_config import (
+            DD_CIRCUIT_BREAKER_ENABLED,
+            DD_L1_PCT, DD_L1_CAP,
+            DD_L2_PCT, DD_L2_CAP,
+            DD_KILLSWITCH_PCT,
+            DD_RESUME_PCT,
+            DOLLAR_RISK_CAP_ENABLED, DOLLAR_RISK_TIERS,
+            LOSS_STREAK_BRAKE_ENABLED,
+            STREAK_L2_LOSSES, STREAK_L2_CAP,
+            STREAK_L3_LOSSES, STREAK_L3_CAP,
+        )
+
         base = self.get_risk_pct(account_balance)
 
         if not DD_CIRCUIT_BREAKER_ENABLED:
@@ -158,15 +175,49 @@ class ForexRiskManager:
 
         dd = (peak - account_balance) / peak   # 0.0 → 1.0
 
+        # ── 1. Kill-switch: hard block at ≥ 40% DD ────────────────────
+        if dd >= DD_KILLSWITCH_PCT / 100:
+            return 0.0, "DD_KILLSWITCH"
+
+        final_pct = base
+        flag      = ""
+
+        # ── 2. DD graduated caps ──────────────────────────────────────
         if dd >= DD_L2_PCT / 100:
-            capped = min(base, DD_L2_CAP)
-            return capped, "DD_CAP_6"
+            final_pct = min(final_pct, DD_L2_CAP)
+            flag = "DD_CAP_6"
+        elif dd >= DD_L1_PCT / 100:
+            final_pct = min(final_pct, DD_L1_CAP)
+            flag = "DD_CAP_10"
 
-        if dd >= DD_L1_PCT / 100:
-            capped = min(base, DD_L1_CAP)
-            return capped, "DD_CAP_10"
+        # ── 3. Loss-streak brake ──────────────────────────────────────
+        if LOSS_STREAK_BRAKE_ENABLED and consecutive_losses > 0:
+            if consecutive_losses >= STREAK_L3_LOSSES:
+                if final_pct > STREAK_L3_CAP:
+                    final_pct = STREAK_L3_CAP
+                    if not flag:
+                        flag = f"STREAK_CAP_{STREAK_L3_CAP:.0f}"
+            elif consecutive_losses >= STREAK_L2_LOSSES:
+                if final_pct > STREAK_L2_CAP:
+                    final_pct = STREAK_L2_CAP
+                    if not flag:
+                        flag = f"STREAK_CAP_{STREAK_L2_CAP:.0f}"
 
-        return base, ""
+        # ── 4. Absolute dollar risk cap ───────────────────────────────
+        if DOLLAR_RISK_CAP_ENABLED and account_balance > 0:
+            max_dollar: Optional[float] = None
+            for threshold, cap in DOLLAR_RISK_TIERS:
+                if account_balance < threshold:
+                    max_dollar = cap
+                    break
+            if max_dollar is not None:
+                max_pct_from_dollar = max_dollar / account_balance * 100
+                if max_pct_from_dollar < final_pct:
+                    final_pct = max_pct_from_dollar
+                    if not flag:
+                        flag = "DOLLAR_CAP"
+
+        return final_pct, flag or ""
 
     def get_tier_label(self, account_balance: float) -> str:
         # Note: use &lt; not < — these labels are sent via Telegram HTML parse mode

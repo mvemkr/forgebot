@@ -487,15 +487,19 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
     trades        = []
     all_decisions = []
     v1_decisions  = _load_v1_decisions()
+    consecutive_losses: int = 0     # streak counter: reset on win, incremented on loss
+    dd_killswitch_blocks: int = 0   # count of entries blocked by 40% DD killswitch
 
     def _risk_pct(bal):
         """DD-aware risk: applies graduated caps when equity is below peak."""
-        pct, _dd_flag = risk.get_risk_pct_with_dd(bal, peak_equity=peak_balance)
+        pct, _dd_flag = risk.get_risk_pct_with_dd(
+            bal, peak_equity=peak_balance, consecutive_losses=consecutive_losses)
         return pct
 
     def _risk_pct_with_flag(bal):
         """Returns (pct, dd_flag) — use for per-trade diagnostics."""
-        return risk.get_risk_pct_with_dd(bal, peak_equity=peak_balance)
+        return risk.get_risk_pct_with_dd(
+            bal, peak_equity=peak_balance, consecutive_losses=consecutive_losses)
 
     def _calc_units(pair, bal, rpct, entry, stop):
         pip    = 0.01 if "JPY" in pair else 0.0001
@@ -804,6 +808,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                     close_reason = ("weekend_proximity" if is_late_week
                                     else "target_reached")
                     risk_r = delta / risk_dist if risk_dist else 0
+                    consecutive_losses = 0   # target/weekend win resets streak
                     trades.append({
                         "pair":        pair,   "direction": direction,
                         "entry":       entry,  "exit":      close_price,
@@ -823,6 +828,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                         "mfe_r":        pos.get("mfe_r", 0.0),
                         "mae_r":        pos.get("mae_r", 0.0),
                         "dd_flag":      pos.get("dd_flag", ""),
+                        "streak_at_entry": pos.get("streak_at_entry", 0),
                         "target_1":     target,
                     })
                     r_sign   = "+" if risk_r >= 0 else ""
@@ -861,6 +867,12 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                     reason = "max_hold"
                 risk_r   = delta / risk_dist if risk_dist else 0
 
+                # ── Streak tracking ───────────────────────────────────
+                if risk_r < -0.10:   # definite loss
+                    consecutive_losses += 1
+                else:                # win or scratch → reset streak
+                    consecutive_losses = 0
+
                 trades.append({
                     "pair": pair, "direction": direction,
                     "entry": entry, "exit": exit_p,
@@ -878,6 +890,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                     "mfe_r":        pos.get("mfe_r", 0.0),
                     "mae_r":        pos.get("mae_r", 0.0),
                     "dd_flag":      pos.get("dd_flag", ""),
+                    "streak_at_entry": pos.get("streak_at_entry", 0),
                 })
 
                 r_sign = "+" if risk_r >= 0 else ""
@@ -1109,6 +1122,18 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                 continue
 
             _base_rpct, _dd_flag = _risk_pct_with_flag(balance)
+
+            # ── DD kill-switch: hard block at ≥ 40% DD ────────────────
+            if _dd_flag == "DD_KILLSWITCH":
+                dd_killswitch_blocks += 1
+                _dd_pct = (peak_balance - balance) / peak_balance * 100 if peak_balance else 0
+                log_gap(ts_utc, pair, decision.direction.upper(), "BLOCKED",
+                        "dd_killswitch",
+                        f"DD {_dd_pct:.1f}% ≥ {_sc.DD_KILLSWITCH_PCT:.0f}% kill-switch — "
+                        f"no new entries until equity recovers above "
+                        f"{_sc.DD_RESUME_PCT*100:.0f}% of peak (${peak_balance:,.0f})")
+                continue
+
             rpct = _base_rpct
             if _is_theme_pair and active_theme:
                 rpct = rpct * active_theme.position_fraction
@@ -1144,6 +1169,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                 "be_moved":     False,
                 "trail_max":    decision.entry_price,   # running max-favourable price for ratchet
                 "trail_locked": False,                  # True after stage-1 lock fires (Arm C)
+                "streak_at_entry": consecutive_losses,  # for per-trade risk audit
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
                 "target_price": _target,
                 "target_type":  decision.exec_target_type,
@@ -1327,11 +1353,38 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             print(f"    Stop pips:  min={_sp_vals[0]:.0f}p  p50={_sp_vals[len(_sp_vals)//2]:.0f}p  "
                   f"p90={_sp_vals[int(len(_sp_vals)*0.9)]:.0f}p  max={_sp_vals[-1]:.0f}p")
 
+    print(f"\n  ── Risk controls summary ──────────────────────────────")
+    # Dollar loss range
+    _losses_dollar = sorted([t["pnl"] for t in trades if t["pnl"] < 0])
+    _max_dollar_loss = _losses_dollar[0] if _losses_dollar else 0.0
+    print(f"    Max single-trade $ loss: ${_max_dollar_loss:,.2f}")
+    print(f"    Avg loss $:              ${sum(_losses_dollar)/len(_losses_dollar):,.2f}"
+          if _losses_dollar else "    Avg loss $:              n/a")
+
+    # DD killswitch
+    if dd_killswitch_blocks > 0:
+        print(f"    DD_KILLSWITCH blocks:    {dd_killswitch_blocks}  "
+              f"(≥{_sc.DD_KILLSWITCH_PCT:.0f}% DD — entries hard-blocked)")
+    else:
+        print(f"    DD_KILLSWITCH blocks:    0  (40% threshold never breached)")
+
+    # DD caps on entered trades
     if _dd_cap_trades:
-        print(f"\n  ── DD circuit breaker applied ─────────────────────────")
         _cap_counts = Counter(t["dd_flag"] for t in _dd_cap_trades)
-        for flag, cnt in _cap_counts.items():
-            print(f"    {flag}: {cnt} trade(s) affected")
+        for flag, cnt in sorted(_cap_counts.items()):
+            print(f"    {flag}: {cnt} trade(s) entered at reduced risk")
+
+    # Loss streak at entry distribution
+    _streak_vals = [t.get("streak_at_entry", 0) for t in trades]
+    _streak_counts = Counter(_streak_vals)
+    _streak_capped = sum(1 for v in _streak_vals if v >= 2)
+    if max(_streak_vals, default=0) > 0:
+        print(f"    Loss-streak distribution at entry:")
+        for s in sorted(_streak_counts):
+            label = "" if s < 2 else f" ← streak cap {'6%' if s < 3 else '3%'}"
+            print(f"      streak={s}: {_streak_counts[s]} trade(s){label}")
+        if _streak_capped:
+            print(f"    Entries affected by streak brake: {_streak_capped}")
 
     # ── Funnel: rejection reasons from WAIT decisions ─────────────────
     _wait_decisions = [d for d in all_decisions if d.get("decision") == "WAIT"]
@@ -1527,12 +1580,14 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         "best_r":        max((t["r"] for t in trades), default=0),
         "avg_r_win":     sum(t["r"] for t in _wins)   / len(_wins)   if _wins   else 0,
         "avg_r_loss":    sum(t["r"] for t in _losses) / len(_losses) if _losses else 0,
-        "n_target":      _ec.get("target_reached", 0) + _ec.get("weekend_proximity", 0),
-        "n_ratchet":     _ec.get("ratchet_stop_hit", 0),
-        "n_sl":          _ec.get("stop_hit", 0),
-        "exec_rr_p50":   _rrs[len(_rrs) // 2] if _rrs else 0,
-        "max_dd":        _max_dd_pct,
-        "ret_pct":       (balance - starting_bal) / starting_bal * 100,
+        "n_target":              _ec.get("target_reached", 0) + _ec.get("weekend_proximity", 0),
+        "n_ratchet":             _ec.get("ratchet_stop_hit", 0),
+        "n_sl":                  _ec.get("stop_hit", 0),
+        "exec_rr_p50":           _rrs[len(_rrs) // 2] if _rrs else 0,
+        "max_dd":                _max_dd_pct,
+        "ret_pct":               (balance - starting_bal) / starting_bal * 100,
+        "dd_killswitch_blocks":  dd_killswitch_blocks,
+        "max_dollar_loss":       min((t["pnl"] for t in trades), default=0.0),
     }
 
 
@@ -1700,6 +1755,8 @@ Examples:
         _row("Ratchet stops", "n_ratchet",      lambda x: str(x))
         _row("Stop hits",     "n_sl",           lambda x: str(x))
         _row("Exec RR p50",   "exec_rr_p50",    lambda x: f"{x:.1f}R")
-        _row("Max DD",        "max_dd",         lambda x: f"{x:.1f}%")
-        _row("Return",        "ret_pct",        lambda x: f"{x:+.1f}%")
+        _row("Max DD",             "max_dd",                lambda x: f"{x:.1f}%")
+        _row("Return",             "ret_pct",               lambda x: f"{x:+.1f}%")
+        _row("Kill-switch blocks", "dd_killswitch_blocks",  lambda x: str(x))
+        _row("Max $ loss",         "max_dollar_loss",       lambda x: f"${x:,.0f}")
         print(f"{'='*75}")

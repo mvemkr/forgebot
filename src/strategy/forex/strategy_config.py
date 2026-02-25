@@ -306,6 +306,40 @@ DD_L2_PCT: float = 25.0    # second cap threshold (harder brake)
 DD_L2_CAP: float = 6.0     # max risk % when DD ≥ L2
 DD_RESUME_PCT: float = 0.95 # equity must recover to 95% of peak to lift the cap
 
+# ── DD Kill-switch (hard block, not just throttle) ────────────────────────
+# When DD ≥ DD_KILLSWITCH_PCT from peak, get_risk_pct_with_dd() returns
+# (0.0, "DD_KILLSWITCH") — the caller MUST block the new entry entirely.
+# This is deterministic: any call after breaching this threshold is blocked
+# until equity recovers above DD_RESUME_PCT × peak.
+DD_KILLSWITCH_PCT: float = 40.0   # hard no-new-entries threshold
+
+# ── Absolute dollar risk cap ─────────────────────────────────────────────
+# Prevents "same % → much bigger $ at high equity" compounding blowups.
+# Applied after all % caps: final_pct = min(final_pct, max_dollar/balance×100)
+# Format: list of (equity_threshold, max_dollar_risk) — last entry is the cap
+# for any equity above the previous threshold.
+#   equity < $25K  → no dollar cap (% caps are sufficient)
+#   $25K–$100K     → cap at $2,500 per trade
+#   > $100K        → cap at $5,000 per trade
+DOLLAR_RISK_CAP_ENABLED: bool = True
+DOLLAR_RISK_TIERS: list = [
+    (25_000,       None),    # below $25K: no dollar cap, % tiers dominate
+    (100_000,      2_500),   # $25K–$100K: max $2,500 at risk per trade
+    (float("inf"), 5_000),   # > $100K: max $5,000 at risk per trade
+]
+
+# ── Loss-streak brake ─────────────────────────────────────────────────────
+# After N consecutive losses, cap risk until a win resets the streak.
+# Targets the variance tail: 4+ loss clusters compound badly at high equity.
+#   2 consecutive losses → cap at STREAK_L2_CAP (6%)
+#   3+ consecutive losses → cap at STREAK_L3_CAP (3%)
+# Streak resets on any winning trade.  Applied AFTER DD caps.
+LOSS_STREAK_BRAKE_ENABLED: bool = True
+STREAK_L2_LOSSES: int   = 2     # streak length for L2 brake
+STREAK_L2_CAP:    float = 6.0   # cap at 6% after 2 consecutive losses
+STREAK_L3_LOSSES: int   = 3     # streak length for L3 brake
+STREAK_L3_CAP:    float = 3.0   # cap at 3% after 3+ consecutive losses
+
 # ── One-way ratchet trailing stop ─────────────────────────────────────────
 # Option B: replaces hard breakeven lock at 1:1.
 # When price moves TRAIL_ACTIVATE_R in our favour, the stop trails
