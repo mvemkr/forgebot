@@ -257,29 +257,49 @@ def get_structure_stop(
             })
 
     # ── Build candidate list ──────────────────────────────────────────────────
-    anchor = pattern.stop_anchor
+    anchor   = pattern.stop_anchor
+    neckline = pattern.neckline
 
     if anchor is not None:
         if "break_retest" in pattern_type:
-            # Preferred: actual retest rejection swing extreme from 1H data
+            # Break/retest: entry is at neckline retest.
+            # Stop = retest rejection bar high/low near the neckline + buffer.
             retest_ext = _find_retest_rejection_extreme(df_1h, direction, anchor)
             if retest_ext is not None:
                 candidates.append((
                     retest_ext + buf if direction == "short" else retest_ext - buf,
                     "retest_swing",
                 ))
-            # Fallback: broken level + buffer (always available when anchor is set)
+            # Fallback: broken level + buffer
             candidates.append((
                 anchor + buf if direction == "short" else anchor - buf,
                 "broken_level",
             ))
+
+        elif "head_and_shoulders" in pattern_type:
+            # H&S / IH&S: entry is at the NECKLINE RETEST (not at the shoulder).
+            # Alex's stop goes just above/below the retest rejection bar near
+            # the neckline — NOT at the right shoulder which can be 100-200p away.
+            # Two candidates (tightest wins):
+            #   1. Retest rejection bar extreme near neckline (preferred — Alex's method)
+            #   2. Right shoulder anchor + buf (structural fallback if no retest bar found)
+            retest_ext = _find_retest_rejection_extreme(df_1h, direction, neckline)
+            if retest_ext is not None:
+                candidates.append((
+                    retest_ext + buf if direction == "short" else retest_ext - buf,
+                    "neckline_retest_swing",
+                ))
+            # Right shoulder as secondary (often farther, but correctly structural)
+            candidates.append((
+                anchor + buf if direction == "short" else anchor - buf,
+                "shoulder_anchor",
+            ))
+
         else:
-            # H&S: right shoulder extreme
-            # IH&S: right shoulder low
-            # DT: highest peak
-            # DB: lowest trough
-            # CB: range boundary
-            # Sweep: wick extreme
+            # DT: second peak high + buf  → stop above the actual peak
+            # DB: second trough low + buf → stop below the actual trough
+            # CB: range boundary + buf
+            # Sweep: wick extreme + buf
             candidates.append((
                 anchor + buf if direction == "short" else anchor - buf,
                 "structural_anchor",
