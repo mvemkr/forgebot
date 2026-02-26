@@ -828,7 +828,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                         "mfe_r":        pos.get("mfe_r", 0.0),
                         "mae_r":        pos.get("mae_r", 0.0),
                         "dd_flag":      pos.get("dd_flag", ""),
-                        "streak_at_entry": pos.get("streak_at_entry", 0),
+                        "streak_at_entry":    pos.get("streak_at_entry", 0),
+                        "entry_equity":       pos.get("entry_equity", 0),
+                        "final_risk_pct":     pos.get("final_risk_pct", 0),
+                        "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
                         "target_1":     target,
                     })
                     r_sign   = "+" if risk_r >= 0 else ""
@@ -890,7 +893,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                     "mfe_r":        pos.get("mfe_r", 0.0),
                     "mae_r":        pos.get("mae_r", 0.0),
                     "dd_flag":      pos.get("dd_flag", ""),
-                    "streak_at_entry": pos.get("streak_at_entry", 0),
+                    "streak_at_entry":    pos.get("streak_at_entry", 0),
+                    "entry_equity":       pos.get("entry_equity", 0),
+                    "final_risk_pct":     pos.get("final_risk_pct", 0),
+                    "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
                 })
 
                 r_sign = "+" if risk_r >= 0 else ""
@@ -1176,8 +1182,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                 "stop_type":    decision.stop_type,
                 "initial_risk": abs(decision.entry_price - decision.stop_loss),
                 "initial_stop_pips": decision.initial_stop_pips,
-                "base_risk_pct": _base_rpct,
-                "dd_flag":       _dd_flag,
+                "base_risk_pct":     _base_rpct,
+                "final_risk_pct":    rpct,
+                "entry_equity":      balance,
+                "entry_risk_dollars": balance * rpct / 100,
+                "dd_flag":           _dd_flag,
                 "signal_type":   (decision.entry_signal.signal_type
                                   if decision.entry_signal else "unknown"),
                 "planned_rr":    decision.exec_rr,
@@ -1385,6 +1394,38 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             print(f"      streak={s}: {_streak_counts[s]} trade(s){label}")
         if _streak_capped:
             print(f"    Entries affected by streak brake: {_streak_capped}")
+
+    # ── 1R audit: stop_hit trades ── prove abs(pnl) ≈ entry_risk_dollars ─────
+    # Mathematical proof (JPY included): units = risk_usd/dist, pnl = dist×units = risk_usd
+    # Sizing errors and P&L conversion errors cancel exactly for all pair types.
+    # Any overrun > 1% indicates a sizing/P&L mismatch in the code.
+    _sh_trades = [t for t in trades if t.get("reason") in ("stop_hit",)
+                  and t.get("entry_risk_dollars", 0) > 0]
+    if _sh_trades:
+        print(f"\n  ── 1R audit (stop_hit trades) ──────────────────────────")
+        _overruns = []
+        for t in _sh_trades:
+            expected = t["entry_risk_dollars"]
+            actual   = abs(t["pnl"])
+            overrun  = actual - expected
+            overrun_pct = overrun / expected * 100 if expected else 0
+            _overruns.append((overrun_pct, t))
+        _max_op, _max_ot = max(_overruns, key=lambda x: abs(x[0]))
+        _clean = all(abs(op) < 2.0 for op, _ in _overruns)
+        print(f"    Stop-hit count:    {len(_sh_trades)}")
+        print(f"    All within ±2%:    {'✅ YES' if _clean else '❌ NO — check sizing!'}")
+        if not _clean:
+            for op, t in sorted(_overruns, key=lambda x: -abs(x[0]))[:5]:
+                print(f"      {t['pair']} {t['direction']} {t['entry_ts'][:10]}: "
+                      f"expected ${t['entry_risk_dollars']:,.0f}  "
+                      f"actual ${abs(t['pnl']):,.0f}  overrun={op:+.1f}%")
+        print(f"    Max overrun:       {_max_op:+.1f}%  "
+              f"({_max_ot['pair']} {_max_ot['entry_ts'][:10]}: "
+              f"expected ${_max_ot['entry_risk_dollars']:,.0f}  "
+              f"actual ${abs(_max_ot['pnl']):,.0f}  "
+              f"equity@entry ${_max_ot.get('entry_equity',0):,.0f}  "
+              f"rpct={_max_ot.get('final_risk_pct',0):.2f}%  "
+              f"dd_flag={_max_ot.get('dd_flag','')!r})")
 
     # ── Funnel: rejection reasons from WAIT decisions ─────────────────
     _wait_decisions = [d for d in all_decisions if d.get("decision") == "WAIT"]
