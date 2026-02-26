@@ -65,13 +65,16 @@ class BacktestResult:
     exec_rr_p50:     float = 0.0   # median planned RR of entered trades
     max_dollar_loss: float = 0.0
 
-    # ── Gate hit counts (all 6 Alex rules) ──────────────────────────────
+    # ── Gate hit counts (all 6 Alex rules + adaptive) ───────────────────
     time_blocks:              int = 0   # NO_SUNDAY + NO_THU_FRI
     countertrend_htf_blocks:  int = 0   # COUNTERTREND_HTF
     weekly_limit_blocks:      int = 0   # WEEKLY_TRADE_LIMIT
     min_rr_small_blocks:      int = 0   # MIN_RR_SMALL_ACCOUNT
     indecision_doji_blocks:   int = 0   # INDECISION_DOJI
     dd_killswitch_blocks:     int = 0   # DD kill-switch blocks
+    adaptive_time_blocks:     int = 0   # ADAPTIVE_TIME_GATE (regime-gated Thu/Fri)
+    strict_htf_blocks:        int = 0   # STRICT_PROTREND_HTF (all 3 must agree)
+    dyn_pip_eq_blocks:        int = 0   # DYN_PIP_EQUITY (stop_pips × MIN_RR)
 
     # ── Regime score analytics ───────────────────────────────────────────
     regime_avg:          float = 0.0

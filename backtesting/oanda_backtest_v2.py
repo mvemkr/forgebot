@@ -36,8 +36,11 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from collections import Counter
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Optional, Dict, List
+import pytz
+
+_ET_TZ = pytz.timezone("America/New_York")   # for adaptive Thu/Fri gate
 
 # ── Real strategy imports ─────────────────────────────────────────────────────
 from src.exchange.oanda_client import OandaClient, INSTRUMENT_MAP
@@ -484,7 +487,12 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  trail_arm_key: str = "",
                  preloaded_candle_data: Optional[dict] = None,
                  use_cache: bool = True,
-                 quiet: bool = False):
+                 quiet: bool = False,
+                 adaptive_gates: bool = False,
+                 adaptive_threshold: float = 0.5,
+                 policy_tag: str = "",
+                 strict_protrend_htf: bool = False,
+                 dynamic_pip_equity: bool = False):
     """Run a single backtest simulation.
 
     quiet=True suppresses all stdout (useful when called from compare scripts).
@@ -509,6 +517,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             start_dt=start_dt, end_dt=end_dt, starting_bal=starting_bal,
             notes=notes, trail_cfg=trail_cfg, trail_arm_key=trail_arm_key,
             preloaded_candle_data=preloaded_candle_data, use_cache=use_cache,
+            adaptive_gates=adaptive_gates, adaptive_threshold=adaptive_threshold,
+            policy_tag=policy_tag,
+            strict_protrend_htf=strict_protrend_htf,
+            dynamic_pip_equity=dynamic_pip_equity,
         )
     finally:
         _sys.stdout = _orig_stdout
@@ -519,7 +531,12 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                        trail_cfg: Optional[dict] = None,
                        trail_arm_key: str = "",
                        preloaded_candle_data: Optional[dict] = None,
-                       use_cache: bool = True):
+                       use_cache: bool = True,
+                       adaptive_gates: bool = False,
+                       adaptive_threshold: float = 0.5,
+                       policy_tag: str = "",
+                       strict_protrend_htf: bool = False,
+                       dynamic_pip_equity: bool = False):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     # Extend data fetch so open positions can run to natural close after the entry window.
     # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
@@ -748,6 +765,9 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _weekly_trade_counts:   dict = {}  # {(iso_year, iso_week): count} — opened trades
     _weekly_limit_blocks:   int  = 0   # blocked by MAX_TRADES_PER_WEEK
     _min_rr_small_blocks:   int  = 0   # blocked by MIN_RR_ALIGN (non-protrend)
+    _adaptive_time_blocks:  int  = 0   # blocked by adaptive Thu/Fri regime gate
+    _strict_htf_blocks:     int  = 0   # blocked by strict protrend HTF gate (all 3 must agree)
+    _dyn_pip_eq_blocks:     int  = 0   # blocked by dynamic pip equity (stop_pips × MIN_RR)
     _countertrend_htf_blocks: int = 0  # blocked by COUNTERTREND_HTF filter
     _time_block_counts:     dict = {}  # {reason_code: count} — Sunday/Thu/Fri blocks
 
@@ -1405,6 +1425,20 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         f"setup too small to consume a slot")
                 continue
 
+            # Dynamic pip equity gate (STRICT_PROTREND):
+            # Threshold = stop_pips × MIN_RR — ensures the setup's reward potential
+            # in pips equals at least the required R multiple of the actual risk.
+            # This is a higher bar than the fixed 100p floor when stops are wide.
+            if dynamic_pip_equity and not _is_theme_pair and not _is_cb_pattern:
+                _stop_pips_entry = getattr(decision, "initial_stop_pips", 0.0) or 0.0
+                _dyn_pe_thresh   = _stop_pips_entry * _sc.MIN_RR
+                if _stop_pips_entry > 0 and pe < _dyn_pe_thresh:
+                    _dyn_pip_eq_blocks += 1
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "DYN_PIP_EQUITY",
+                            f"Pip equity {pe:.0f}p < stop({_stop_pips_entry:.0f}p) "
+                            f"× MIN_RR({_sc.MIN_RR:.1f}) = {_dyn_pe_thresh:.0f}p threshold")
+                    continue
+
             # Re-check eligibility — earlier entries this bar may have changed
             # slot counts; also runs theme contradiction gate (needs direction)
             eligible, elig_reason2 = _entry_eligible(pair, active_theme,
@@ -1472,6 +1506,66 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         _wk_reason + f" (ISO {_iso_key[0]}-W{_iso_key[1]:02d})")
                 continue
 
+            # ── Gate 3 (adaptive): regime-gated Thu/Fri block + weekly cap ──
+            # When adaptive_gates=True the session filter does NOT block Thu PM / Fri
+            # at strategy eval time (NO_THU_FRI_TRADES_ENABLED=False).  Instead we
+            # compute regime_score here and apply the time/weekly gate conditionally:
+            #   • Thu PM or Fri AND regime_score < adaptive_threshold  →  block
+            #   • Weekly cap = 2 if regime_score ≥ 0.65, else 1 (regardless of balance)
+            # This skips poor-regime entries at the end of the week, but allows
+            # high-conviction setups through even on Thursday/Friday.
+            _rs_early = None   # will hold early RegimeScore when adaptive_gates=True
+            if adaptive_gates:
+                _h4_sl = {
+                    _p: candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]
+                    for _p in candle_data
+                    if candle_data[_p].get("4h") is not None
+                    and len(candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]) >= 20
+                }
+                _rs_early = compute_regime_score(
+                    df_h4=hist_4h, recent_trades=trades, h4_slices=_h4_sl,
+                )
+                _et_bar = ts_utc.astimezone(_ET_TZ)
+                _is_thu_pm = _et_bar.weekday() == 3 and _et_bar.hour > 9
+                _is_fri    = _et_bar.weekday() == 4
+                if (_is_thu_pm or _is_fri) and _rs_early.total < adaptive_threshold:
+                    _adaptive_time_blocks += 1
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "ADAPTIVE_TIME_GATE",
+                            f"Thu PM/Fri AND regime_score={_rs_early.total:.2f} < "
+                            f"{adaptive_threshold:.2f} — below quality threshold")
+                    continue
+                # Adaptive weekly cap: relax to 2/wk when regime is strong
+                _adaptive_wk_cap = 2 if _rs_early.total >= 0.65 else 1
+                _iso_key_adp = ts_utc.isocalendar()[:2]
+                if _weekly_trade_counts.get(_iso_key_adp, 0) >= _adaptive_wk_cap:
+                    _weekly_limit_blocks += 1
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "ADAPTIVE_WEEKLY_CAP",
+                            f"weekly cap={_adaptive_wk_cap} (regime={_rs_early.total:.2f}) "
+                            f"already used ISO {_iso_key_adp[0]}-W{_iso_key_adp[1]:02d}")
+                    continue
+
+            # ── Gate 4 (strict_protrend): ALL three HTFs must agree with direction ──
+            # Stricter than REQUIRE_HTF_TREND_ALIGNMENT (which only blocks when all 3
+            # oppose).  This gate blocks any trade where W, D, and 4H are NOT all
+            # explicitly aligned with the trade direction — mixed signals blocked too.
+            if strict_protrend_htf:
+                _sp_htf = alex_policy.htf_aligned(
+                    decision.direction or "",
+                    decision.trend_weekly,
+                    decision.trend_daily,
+                    decision.trend_4h,
+                )
+                if _sp_htf is not True:
+                    _strict_htf_blocks += 1
+                    _sp_reason = (
+                        "HTF unknown (missing trend data)"
+                        if _sp_htf is None
+                        else f"W/D/4H not all {decision.direction} — strict protrend required"
+                    )
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "STRICT_PROTREND_HTF",
+                            f"{_sp_reason} (direction={decision.direction})")
+                    continue
+
             strat = strategies[pair]
 
             # ── Target: use exec_target from strategy (single source of truth) ──
@@ -1490,17 +1584,21 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             # ── Regime score at entry ─────────────────────────────────────
             # Compute once at entry (cheap: ~17 times in Alex window).
             # All 4 components use data already loaded; no new OANDA calls.
-            _h4_slices_rs = {
-                _p: candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]
-                for _p in candle_data
-                if candle_data[_p].get("4h") is not None
-                and len(candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]) >= 20
-            }
-            _rs = compute_regime_score(
-                df_h4        = hist_4h,
-                recent_trades = trades,          # closed trades so far
-                h4_slices    = _h4_slices_rs,
-            )
+            # If adaptive_gates=True we already computed _rs_early above — reuse it.
+            if _rs_early is not None:
+                _rs = _rs_early   # reuse from adaptive gate (avoid double compute)
+            else:
+                _h4_slices_rs = {
+                    _p: candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]
+                    for _p in candle_data
+                    if candle_data[_p].get("4h") is not None
+                    and len(candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]) >= 20
+                }
+                _rs = compute_regime_score(
+                    df_h4        = hist_4h,
+                    recent_trades = trades,      # closed trades so far
+                    h4_slices    = _h4_slices_rs,
+                )
 
             open_pos[pair] = {
                 "entry_price":  decision.entry_price,
@@ -1967,7 +2065,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         # Always a list[str] — never contains dicts or None (defensive str() cast
         # inside get_model_tags guarantees this).
         "model_tags":   _sc.get_model_tags(trail_arm=trail_arm_key or "?",
-                                           pairs_hash=_pairs_hash),
+                                           pairs_hash=_pairs_hash)
+                        + ([f"policy={policy_tag}"] if policy_tag else []),
         "trail_arm":    trail_arm_key or "?",
         "pairs":        _active_pairs,
         "pairs_hash":   _pairs_hash,
@@ -2000,6 +2099,12 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             "MIN_RR_ALIGN":              _sc.MIN_RR_SMALL_ACCOUNT,
             "MIN_RR_STANDARD":                   _sc.MIN_RR_STANDARD,
             "INDECISION_FILTER_ENABLED":         _sc.INDECISION_FILTER_ENABLED,
+            # Extra run_backtest param gates (not in strategy_config)
+            "adaptive_gates":                    adaptive_gates,
+            "adaptive_threshold":                adaptive_threshold,
+            "strict_protrend_htf":               strict_protrend_htf,
+            "dynamic_pip_equity":                dynamic_pip_equity,
+            "policy_tag":                        policy_tag,
         },
         "results": {
             "n_trades":   len(trades),
@@ -2083,13 +2188,16 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         n_sl           = _ec.get("stop_hit", 0),
         exec_rr_p50    = _rrs[len(_rrs) // 2] if _rrs else 0,
         max_dollar_loss= min((t["pnl"] for t in trades), default=0.0),
-        # ── Gate hit counts (all 6 Alex rules) ───────────────────────
+        # ── Gate hit counts (all 6 Alex rules + adaptive) ────────────
         time_blocks              = _time_block_n,
         countertrend_htf_blocks  = _htf_block_n,
         weekly_limit_blocks      = _weekly_limit_blocks,
         min_rr_small_blocks      = _min_rr_small_blocks,
         indecision_doji_blocks   = _indes_block_n,
         dd_killswitch_blocks     = dd_killswitch_blocks,
+        adaptive_time_blocks     = _adaptive_time_blocks,
+        strict_htf_blocks        = _strict_htf_blocks,
+        dyn_pip_eq_blocks        = _dyn_pip_eq_blocks,
         # ── Regime analytics ─────────────────────────────────────────
         regime_scores      = _regime_scores,
         regime_avg         = sum(_regime_scores) / len(_regime_scores) if _regime_scores else 0.0,
