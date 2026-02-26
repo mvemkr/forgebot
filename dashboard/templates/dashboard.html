@@ -116,6 +116,32 @@
   </button>
 </div>
 
+<!-- ── WHY NOT TRADING? BANNER ───────────────────────────── -->
+<!-- Priority: kill-switch → session blocked → no setups. Paused has its own banner above. -->
+<div x-show="!state.paused && botOnline && state.dd_flag === 'DD_KILLSWITCH'"
+     class="alert alert-error rounded-none">
+  <i class="ph ph-skull ph-bold text-xl"></i>
+  <span>🛑 <strong>KILL-SWITCH ACTIVE</strong> — DD ≥ 40%. All new entries blocked until equity recovers.</span>
+</div>
+
+<div x-show="!state.paused && botOnline && state.dd_flag !== 'DD_KILLSWITCH' && !state.session_allowed"
+     class="alert alert-info rounded-none">
+  <i class="ph ph-clock ph-bold text-xl"></i>
+  <span>
+    🕐 <strong>SESSION CLOSED</strong> —
+    <span x-text="state.session_reason || 'Outside London/NY window'"></span>.
+    <span x-show="state.next_session_mins > 0">
+      Next <strong x-text="state.next_session || 'London'"></strong> open in
+      <strong x-text="state.next_session_mins >= 60
+        ? Math.floor(state.next_session_mins/60) + 'h ' + (state.next_session_mins%60) + 'm'
+        : state.next_session_mins + 'm'"></strong>.
+    </span>
+    <span x-show="state.next_session_mins === 0 && !state.session_allowed" class="ml-1 opacity-70">
+      (calculating…)
+    </span>
+  </span>
+</div>
+
 <!-- ── TAB NAV ────────────────────────────────────────────── -->
 <div class="px-6 pt-4 border-b border-base-300 bg-base-200 flex gap-1">
   <button @click="activeTab='live'"
@@ -973,7 +999,7 @@ function dashboard() {
           'tier_label','total_pnl','total_trades','win_rate','account_balance',
           'pattern_memory_count','regroup_ends',
           'last_scan_ts','last_decision_ts','last_state_write_ts','engine_sha',
-          'peak_source'];
+          'peak_source','session_allowed','session_reason','next_session','next_session_mins'];
         this.state = { ...(status.heartbeat || {}) };
         for (const k of _topFields) {
           if (status[k] !== undefined) this.state[k] = status[k];

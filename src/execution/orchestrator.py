@@ -1014,11 +1014,12 @@ class ForexOrchestrator:
         """Save full bot state to disk — dashboard reads this."""
         try:
             self._refresh_consecutive_losses()
-            risk_status = self.risk.status(
+            risk_status  = self.risk.status(
                 self.account_balance,
                 consecutive_losses=self._consecutive_losses,
                 dry_run=self.dry_run,
             )
+            session_info = self._session_status()
             self.state.save(
                 account_balance  = self.account_balance,
                 dry_run          = self.dry_run,
@@ -1046,6 +1047,10 @@ class ForexOrchestrator:
                     "paused":              risk_status["paused"],
                     "paused_since":        risk_status["paused_since"],
                     "peak_source":         risk_status["peak_source"],
+                    "session_allowed":     session_info["session_allowed"],
+                    "session_reason":      session_info["session_reason"],
+                    "next_session":        session_info["next_session"],
+                    "next_session_mins":   session_info["next_session_mins"],
                     "traded_pattern_keys": list(self.strategy.traded_patterns.keys()),
                 },
             )
@@ -1054,13 +1059,30 @@ class ForexOrchestrator:
 
     # ── Heartbeat ─────────────────────────────────────────────────────
 
+    def _session_status(self) -> dict:
+        """Current session block status + minutes to next valid entry window."""
+        try:
+            sf = self.strategy.session_filter
+            now = datetime.now(timezone.utc)
+            allowed, reason = sf.is_entry_allowed(now)
+            next_session, mins_until = sf.next_entry_window(now)
+            return {
+                "session_allowed":     allowed,
+                "session_reason":      reason if not allowed else "",
+                "next_session":        next_session,
+                "next_session_mins":   mins_until,
+            }
+        except Exception:
+            return {"session_allowed": True, "session_reason": "", "next_session": "", "next_session_mins": 0}
+
     def _write_heartbeat(self, status: str = "ok"):
         try:
-            risk_status = self.risk.status(
+            risk_status   = self.risk.status(
                 self.account_balance,
                 consecutive_losses=self._consecutive_losses,
                 dry_run=self.dry_run,
             )
+            session_info  = self._session_status()
             HEARTBEAT_FILE.write_text(json.dumps({
                 "timestamp":          datetime.now(timezone.utc).isoformat(),
                 "status":             status,
@@ -1077,8 +1099,12 @@ class ForexOrchestrator:
                 "tier":               risk_status["tier_label"],
                 "drawdown_pct":       risk_status["drawdown_pct"],
                 "peak_balance":       risk_status["peak_balance"],
-                "regroup_ends":       risk_status["regroup_ends"],
-                "dry_run":            self.dry_run,
+                "regroup_ends":        risk_status["regroup_ends"],
+                "dry_run":             self.dry_run,
+                "session_allowed":     session_info["session_allowed"],
+                "session_reason":      session_info["session_reason"],
+                "next_session":        session_info["next_session"],
+                "next_session_mins":   session_info["next_session_mins"],
             }, indent=2))
         except Exception:
             pass
