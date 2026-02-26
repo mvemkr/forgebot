@@ -647,13 +647,17 @@ class SetAndForgetStrategy:
         # ─────────────────────────────────────────────
         entry_allowed, session_reason = self.session_filter.is_entry_allowed(current_dt)
         if not entry_allowed:
+            # Use the specific reason code prefix (before ": ") so the
+            # backtester's time-block counter can match "NO_THU_FRI_TRADES",
+            # "NO_SUNDAY_TRADES", "MONDAY_WICK_GUARD", "LOW_QUALITY_SESSION".
+            _session_code = session_reason.split(":")[0].strip()
             return TradeDecision(
                 decision=Decision.BLOCKED,
                 pair=pair,
                 direction=None,
                 reason=f"Session blocked: {session_reason}",
                 confidence=0.0,
-                failed_filters=["session"],
+                failed_filters=[_session_code],
             )
 
         session, session_quality = self.session_filter.session_quality(current_dt)

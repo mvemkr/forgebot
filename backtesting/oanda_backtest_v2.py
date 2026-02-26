@@ -747,7 +747,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     # ── Alex small-account gate counters ───────────────────────────────────
     _weekly_trade_counts:   dict = {}  # {(iso_year, iso_week): count} — opened trades
     _weekly_limit_blocks:   int  = 0   # blocked by MAX_TRADES_PER_WEEK
-    _min_rr_small_blocks:   int  = 0   # blocked by MIN_RR_SMALL_ACCOUNT
+    _min_rr_small_blocks:   int  = 0   # blocked by MIN_RR_ALIGN (non-protrend)
     _countertrend_htf_blocks: int = 0  # blocked by COUNTERTREND_HTF filter
     _time_block_counts:     dict = {}  # {reason_code: count} — Sunday/Thu/Fri blocks
 
@@ -1442,13 +1442,22 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             # Parity note: live orchestrator calls the same functions from
             # src/strategy/forex/alex_policy.py — single source of truth.
 
-            # Gate 1: Dynamic MIN_RR — stricter when equity < $25K
+            # Gate 1: Alignment-based MIN_RR
+            # Pro-trend (W+D+4H all agree) → 2.5R; non-protrend/mixed → 3.0R
+            _htf_aligned_flag = alex_policy.htf_aligned(
+                decision.direction or "",
+                decision.trend_weekly,
+                decision.trend_daily,
+                decision.trend_4h,
+            )
             _rr_blocked, _rr_reason = alex_policy.check_dynamic_min_rr(
-                decision.exec_rr, balance
+                decision.exec_rr,
+                htf_aligned_flag=_htf_aligned_flag,
+                balance=balance,
             )
             if _rr_blocked:
                 _min_rr_small_blocks += 1
-                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "MIN_RR_SMALL_ACCOUNT",
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "MIN_RR_ALIGN",
                         _rr_reason)
                 continue
 
@@ -1810,7 +1819,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
 
     # ── Alex small-account rules summary ──────────────────────────────────
     print(f"\n  ── Alex small-account rules ─────────────────────────────────")
-    print(f"    MIN_RR blocks (exec_rr < {_sc.MIN_RR_SMALL_ACCOUNT}R when <$25K): {_min_rr_small_blocks}x")
+    print(f"    MIN_RR_ALIGN blocks (non-protrend/mixed → 3.0R, protrend → 2.5R): {_min_rr_small_blocks}x")
     print(f"    Weekly limit blocks (punch-card):                {_weekly_limit_blocks}x")
     # Extract time blocks and HTF blocks from all_decisions
     _all_blocked  = [d for d in all_decisions if d.get("decision") == "BLOCKED"]
@@ -1827,7 +1836,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                          if f == "INDECISION_DOJI")
     _gap_blocks    = [d for d in all_decisions if d.get("event") == "GAP"]
     _gap_weekly    = sum(1 for d in _gap_blocks if d.get("gap_type","") == "WEEKLY_TRADE_LIMIT")
-    _gap_rr_sm     = sum(1 for d in _gap_blocks if d.get("gap_type","") == "MIN_RR_SMALL_ACCOUNT")
+    _gap_rr_sm     = sum(1 for d in _gap_blocks if d.get("gap_type","") == "MIN_RR_ALIGN")
     print(f"    Time blocks (NO_SUNDAY/NO_THU_FRI):              {_time_block_n}x")
     print(f"    HTF alignment blocks (COUNTERTREND_HTF):         {_htf_block_n}x")
     print(f"    Indecision doji blocks (INDECISION_DOJI):        {_indes_block_n}x")
@@ -1988,7 +1997,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             "REQUIRE_HTF_TREND_ALIGNMENT":       _sc.REQUIRE_HTF_TREND_ALIGNMENT,
             "MAX_TRADES_PER_WEEK_SMALL":         _sc.MAX_TRADES_PER_WEEK_SMALL,
             "MAX_TRADES_PER_WEEK_STANDARD":      _sc.MAX_TRADES_PER_WEEK_STANDARD,
-            "MIN_RR_SMALL_ACCOUNT":              _sc.MIN_RR_SMALL_ACCOUNT,
+            "MIN_RR_ALIGN":              _sc.MIN_RR_SMALL_ACCOUNT,
             "MIN_RR_STANDARD":                   _sc.MIN_RR_STANDARD,
             "INDECISION_FILTER_ENABLED":         _sc.INDECISION_FILTER_ENABLED,
         },

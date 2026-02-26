@@ -62,8 +62,9 @@ MIN_RR: float = 2.5   # minimum exec R:R — select_target() rejects any candida
 # These constants drive the backtester and live risk manager; all gates
 # log their reason codes for funnel reporting.
 SMALL_ACCOUNT_THRESHOLD:  float = 25_000.0   # USD equity boundary
-MIN_RR_SMALL_ACCOUNT:     float = 3.0        # stricter RR gate when < $25K
-MIN_RR_STANDARD:          float = 2.5        # normal RR gate (same as MIN_RR)
+MIN_RR_STANDARD:          float = 2.5        # pro-trend baseline (W+D+4H all agree)
+MIN_RR_COUNTERTREND:      float = 3.0        # non-protrend / mixed HTF alignment
+MIN_RR_SMALL_ACCOUNT:     float = MIN_RR_COUNTERTREND  # legacy alias — kept for compat
 
 # Weekly punch-card behaviour — Alex: "pretend you only have 2 trades per month"
 # Implementation: per-calendar-week cap (ISO week).
@@ -767,10 +768,10 @@ def get_model_tags(trail_arm: str = "", pairs_hash: str = "") -> list:
     if _wk_small < 999:
         _wk_std = getattr(m, "MAX_TRADES_PER_WEEK_STANDARD", 999)
         tags.append(f"wk_{_wk_small}s_{_wk_std}n")   # e.g. wk_1s_2n = 1/wk small, 2/wk normal
-    _rr_small = getattr(m, "MIN_RR_SMALL_ACCOUNT", 0.0)
-    _rr_std   = getattr(m, "MIN_RR_STANDARD",      0.0)
-    if _rr_small and _rr_small != _rr_std:
-        tags.append(f"dyn_rr_{_rr_small:.1f}s")
+    _rr_ct  = getattr(m, "MIN_RR_COUNTERTREND", 0.0)
+    _rr_std = getattr(m, "MIN_RR_STANDARD",     0.0)
+    if _rr_ct and _rr_ct != _rr_std:
+        tags.append(f"rr_ct_{_rr_ct:.1f}_std_{_rr_std:.1f}")
     if getattr(m, "INDECISION_FILTER_ENABLED", False): tags.append("doji_gate")
 
     # ── Pairs hash (injected by caller) ─────────────────────────────────────

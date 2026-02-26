@@ -3,12 +3,13 @@ compare_alex_rules.py
 =====================
 Before/after comparison of Alex's small-account hard constraints.
 
-Arm A — Baseline (current production: engulf_only + doji filter, no new gates)
-Arm B — + Time rules (NO_SUNDAY, NO_THU_FRI)
-Arm C — + HTF alignment gate (COUNTERTREND_HTF; requires W+D+4H all agree)
-Arm D — + Weekly punch-card (MAX_TRADES_PER_WEEK by equity tier)
-Arm E — + Dynamic MIN_RR (3.0R when equity < $25K)
-Arm F — ALL gates combined (B+C+D+E)
+Arm A — Baseline (engulf_only + doji filter, no new gates)
+Arm B — + Time rules (NO_SUNDAY; Thursday block AFTER 09:00 NY; all Friday)
+Arm C — + HTF alignment gate (COUNTERTREND_HTF; block only when W+D+4H all oppose)
+Arm D — + Weekly punch-card (1 trade/wk <$25K, 2 trade/wk ≥$25K)
+Arm E — + Alignment-based MIN_RR:
+           pro-trend (W+D+4H all agree) → 2.5 R
+           non-protrend / mixed HTF     → 3.0 R
 
 Windows:
   W1  Jul 15 – Oct 31 2024  (Alex benchmark)
@@ -42,10 +43,10 @@ ARM_KEY       = "C"
 @dataclass
 class ArmConfig:
     label:                str
-    time_rules:           bool = False   # NO_SUNDAY + NO_THU_FRI
-    htf_alignment:        bool = False   # REQUIRE_HTF_TREND_ALIGNMENT
-    weekly_limit:         bool = False   # MAX_TRADES_PER_WEEK active
-    dynamic_min_rr:       bool = False   # MIN_RR 3.0 when < $25K
+    time_rules:           bool = False   # NO_SUNDAY + NO_THU_FRI (Thu block AFTER 09:00 NY)
+    htf_alignment:        bool = False   # REQUIRE_HTF_TREND_ALIGNMENT (3-of-3 opposing)
+    weekly_limit:         bool = False   # MAX_TRADES_PER_WEEK by equity tier
+    dynamic_min_rr:       bool = False   # alignment-based MIN_RR (protrend=2.5, other=3.0)
 
 
 ARMS: dict[str, ArmConfig] = {
@@ -53,11 +54,11 @@ ARMS: dict[str, ArmConfig] = {
         label="A — baseline (engulf_only + doji filter)",
     ),
     "B_time":     ArmConfig(
-        label="B — +time rules (no Sun, no Thu PM/Fri)",
+        label="B — +time rules (no Sun; Thu >09:00 NY; all Fri)",
         time_rules=True,
     ),
     "C_htf":      ArmConfig(
-        label="C — +HTF alignment (W+D+4H must agree)",
+        label="C — +HTF alignment (block only if W+D+4H all oppose)",
         time_rules=True, htf_alignment=True,
     ),
     "D_weekly":   ArmConfig(
@@ -65,7 +66,7 @@ ARMS: dict[str, ArmConfig] = {
         time_rules=True, htf_alignment=True, weekly_limit=True,
     ),
     "E_rr":       ArmConfig(
-        label="E — +dynamic MIN_RR (3.0R when <$25K)",
+        label="E — +align MIN_RR (protrend=2.5R, non-protrend=3.0R)",
         time_rules=True, htf_alignment=True, weekly_limit=True, dynamic_min_rr=True,
     ),
 }
@@ -88,31 +89,34 @@ def _patch(arm: ArmConfig) -> None:
     _cfg.NO_SUNDAY_TRADES_ENABLED    = arm.time_rules
     _cfg.NO_THU_FRI_TRADES_ENABLED   = arm.time_rules
     _cfg.REQUIRE_HTF_TREND_ALIGNMENT = arm.htf_alignment
-    # Weekly limit and dynamic MIN_RR: controlled by the strategy_config flags
-    # but actually enforced in the backtester. We disable them by setting
-    # very high caps when arm doesn't include them.
+    # Weekly limit: disable by setting caps to 999 (effectively off)
     if arm.weekly_limit:
         _cfg.MAX_TRADES_PER_WEEK_SMALL    = 1
         _cfg.MAX_TRADES_PER_WEEK_STANDARD = 2
     else:
         _cfg.MAX_TRADES_PER_WEEK_SMALL    = 999
         _cfg.MAX_TRADES_PER_WEEK_STANDARD = 999
+    # Alignment-based MIN_RR: when off, flatten both thresholds to 2.5
+    # (pro-trend and non-protrend get the same gate → disabled)
     if arm.dynamic_min_rr:
-        _cfg.MIN_RR_SMALL_ACCOUNT = 3.0
-        _cfg.MIN_RR_STANDARD      = 2.5
+        _cfg.MIN_RR_STANDARD     = 2.5   # pro-trend stays at 2.5
+        _cfg.MIN_RR_COUNTERTREND = 3.0   # non-protrend raised to 3.0
     else:
-        _cfg.MIN_RR_SMALL_ACCOUNT = 2.5   # same as standard → gate is a no-op
-        _cfg.MIN_RR_STANDARD      = 2.5
+        _cfg.MIN_RR_STANDARD     = 2.5   # flatten both → gate is a no-op
+        _cfg.MIN_RR_COUNTERTREND = 2.5
+    _cfg.MIN_RR_SMALL_ACCOUNT = _cfg.MIN_RR_COUNTERTREND   # keep alias in sync
 
 
 def _restore() -> None:
+    """Restore production defaults after each run."""
     _cfg.NO_SUNDAY_TRADES_ENABLED    = True
     _cfg.NO_THU_FRI_TRADES_ENABLED   = True
     _cfg.REQUIRE_HTF_TREND_ALIGNMENT = True
-    _cfg.MAX_TRADES_PER_WEEK_SMALL   = 1
+    _cfg.MAX_TRADES_PER_WEEK_SMALL    = 1
     _cfg.MAX_TRADES_PER_WEEK_STANDARD = 2
-    _cfg.MIN_RR_SMALL_ACCOUNT        = 3.0
     _cfg.MIN_RR_STANDARD             = 2.5
+    _cfg.MIN_RR_COUNTERTREND         = 3.0
+    _cfg.MIN_RR_SMALL_ACCOUNT        = _cfg.MIN_RR_COUNTERTREND
 
 
 def _run(arm: ArmConfig, start: datetime, end: datetime) -> BacktestResult:
@@ -131,14 +135,17 @@ def _run(arm: ArmConfig, start: datetime, end: datetime) -> BacktestResult:
 
 
 def _arm_config_str(arm: ArmConfig) -> str:
-    """One-line config summary for a table row."""
-    parts = [f"trail={ARM_KEY}", f"min_rr=2.5", f"pairs=alex7"]
-    parts.append("sun=off" if arm.time_rules else "sun=ON")
-    parts.append("thu_fri=off" if arm.time_rules else "thu_fri=ON")
-    parts.append("htf=off" if arm.htf_alignment else "htf=ON")
-    parts.append(f"wk={'1s/2n' if arm.weekly_limit else 'off'}")
-    parts.append(f"dyn_rr={'3.0s' if arm.dynamic_min_rr else 'off'}")
-    parts.append("doji=on")   # always on (production default)
+    """One-line config summary for a table row (shown before results table)."""
+    parts = [f"trail={ARM_KEY}", "min_rr_base=2.5", "pairs=alex7"]
+    # Time gate: sun/thu/fri restrictions
+    parts.append("no_sun/thu/fri" if arm.time_rules else "sun+thu+fri=open")
+    # HTF gate: countertrend block
+    parts.append("htf_block=on" if arm.htf_alignment else "htf_block=off")
+    # Weekly punch-card
+    parts.append("wk_cap=1s/2n" if arm.weekly_limit else "wk_cap=off")
+    # Alignment-based MIN_RR
+    parts.append("rr=protrend2.5/other3.0" if arm.dynamic_min_rr else "rr=flat2.5")
+    parts.append("doji=on")   # always on
     return "  ".join(parts)
 
 

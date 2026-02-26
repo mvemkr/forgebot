@@ -712,9 +712,18 @@ class ForexOrchestrator:
             # Parity note: backtester calls the same functions from
             # src/strategy/forex/alex_policy.py — single source of truth.
 
-            # Gate 1: Dynamic MIN_RR (3.0R required when equity < $25K)
+            # Gate 1: Alignment-based MIN_RR
+            # Pro-trend (W+D+4H all agree) → 2.5 R; non-protrend/mixed → 3.0 R
+            _htf_aligned_flag = alex_policy.htf_aligned(
+                decision.direction or "",
+                decision.trend_weekly,
+                decision.trend_daily,
+                decision.trend_4h,
+            )
             _rr_blk, _rr_rsn = alex_policy.check_dynamic_min_rr(
-                decision.exec_rr, self.account_balance
+                decision.exec_rr,
+                htf_aligned_flag=_htf_aligned_flag,
+                balance=self.account_balance,
             )
             if _rr_blk:
                 logger.info(f"⚠ {pair}: ENTER BLOCKED — {_rr_rsn}")

@@ -66,10 +66,13 @@ class SessionFilter:
         if weekday == 0 and t < self.MONDAY_HARD_BLOCK_END:
             return True, "MONDAY_WICK_GUARD: pre-8AM ET"
 
-        # Thursday ≥ 09:00 ET — spread widens into week-end
+        # Thursday > 09:00 ET — spread widens into week-end.
+        # Alex rule: "allow entries only ≤ 09:00 NY (London/early NY ok), block after."
+        # Use strict-greater-than so the 09:00 AM bar itself (entry at bar close ≈ 09:00)
+        # is still allowed.  ≥ would block the 9AM bar which is still London/NY-overlap.
         if weekday == 3 and _cfg.NO_THU_FRI_TRADES_ENABLED:
             cutoff = time(_cfg.THU_ENTRY_CUTOFF_HOUR_ET, 0)
-            if t >= cutoff:
+            if t > cutoff:
                 return True, "NO_THU_FRI_TRADES: Thursday post-09:00 ET"
 
         # Friday ALL DAY (Alex: "not worth it")
@@ -147,14 +150,18 @@ class SessionFilter:
         """
         Returns (allowed: bool, reason: str).
         Combines hard block + session quality check.
+
+        Reason string on hard-block is the SPECIFIC code from is_hard_blocked()
+        (e.g. "NO_THU_FRI_TRADES: Thursday post-09:00 ET") so callers can propagate
+        it directly into failed_filters and the backtester counter can see it.
         """
         blocked, reason = self.is_hard_blocked(dt)
         if blocked:
-            return False, reason
+            return False, reason   # ← specific code, not generic "session"
 
         session, quality = self.session_quality(dt)
         if quality < 0.5:
-            return False, f"Low quality session ({session}, score={quality:.1f}) — wait for London/NY"
+            return False, f"LOW_QUALITY_SESSION: {session} (score={quality:.1f})"
 
         return True, f"Entry allowed — {session} session (quality={quality:.1f})"
 
