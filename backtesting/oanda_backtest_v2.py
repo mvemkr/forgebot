@@ -73,6 +73,7 @@ from src.strategy.forex.strategy_config import (
     NECKLINE_CLUSTER_PCT,
     get_model_tags,
     DRY_RUN_PAPER_BALANCE,
+    CACHE_VERSION,
 )
 
 # ── Backtest-only config ──────────────────────────────────────────────────────
@@ -373,34 +374,112 @@ TRAIL_ARMS: Dict[str, dict] = {
 _DEFAULT_ARM = "A"   # used when trail_cfg=None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data cache helpers
+# ── Per-pair/TF raw candle cache ─────────────────────────────────────────────
+# One file per (pair, TF, price_type, env, CACHE_VERSION).
+# Any run whose date window falls within the cached range = zero OANDA requests.
+# Different pair lists share the same per-pair files — no re-fetch on list change.
+#
+# Invalidation:
+#   • Bump CACHE_VERSION in strategy_config.py  → wipes all pairs/TFs at once
+#   • Delete ~/.cache/forge_backtester/         → manual wipe
+#   • Window extends beyond cached range        → only that pair/TF is re-fetched
+#
+# Default: ON (pass --no-cache to disable; --cache kept as no-op for compat)
 # ─────────────────────────────────────────────────────────────────────────────
-_CACHE_PATH = Path("/tmp/backtest_candle_cache.pkl")
+CACHE_DIR  = Path.home() / ".cache" / "forge_backtester"
+PRICE_TYPE = "M"   # OANDA mid (open/high/low/close)
 
-def _save_cache(candle_data: dict, meta: dict) -> None:
-    with open(_CACHE_PATH, "wb") as f:
-        pickle.dump({"candle_data": candle_data, "meta": meta}, f)
-    print(f"  💾 Cache saved → {_CACHE_PATH}")
+# Module-level API call counter — reset to 0 at the start of every fetch block.
+# After a full cache hit this stays 0; callers can assert on it.
+_api_call_count: int = 0
 
-def _load_cache() -> Optional[tuple]:
-    """Returns (candle_data, meta) or None if cache missing / stale."""
-    if not _CACHE_PATH.exists():
+def _cache_env() -> str:
+    """'live' or 'prac' — baked into cache filenames so account envs don't cross-contaminate."""
+    return "live" if "fxtrade" in _oanda_client.base else "prac"
+
+def _pair_slug(pair: str) -> str:
+    return pair.replace("/", "").replace("_", "")
+
+def _pair_cache_path(pair: str, tf: str) -> Path:
+    return CACHE_DIR / f"{_pair_slug(pair)}_{tf}_{PRICE_TYPE}_{_cache_env()}_{CACHE_VERSION}.pkl"
+
+def _pair_cache_load(pair: str, tf: str,
+                     need_start: datetime, need_end: datetime) -> Optional[pd.DataFrame]:
+    """
+    Load (pair, TF) from disk cache.
+    Returns the DataFrame if the cache exists, version matches, and data covers
+    [need_start, need_end].  Returns None on any miss/mismatch.
+    """
+    path = _pair_cache_path(pair, tf)
+    if not path.exists():
         return None
     try:
-        with open(_CACHE_PATH, "rb") as f:
-            obj = pickle.load(f)
-        print(f"  ⚡ Cache loaded ← {_CACHE_PATH}  "
-              f"(saved {obj['meta'].get('saved_at', '?')})")
-        return obj["candle_data"], obj["meta"]
-    except Exception as e:
-        print(f"  ⚠ Cache load failed ({e}), re-fetching.")
+        obj = pickle.load(open(path, "rb"))
+        if obj.get("version") != CACHE_VERSION:
+            return None
+        df: pd.DataFrame = obj["df"]
+        ns = need_start.replace(tzinfo=None) if need_start.tzinfo else need_start
+        ne = need_end.replace(tzinfo=None)   if need_end.tzinfo   else need_end
+        # Allow tolerance at both ends — OANDA bar timestamps don't land exactly
+        # on calendar boundaries (weekends, bank holidays, UTC-offset drift):
+        #   start: allow up to 7 days (first bar may be the next Monday after a weekend/holiday)
+        #   end:   allow up to 5 days (last bar may be a few days before computed runout_dt)
+        ns_ceil    = ns + pd.Timedelta(days=7)
+        ne_floor   = ne - pd.Timedelta(days=5)
+        if df.index.min() > ns_ceil or df.index.max() < ne_floor:
+            return None   # coverage gap — stale or shorter window cached
+        return df
+    except Exception:
         return None
+
+def _pair_cache_save(pair: str, tf: str, df: pd.DataFrame) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _pair_cache_path(pair, tf)
+    with open(path, "wb") as f:
+        pickle.dump({
+            "df":          df,
+            "version":     CACHE_VERSION,
+            "saved_at":    datetime.now(timezone.utc).isoformat(),
+            "pair":        pair,
+            "tf":          tf,
+            "price_type":  PRICE_TYPE,
+            "bars":        len(df),
+            "range_start": str(df.index.min()),
+            "range_end":   str(df.index.max()),
+        }, f)
+
+# ── Counted fetch wrappers ────────────────────────────────────────────────────
+# Every call to these increments _api_call_count so callers can assert "0 API
+# calls on second run".  Raw _fetch / _fetch_range are unchanged.
+
+def _counted_fetch_range(pair: str, tf: str,
+                         from_dt: datetime, to_dt: datetime = None) -> Optional[pd.DataFrame]:
+    global _api_call_count
+    _api_call_count += 1
+    return _fetch_range(pair, tf, from_dt=from_dt, to_dt=to_dt)
+
+def _counted_fetch(pair: str, tf: str, count: int) -> Optional[pd.DataFrame]:
+    global _api_call_count
+    _api_call_count += 1
+    return _fetch(pair, tf, count)
+
+# ── Legacy monolithic cache (kept as no-op stubs for external callers) ────────
+_CACHE_PATH = Path("/tmp/backtest_candle_cache.pkl")   # old path — kept for reference
+
+def _save_cache(candle_data: dict, meta: dict) -> None:  # noqa: deprecated
+    """Deprecated — replaced by per-pair _pair_cache_save(). No-op."""
+    pass
+
+def _load_cache() -> Optional[tuple]:  # noqa: deprecated
+    """Deprecated — replaced by per-pair _pair_cache_load(). Always returns None."""
+    return None
 
 # ── Main backtest ─────────────────────────────────────────────────────────────
 def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  starting_bal: float = STARTING_BAL, notes: str = "",
                  trail_cfg: Optional[dict] = None,
-                 preloaded_candle_data: Optional[dict] = None):
+                 preloaded_candle_data: Optional[dict] = None,
+                 use_cache: bool = True):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     # Extend data fetch so open positions can run to natural close after the entry window.
     # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
@@ -417,39 +496,115 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         print(f"Trail: {_tlabel}")
     print(f"{'='*65}")
 
-    # ── Fetch candle data (or use preloaded) ──────────────────────────
+    # ── Fetch candle data ─────────────────────────────────────────────
+    global _api_call_count
+    _api_call_count = 0   # reset for this run
+
     if preloaded_candle_data is not None:
+        # In-memory bypass: caller already holds data (e.g. multi-mode comparison script).
+        # Skip all cache I/O — no disk reads, no API calls.
         candle_data = preloaded_candle_data
-        print(f"\n  ⚡ Using preloaded candle data ({len(candle_data)} pairs)")
+        print(f"\n  ⚡ Preloaded candle data ({len(candle_data)} pairs) — skipping cache")
+
     else:
-        print("\nFetching OANDA historical candles...")
-        candle_data = {}
-        # Use date-range fetch when start_dt is more than 200 days ago (beyond count=5000 H1 window)
-        # Always fetch 6 months of daily context before start for pattern/trend detection
-        data_start = (start_dt - pd.Timedelta(days=180)).replace(tzinfo=timezone.utc)
-        data_end   = end_naive   # may be None for live use
-        use_range  = (datetime.now(tz=timezone.utc) - start_dt).days > 200
+        # Per-pair/TF cache-aware fetch.
+        # Each (pair, TF) is loaded from disk if cached + coverage OK; fetched otherwise.
+        env       = _cache_env()
+        need_end  = runout_dt or datetime.now(tz=timezone.utc)
+        use_range = (datetime.now(tz=timezone.utc) - start_dt).days > 200
+
+        # TF → (fetch_start, fetch_end) mapping
+        tf_ranges = {
+            "H1": ((start_dt - pd.Timedelta(days=180)).replace(tzinfo=timezone.utc), need_end),
+            "H4": ((start_dt - pd.Timedelta(days=180)).replace(tzinfo=timezone.utc), need_end),
+            "D":  ((start_dt - pd.Timedelta(days=730)).replace(tzinfo=timezone.utc), need_end),
+        }
+
+        # ── Cache header ──────────────────────────────────────────────
+        W = 72
+
+        def _box(text: str) -> str:
+            """Left-justify text inside a │ box of interior width W."""
+            return f"│  {text:<{W}}│"
+
+        pairs_str = ", ".join(WATCHLIST[:6]) + (f" +{len(WATCHLIST)-6}" if len(WATCHLIST) > 6 else "")
+        end_disp  = (end_dt or datetime.now(tz=timezone.utc)).date()
+
+        print(f"\n┌─ Candle cache {'─' * W}┐")
+        print(_box(f"cache_version : {CACHE_VERSION}   price_type : {PRICE_TYPE} (mid)   env : {env}"))
+        print(_box(f"cache_dir     : {CACHE_DIR}"))
+        print(_box(f"pairs ({len(WATCHLIST):2d})     : {pairs_str}"))
+        print(_box(f"TFs           : {', '.join(tf_ranges)}"))
+        print(_box(f"window        : {start_dt.date()} → {end_disp}  (+{RUNOUT_DAYS}d runout)"))
+        print(_box(f"cache         : {'ON' if use_cache else 'OFF (--no-cache)'}"))
+        print(f"├{'─' * (W + 2)}┤")
+
+        candle_data: dict = {}
+        n_hits = n_miss = 0
+        _miss_pairs: list = []
 
         for pair in WATCHLIST:
-            if use_range:
-                # Paginated date-range fetch — handles any historical window.
-                # Fetch to runout_dt so we can let positions close naturally after window end.
-                df_1h = _fetch_range(pair, "H1", from_dt=data_start, to_dt=runout_dt)
-                df_4h = _fetch_range(pair, "H4", from_dt=data_start, to_dt=runout_dt)
-                df_d  = _fetch_range(pair, "D",  from_dt=(start_dt - pd.Timedelta(days=730)).replace(tzinfo=timezone.utc), to_dt=runout_dt)
-            else:
-                df_1h = _fetch(pair, "H1", 5000)   # ~208 days of hourly bars
-                df_4h = _fetch(pair, "H4", 1500)   # ~250 days of 4H bars
-                df_d  = _fetch(pair, "D",  500)    # ~500 trading days (~2 years)
-            if df_1h is None or len(df_1h) < 50:
-                print(f"  ✗ {pair}: insufficient data, skipping")
+            pair_tfs: dict = {}
+            pair_failed = False
+
+            for tf, (fs, fe) in tf_ranges.items():
+                hit_df = _pair_cache_load(pair, tf, fs, fe) if use_cache else None
+                if hit_df is not None:
+                    n_hits += 1
+                    hit_info = (f"{pair:<10} {tf:<4} ✓ HIT   "
+                                f"({len(hit_df):5d} bars  "
+                                f"{hit_df.index.min().date()} → {hit_df.index.max().date()})")
+                    print(_box(hit_info))
+                    pair_tfs[tf] = hit_df
+                else:
+                    n_miss += 1
+                    _miss_pairs.append(f"{pair}/{tf}")
+                    print(_box(f"{pair:<10} {tf:<4} ✗ MISS  → fetching …"), flush=True)
+                    # Fetch from OANDA
+                    if use_range:
+                        df = _counted_fetch_range(pair, tf, from_dt=fs, to_dt=fe)
+                    else:
+                        count = {"H1": 5000, "H4": 1500, "D": 500}.get(tf, 500)
+                        df = _counted_fetch(pair, tf, count)
+
+                    if df is not None and len(df) >= (50 if tf == "H1" else 1):
+                        if use_cache:
+                            _pair_cache_save(pair, tf, df)
+                        pair_tfs[tf] = df
+                        fetch_info = (f"  └─ fetched {len(df)} bars  "
+                                      f"({df.index.min().date()} → {df.index.max().date()})"
+                                      f"  saved={'yes' if use_cache else 'no'}")
+                        print(_box(fetch_info))
+                        time.sleep(0.3)   # OANDA rate limit
+                    else:
+                        print(_box("  └─ ✗ FAILED or insufficient data"))
+                        if tf == "H1":
+                            pair_failed = True
+                            break
+
+            if pair_failed or "H1" not in pair_tfs or len(pair_tfs["H1"]) < 50:
+                print(_box(f"{pair:<10} ✗ skipped (insufficient H1 data)"))
                 continue
-            df_w = _resample_weekly(df_d) if df_d is not None else None
-            candle_data[pair] = {"1h": df_1h, "4h": df_4h, "d": df_d, "w": df_w}
-            time.sleep(0.3)   # OANDA rate limit
-            print(f"  ✓ {pair}: {len(df_1h)} 1H | {len(df_4h) if df_4h is not None else 0} 4H"
-                  f" | {len(df_d) if df_d is not None else 0} D"
-                  f" | {len(df_w) if df_w is not None else 0} W")
+
+            df_w = _resample_weekly(pair_tfs["D"]) if pair_tfs.get("D") is not None else None
+            candle_data[pair] = {
+                "1h": pair_tfs["H1"],
+                "4h": pair_tfs.get("H4"),
+                "d":  pair_tfs.get("D"),
+                "w":  df_w,
+            }
+
+        # ── Cache summary ─────────────────────────────────────────────
+        total_tfs = n_hits + n_miss
+        print(f"├{'─' * (W + 2)}┤")
+        summary = (f"{n_hits}/{total_tfs} TF slots cached  |  "
+                   f"{n_miss} MISS  |  API calls: {_api_call_count}  |  "
+                   f"{len(candle_data)}/{len(WATCHLIST)} pairs loaded")
+        print(_box(summary))
+        if _miss_pairs:
+            miss_str = ", ".join(_miss_pairs[:8]) + (f" +{len(_miss_pairs)-8}" if len(_miss_pairs) > 8 else "")
+            print(_box(f"Fetched: {miss_str}"))
+        print(f"└{'─' * (W + 2)}┘")
 
     if not candle_data:
         print("No data loaded. Exiting.")
@@ -1699,6 +1854,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         "ret_pct":               (balance - starting_bal) / starting_bal * 100,
         "dd_killswitch_blocks":  dd_killswitch_blocks,
         "max_dollar_loss":       min((t["pnl"] for t in trades), default=0.0),
+        "api_calls":             _api_call_count,   # 0 on full cache hit
     }
 
 
@@ -1737,8 +1893,11 @@ Examples:
                         help="Trail arm: A | B | C | all  (default: A). "
                              "A=activate1R trail0.5R  B=activate1.5R  C=2-stage 2R+3R")
     parser.add_argument("--cache", action="store_true", default=False,
-                        help="Save candle data after first fetch; reuse on subsequent runs. "
-                             "Eliminates 12-13 min OANDA fetch. Cache: /tmp/backtest_candle_cache.pkl")
+                        help="No-op (kept for backward compat). Cache is ON by default. "
+                             "Use --no-cache to disable.")
+    parser.add_argument("--no-cache", action="store_true", default=False,
+                        help="Disable per-pair disk cache — always fetch from OANDA. "
+                             f"Cache dir: {CACHE_DIR}")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -1799,43 +1958,35 @@ Examples:
         parser.error(f"--arm must be A | B | C | all, got '{args.arm}'")
     _arms_to_run = list(TRAIL_ARMS.keys()) if _arm_arg == "ALL" else [_arm_arg]
 
-    # ── Handle data cache ─────────────────────────────────────────────────────
-    _preloaded = None
-    if args.cache:
-        cached = _load_cache()
-        if cached:
-            _preloaded, _cmeta = cached
-            # Invalidate if window changed
-            if (_cmeta.get("start") != args.start or
-                    _cmeta.get("end") != args.end):
-                print(f"  ⚠ Cache window mismatch "
-                      f"(cached {_cmeta.get('start')}–{_cmeta.get('end')}, "
-                      f"requested {args.start}–{args.end}). Re-fetching.")
-                _preloaded = None
-        if _preloaded is None:
-            # Fetch once, then save for subsequent arm runs
-            print("\n  First run — fetching data and saving to cache...")
+    # ── Cache mode ────────────────────────────────────────────────────────────
+    # Cache is ON by default (per-pair/TF disk cache in ~/.cache/forge_backtester/).
+    # --no-cache disables disk reads/writes and always fetches from OANDA.
+    # --cache is a legacy no-op kept for backward compat.
+    _use_cache = not getattr(args, "no_cache", False)
+    if not _use_cache:
+        print("  ⚠ Cache disabled (--no-cache) — all data fetched from OANDA")
 
     # ── Run arms ──────────────────────────────────────────────────────────────
-    _arm_results = {}
+    # For multi-arm runs, candle data is fetched once then shared in-memory
+    # across subsequent arms via preloaded_candle_data — no redundant I/O.
+    _arm_results: dict = {}
+    _shared_candles: Optional[dict] = None   # populated after first arm's fetch
+
     for _arm_key in _arms_to_run:
-        _tcfg = TRAIL_ARMS[_arm_key]
+        _tcfg      = TRAIL_ARMS[_arm_key]
         _arm_notes = f"{notes} [arm={_arm_key}]".strip()
 
         result = run_backtest(
             start_dt=start, end_dt=end, starting_bal=args.balance,
             notes=_arm_notes, trail_cfg=_tcfg,
-            preloaded_candle_data=_preloaded,
+            preloaded_candle_data=_shared_candles,
+            use_cache=_use_cache,
         )
 
-        # After first arm: save cache if requested
-        if args.cache and _preloaded is None and result is not None:
-            _preloaded = result.get("candle_data")
-            if _preloaded:
-                _save_cache(_preloaded, {
-                    "start": args.start, "end": args.end,
-                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                })
+        # Share candle data from first arm with all subsequent arms in-process.
+        # Bypasses cache overhead entirely for arms 2+ in a single run.
+        if _shared_candles is None and result is not None:
+            _shared_candles = result.get("candle_data")
 
         if result:
             _arm_results[_arm_key] = result

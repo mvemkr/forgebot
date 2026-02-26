@@ -222,6 +222,13 @@ NECKLINE_CLUSTER_PCT: float = 0.003
 # Set this to the capital you intend to fund with.
 DRY_RUN_PAPER_BALANCE: float = 8_000.0
 
+# ── Backtest candle cache ──────────────────────────────────────────────────
+# Version string baked into every per-pair/TF cache filename.
+# Bump this to v2, v3 etc. to invalidate all on-disk caches globally
+# (e.g. after changing OANDA price_type, instrument mapping, or TF set).
+# Cache dir: ~/.cache/forge_backtester/
+CACHE_VERSION: str = "v1"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STRATEGY LEVERS — toggleable filters, all with defaults matching Alex's rules

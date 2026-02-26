@@ -706,13 +706,16 @@
     <div class="overflow-x-auto">
       <table class="table table-sm">
         <thead><tr>
-          <th>Run</th><th>Window</th><th>Return</th><th>Trades</th><th>WR</th><th>Net P&L</th><th>Model</th>
+          <th>Commit</th><th>Run date</th><th>Window</th><th>Return</th><th>Trades</th><th>WR</th><th>Net P&L</th><th>Model</th>
         </tr></thead>
         <tbody>
           <template x-for="id in btSelected" :key="id">
             <template x-if="btResults.find(r=>r._id===id)">
               <tr>
                 <td class="font-mono text-xs" x-text="btResults.find(r=>r._id===id).commit"></td>
+                <td class="font-mono text-xs text-base-content/50"
+                    :title="btResults.find(r=>r._id===id).run_dt"
+                    x-text="shortDt(btResults.find(r=>r._id===id).run_dt)"></td>
                 <td class="text-xs" x-text="btResults.find(r=>r._id===id).window_start.slice(0,10)+' → '+btResults.find(r=>r._id===id).window_end.slice(0,10)"></td>
                 <td class="font-mono font-bold"
                     :class="(btResults.find(r=>r._id===id).results.return_pct||0)>=0?'text-success':'text-error'"
@@ -753,6 +756,8 @@
               x-text="btResults[0]?.results?.n_trades+'T · '+btResults[0]?.results?.win_rate+'% WR · $'+Math.abs(btResults[0]?.results?.net_pnl||0).toFixed(0)"></span>
         <span class="font-mono text-xs" :class="btResults[0]?.commit?.includes('dirty')?'text-warning':'text-base-content/30'"
               x-text="btResults[0]?.commit"></span>
+        <span class="text-xs text-base-content/30 font-mono" :title="btResults[0]?.run_dt"
+              x-text="'run ' + shortDt(btResults[0]?.run_dt)"></span>
       </div>
     </div>
     <div class="overflow-x-auto">
@@ -873,6 +878,9 @@
             <!-- Commit -->
             <div class="font-mono text-xs" :class="run.commit.includes('dirty')?'text-warning':'text-base-content/30'"
                  x-text="run.commit"></div>
+            <!-- Run date -->
+            <div class="text-xs text-base-content/30 font-mono whitespace-nowrap" :title="run.run_dt"
+                 x-text="shortDt(run.run_dt)"></div>
             <!-- Expand chevron -->
             <i class="ph text-base-content/30 transition-transform duration-200"
                :class="btExpanded===run._id ? 'ph-caret-up' : 'ph-caret-down'"></i>
@@ -1321,6 +1329,16 @@ function dashboard() {
       if (diff < 3600) return Math.floor(diff/60) + 'm ago';
       if (diff < 86400)return Math.floor(diff/3600) + 'h ago';
       return new Date(ts).toLocaleDateString();
+    },
+    shortDt(ts) {
+      // "Feb 26 08:14" — compact run timestamp for backtest history rows
+      if (!ts) return '—';
+      const d = new Date(ts);
+      const mon = d.toLocaleDateString('en-US', {month:'short'});
+      const day = d.getDate();
+      const hh  = String(d.getHours()).padStart(2,'0');
+      const mm  = String(d.getMinutes()).padStart(2,'0');
+      return `${mon} ${day} ${hh}:${mm}`;
     },
 
     // ── Latest run trade list helpers ──────────────────────────────
