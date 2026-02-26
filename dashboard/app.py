@@ -79,6 +79,43 @@ def load_recent_decisions(n=40):
         except Exception: pass
     return list(reversed(entries))
 
+
+def get_last_decision_ts() -> Optional[str]:
+    """Timestamp of the most recent entry in decision_log.jsonl."""
+    if not DECISIONS_FILE.exists():
+        return None
+    try:
+        with open(DECISIONS_FILE, "rb") as f:
+            # Seek to end, scan backwards for last newline-terminated JSON line
+            f.seek(0, 2)
+            size = f.tell()
+            if size == 0:
+                return None
+            f.seek(max(0, size - 512))
+            tail = f.read().decode(errors="ignore")
+        for line in reversed(tail.strip().splitlines()):
+            try:
+                return json.loads(line).get("ts")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def get_engine_sha() -> str:
+    """Current git commit SHA (short) for the trading-bot repo."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path.home() / "trading-bot"),
+            capture_output=True, text=True, timeout=2,
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
 def get_scan_state():
     """Last 48h of pair events from the trade journal."""
     journal = get_journal()
@@ -129,8 +166,10 @@ def api_status():
         account = {"error": str(e)}
 
     stats         = journal.get_stats()
-    recent_trades = journal.get_recent_trades(15)
-    scan_state    = get_scan_state()
+    recent_trades     = journal.get_recent_trades(15)
+    scan_state        = get_scan_state()
+    last_decision_ts  = get_last_decision_ts()
+    engine_sha        = get_engine_sha()
 
     # Merge heartbeat + state for richer payload
     merged_hb = {**heartbeat, **{k: v for k, v in bot_state.items()
@@ -189,6 +228,10 @@ def api_status():
         "top_setups":         bot_state.get("top_setups", []),
         "confluence":         confluence_sorted,
         "server_time":        datetime.now(timezone.utc).isoformat(),
+        "last_scan_ts":       bot_state.get("last_scan_time") or merged_hb.get("timestamp"),
+        "last_decision_ts":   last_decision_ts,
+        "last_state_write_ts": bot_state.get("timestamp"),
+        "engine_sha":         engine_sha,
         # enriched fields for dashboard display
         "mode":               mode,
         "dry_run":            dry_run,

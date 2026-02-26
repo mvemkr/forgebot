@@ -968,7 +968,8 @@ function dashboard() {
           'risk_pct','base_risk_pct','final_risk_pct','dd_flag','active_cap_label',
           'final_risk_dollars','consecutive_losses','drawdown_pct','peak_balance',
           'tier_label','total_pnl','total_trades','win_rate','account_balance',
-          'pattern_memory_count','regroup_ends'];
+          'pattern_memory_count','regroup_ends',
+          'last_scan_ts','last_decision_ts','last_state_write_ts','engine_sha'];
         this.state = { ...(status.heartbeat || {}) };
         for (const k of _topFields) {
           if (status[k] !== undefined) this.state[k] = status[k];
@@ -1128,5 +1129,13 @@ function dashboard() {
   };
 }
 </script>
+<!-- ── FOOTER ──────────────────────────────────────────────── -->
+<div class="px-6 py-3 border-t border-base-300 bg-base-200/50 flex flex-wrap gap-x-6 gap-y-1 text-xs text-base-content/30 font-mono">
+  <span>engine: <span x-text="state.engine_sha || 'unknown'"></span></span>
+  <span x-show="state.last_scan_ts">last scan: <span x-text="state.last_scan_ts ? timeAgo(state.last_scan_ts) : '—'"></span></span>
+  <span x-show="state.last_decision_ts">last decision: <span x-text="state.last_decision_ts ? timeAgo(state.last_decision_ts) : '—'"></span></span>
+  <span x-show="state.last_state_write_ts">state written: <span x-text="state.last_state_write_ts ? timeAgo(state.last_state_write_ts) : '—'"></span></span>
+  <span x-text="'server: ' + (state.server_time ? new Date(state.server_time).toLocaleTimeString() : '—')"></span>
+</div>
 </body>
 </html>
