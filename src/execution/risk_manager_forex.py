@@ -653,7 +653,8 @@ class ForexRiskManager:
 
     # ── Status ─────────────────────────────────────────────────────────
 
-    def status(self, account_balance: float, consecutive_losses: int = 0) -> Dict:
+    def status(self, account_balance: float, consecutive_losses: int = 0,
+               dry_run: bool = False) -> Dict:
         """
         Full risk decomposition for dashboard + orchestrator.
 
@@ -703,6 +704,7 @@ class ForexRiskManager:
             "tier_label":         self.get_tier_label(account_balance),
             "account_balance":    account_balance,
             "peak_balance":       peak,
+            "peak_source":        "paper" if dry_run else "broker",
             "drawdown_pct":       drawdown_pct,
             "drawdown_threshold_pct": self.DRAWDOWN_THRESHOLD_PCT,
         }

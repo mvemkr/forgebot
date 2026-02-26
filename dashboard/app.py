@@ -195,6 +195,7 @@ def api_status():
     drawdown_pct_saved = bot_stats.get("drawdown_pct",       merged_hb.get("drawdown_pct", 0))
     paused             = bot_stats.get("paused",             merged_hb.get("paused", False)) or (mode == "paused")
     paused_since       = bot_stats.get("paused_since",       merged_hb.get("paused_since"))
+    peak_source        = bot_stats.get("peak_source",        merged_hb.get("peak_source", "broker"))
 
     # Win rate from stats
     wr      = stats.get("win_rate", 0) if isinstance(stats, dict) else 0
@@ -238,6 +239,7 @@ def api_status():
         "halted":             halted,
         "paused":             paused,
         "paused_since":       paused_since,
+        "peak_source":        peak_source,
         # risk decomposition
         "risk_pct":           final_risk_pct,
         "base_risk_pct":      base_risk_pct,

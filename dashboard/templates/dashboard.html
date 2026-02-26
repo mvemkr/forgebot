@@ -175,7 +175,8 @@
       <div class="stat-value font-mono text-2xl"
            :class="(state.drawdown_pct||0) > 30 ? 'text-error' : (state.drawdown_pct||0) > 15 ? 'text-warning' : 'text-success'"
            x-text="(state.drawdown_pct||0) > 0 ? (state.drawdown_pct||0) + '%' : '✓ Peak'">—</div>
-      <div class="stat-desc" x-text="'KS trigger: 40% | Peak: $' + fmt(state.peak_balance||0)"></div>
+      <div class="stat-desc"
+           x-text="'KS trigger: 40% | Peak: $' + fmt(state.peak_balance||0) + ' (' + (state.peak_source||'broker') + ')'"></div>
     </div>
     <div class="stat bg-base-200 rounded-2xl border border-base-300"
          :class="state.mode==='regroup' ? 'border-warning/50' : state.mode==='paused' ? 'border-error/50' : 'border-success/20'">
@@ -356,7 +357,8 @@
             <div class="rounded-xl border p-4 pair-card" :class="{
               'border-success/40 bg-success/5':  c.decision === 'ENTER',
               'border-warning/30 bg-warning/5':  c.decision === 'WAIT' && c.confidence >= 0.60,
-              'border-base-300 bg-base-300/30':  c.decision === 'NO_TRADE' || c.confidence < 0.60
+              'border-error/20 bg-error/5':      c.decision === 'BLOCKED',
+              'border-base-300 bg-base-300/30':  c.decision === 'NO_TRADE' || (c.decision !== 'BLOCKED' && c.confidence < 0.60)
             }">
 
               <!-- Header row -->
@@ -374,6 +376,7 @@
                   <span class="badge badge-xs" :class="{
                     'badge-success': c.decision==='ENTER',
                     'badge-warning': c.decision==='WAIT',
+                    'badge-error':   c.decision==='BLOCKED',
                     'badge-ghost':   c.decision==='NO_TRADE'
                   }" x-text="c.decision"></span>
                 </div>
@@ -429,9 +432,9 @@
                 </span>
               </div>
 
-              <!-- Waiting for -->
+              <!-- Waiting for / Blocked by -->
               <div class="text-xs" x-show="c.waiting_for && c.waiting_for.length > 0">
-                <span class="opacity-40">Waiting for: </span>
+                <span class="opacity-40" x-text="c.decision === 'BLOCKED' ? 'Blocked by: ' : 'Waiting for: '"></span>
                 <template x-for="(item, i) in (c.waiting_for||[])" :key="i">
                   <span>
                     <span :class="item.includes('Pip equity') ? 'text-error font-semibold' :
@@ -969,7 +972,8 @@ function dashboard() {
           'final_risk_dollars','consecutive_losses','drawdown_pct','peak_balance',
           'tier_label','total_pnl','total_trades','win_rate','account_balance',
           'pattern_memory_count','regroup_ends',
-          'last_scan_ts','last_decision_ts','last_state_write_ts','engine_sha'];
+          'last_scan_ts','last_decision_ts','last_state_write_ts','engine_sha',
+          'peak_source'];
         this.state = { ...(status.heartbeat || {}) };
         for (const k of _topFields) {
           if (status[k] !== undefined) this.state[k] = status[k];

@@ -141,6 +141,23 @@ class ForexOrchestrator:
             self.unrealized_pnl  = 0.0
 
         self.risk             = ForexRiskManager(self.journal)
+
+        # ── Dry-run peak isolation ─────────────────────────────────────
+        # If running in dry_run with a paper balance, the persisted peak may
+        # be from a previous live/practice run (e.g., OANDA practice $10K).
+        # Inheriting that peak permanently caps risk during development and
+        # makes testing misleading.  Reset peak to the paper balance so DD
+        # logic only measures this bot's simulated performance.
+        if dry_run and self.risk._peak_balance > self.account_balance * 1.02:
+            old_peak = self.risk._peak_balance
+            self.risk._peak_balance = self.account_balance
+            self.risk._save_regroup_state()
+            logger.info(
+                f"DRY RUN — reset inherited peak ${old_peak:,.0f} → "
+                f"${self.account_balance:,.0f} (paper balance). "
+                f"DD tracking now starts from scratch."
+            )
+
         initial_risk_pct      = self.risk.get_risk_pct(self.account_balance)
 
         self.strategy = SetAndForgetStrategy(
@@ -833,7 +850,7 @@ class ForexOrchestrator:
         except Exception:
             weekly_pnl = trades_week = wins_week = losses_week = 0
 
-        risk_status = self.risk.status(self.account_balance)
+        risk_status = self.risk.status(self.account_balance, consecutive_losses=self._consecutive_losses, dry_run=self.dry_run)
 
         self.notifier.send_standings(
             account_balance  = self.account_balance,
@@ -1000,6 +1017,7 @@ class ForexOrchestrator:
             risk_status = self.risk.status(
                 self.account_balance,
                 consecutive_losses=self._consecutive_losses,
+                dry_run=self.dry_run,
             )
             self.state.save(
                 account_balance  = self.account_balance,
@@ -1027,6 +1045,7 @@ class ForexOrchestrator:
                     "consecutive_losses":  self._consecutive_losses,
                     "paused":              risk_status["paused"],
                     "paused_since":        risk_status["paused_since"],
+                    "peak_source":         risk_status["peak_source"],
                     "traded_pattern_keys": list(self.strategy.traded_patterns.keys()),
                 },
             )
@@ -1040,6 +1059,7 @@ class ForexOrchestrator:
             risk_status = self.risk.status(
                 self.account_balance,
                 consecutive_losses=self._consecutive_losses,
+                dry_run=self.dry_run,
             )
             HEARTBEAT_FILE.write_text(json.dumps({
                 "timestamp":          datetime.now(timezone.utc).isoformat(),
