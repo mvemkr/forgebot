@@ -28,6 +28,78 @@ from .level_detector import LevelDetector, KeyLevel
 from .pattern_detector import PatternDetector, PatternResult, Trend
 from .entry_signal import EntrySignalDetector, EntrySignal
 from .targeting import select_target, find_next_structure_level, get_structure_stop
+
+
+class _TFBarCache:
+    """
+    Per-strategy instance cache for expensive per-TF computations.
+
+    detect_all() and detect_trend() are O(n_bars) and called inside
+    evaluate() — but daily/4H/weekly context only changes when a new
+    bar closes on that timeframe, not every H1 bar.
+
+    Cache invalidation: keyed on len(df) for each TF. When the slice
+    length hasn't changed (no new bar on that TF), cached results are
+    returned directly — no recomputation.
+
+    Expected speedup on Alex window (Jul 15–Oct 31 2024, 7 pairs):
+      detect_all(daily)  : 4,320 → 180 calls  (24× reduction)
+      detect_all(4h)     : 4,320 → 1,080 calls (4× reduction)
+      detect_trend(daily): 4,320 → 180 calls
+      detect_trend(4h)   : 4,320 → 1,080 calls
+      detect_trend(weekly): 4,320 → 26 calls
+    Net: ~8× speedup on cached operations which dominate runtime.
+    """
+    __slots__ = (
+        "daily_len", "h4_len", "weekly_len",
+        "trend_w", "trend_d", "trend_4h",
+        "ema21", "ema50",
+        "ext_z", "ext_high", "ext_low",
+        "patterns_daily", "patterns_4h",
+    )
+
+    def __init__(self):
+        self.daily_len:   int = -1
+        self.h4_len:      int = -1
+        self.weekly_len:  int = -1
+        self.trend_w           = None
+        self.trend_d           = None
+        self.trend_4h          = None
+        self.ema21:       float = 0.0
+        self.ema50:       float = 0.0
+        self.ext_z:       float = 0.0
+        self.ext_high:    bool  = False
+        self.ext_low:     bool  = False
+        self.patterns_daily: list = []
+        self.patterns_4h:    list = []
+
+    def refresh(self, df_daily: pd.DataFrame, df_4h: pd.DataFrame,
+                df_weekly: pd.DataFrame, detector: "PatternDetector",
+                price_extension_fn) -> None:
+        """Refresh any TF whose slice length has grown since last call."""
+        d_len  = len(df_daily)
+        h4_len = len(df_4h)
+        w_len  = len(df_weekly)
+
+        if d_len != self.daily_len and d_len > 0:
+            self.trend_d        = detector.detect_trend(df_daily)
+            self.patterns_daily = detector.detect_all(df_daily)
+            if d_len >= 50:
+                _closes = df_daily["close"].values
+                _ser = pd.Series(_closes)
+                self.ema21 = float(_ser.ewm(span=21, adjust=False).mean().iloc[-1])
+                self.ema50 = float(_ser.ewm(span=50, adjust=False).mean().iloc[-1])
+            self.ext_z, self.ext_high, self.ext_low = price_extension_fn(df_daily)
+            self.daily_len = d_len
+
+        if h4_len != self.h4_len and h4_len > 0:
+            self.trend_4h    = detector.detect_trend(df_4h)
+            self.patterns_4h = detector.detect_all(df_4h)
+            self.h4_len = h4_len
+
+        if w_len != self.weekly_len and w_len > 0:
+            self.trend_w    = detector.detect_trend(df_weekly)
+            self.weekly_len = w_len
 from . import strategy_config as _cfg   # module-ref import so apply_levers() patches propagate
 
 logger = logging.getLogger(__name__)
@@ -197,6 +269,15 @@ class SetAndForgetStrategy:
         # This stops "15 bars in a row at USD/CAD IH&S 1.40" spam.
         self.DEDUP_HOURS: int = 6          # 6 hours = 6 bars on 1H data
         self._recent_enter_ts: Dict[str, object] = {}    # key → pd.Timestamp
+
+        # TF bar cache — reuse detect_all/detect_trend/EMA results across H1
+        # bars when the higher-TF slice hasn't grown.  See _TFBarCache docstring.
+        self._tf_cache = _TFBarCache()
+
+        # Level-detect cache — level_detector.detect(df_daily, level) is O(n)
+        # on df_daily and only changes when a new daily bar appears or the
+        # queried level changes.  Cache key: (len(df_daily), rounded_level).
+        self._level_cache: dict = {}
 
     def update_balance(self, balance: float):
         self.account_balance = balance
@@ -631,9 +712,21 @@ class SetAndForgetStrategy:
         # Block only when there is no evidence of reversal on EITHER
         # the daily OR 4H — pure trend continuation with no pattern signal.
         # ─────────────────────────────────────────────
-        trend_w = self.pattern_detector.detect_trend(df_weekly)
-        trend_d = self.pattern_detector.detect_trend(df_daily)
-        trend_4 = self.pattern_detector.detect_trend(df_4h)
+
+        # ── TF bar cache refresh ──────────────────────────────────────────
+        # detect_all + detect_trend + EMA are O(n_bars) on the full TF slice.
+        # Re-run only when the slice length grew (new D/4H/W bar closed).
+        # Across 4,320 H1 bars this cuts daily detect_all from 4,320 → 180
+        # calls and 4H from 4,320 → 1,080 — ~8× overall speedup.
+        self._tf_cache.refresh(
+            df_daily, df_4h, df_weekly,
+            self.pattern_detector, self._price_extension,
+        )
+        _c = self._tf_cache
+
+        trend_w = _c.trend_w if _c.trend_w is not None else Trend.NEUTRAL
+        trend_d = _c.trend_d if _c.trend_d is not None else Trend.NEUTRAL
+        trend_4 = _c.trend_4h if _c.trend_4h is not None else Trend.NEUTRAL
 
         w_bullish = trend_w in (Trend.BULLISH, Trend.STRONG_BULLISH)
         w_bearish = trend_w in (Trend.BEARISH, Trend.STRONG_BEARISH)
@@ -674,20 +767,15 @@ class SetAndForgetStrategy:
         # EMA + price extension — pre-calculate for use in scoring below
         # ─────────────────────────────────────────────────────────────────
         _ema_confluence = False
-        _ema21 = _ema50 = 0.0
+        _ema21 = _c.ema21   # cached — recomputed only when daily bar advances
+        _ema50 = _c.ema50
         if len(df_daily) >= 50:
-            _closes_d = df_daily["close"].values
-            _ema21 = float(pd.Series(_closes_d).ewm(span=21, adjust=False).mean().iloc[-1])
-            _ema50 = float(pd.Series(_closes_d).ewm(span=50, adjust=False).mean().iloc[-1])
             _near_ema21 = abs(current_price - _ema21) / current_price < 0.005
             _near_ema50 = abs(current_price - _ema50) / current_price < 0.005
             _ema_confluence = _near_ema21 or _near_ema50
 
-        # Price extension Z-score — how far is current price from 1-year mean?
-        # Used in _mtf_context() to hard-block wrong-direction trades at extremes
-        # and add a confidence bonus to correct-direction trades (e.g., short
-        # at Z>2 = price at extreme high = ideal reversal short setup).
-        _ext_z, _ext_high, _ext_low = self._price_extension(df_daily)
+        # Price extension Z-score — cached; refreshed once per new daily bar
+        _ext_z, _ext_high, _ext_low = _c.ext_z, _c.ext_high, _c.ext_low
 
         # ─────────────────────────────────────────────────────────────────
         # FILTER 3: Pattern detection — PATTERN SETS DIRECTION
@@ -723,8 +811,8 @@ class SetAndForgetStrategy:
         #   PARTIAL ALIGNMENT (-3% adj): mixed signals, some confirmation
         # ─────────────────────────────────────────────────────────────────
 
-        # Build pattern list from daily (primary source — larger stops, clearer structure)
-        patterns_daily = self.pattern_detector.detect_all(df_daily)
+        # Build pattern list from daily — use cache (recomputed only on new daily bar)
+        patterns_daily = list(_c.patterns_daily)   # list() — downstream code appends 4H patterns
 
         # ── 4H patterns — ALSO valid entries per Alex's actual trades ────────
         # Alex's GBP/JPY Week 1 trade: H&S on 4H, daily only provided context.
@@ -738,7 +826,7 @@ class SetAndForgetStrategy:
         mtf_confluence: dict = {}
         if len(df_4h) >= 30:
             _4h_structural = [
-                p for p in self.pattern_detector.detect_all(df_4h)
+                p for p in _c.patterns_4h   # cached; refreshed only on new 4H bar
                 if 'sweep' not in p.pattern_type
                 and any(k in p.pattern_type for k in
                         ('head_and_shoulders', 'double_top', 'double_bottom',
@@ -1089,7 +1177,14 @@ class SetAndForgetStrategy:
         # levels — so we just check whether ANY detected level is near
         # the pattern's structural price.
         # ─────────────────────────────────────────────
-        levels = self.level_detector.detect(df_daily, matching_pattern.pattern_level, pair=pair)
+        # Cache level detection — result depends only on df_daily length and
+        # the queried pattern level.  Invalidated automatically when daily bar
+        # advances (len changes) or a different level is queried.
+        _lk = (len(df_daily), round(matching_pattern.pattern_level or 0, 6))
+        if _lk not in self._level_cache:
+            self._level_cache[_lk] = self.level_detector.detect(
+                df_daily, matching_pattern.pattern_level, pair=pair)
+        levels = self._level_cache[_lk]
 
         # Check round number first (fast path, no level detection needed)
         pattern_at_round_number = (

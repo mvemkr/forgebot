@@ -726,6 +726,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     v1_decisions  = _load_v1_decisions()
     consecutive_losses: int = 0     # streak counter: reset on win, incremented on loss
     dd_killswitch_blocks: int = 0   # count of entries blocked by 40% DD killswitch
+    _eval_calls: int = 0            # performance counter: evaluate() call count
+    _eval_ms:    float = 0.0        # total ms spent in evaluate()
 
     def _risk_pct(bal):
         """DD-aware risk: applies graduated caps when equity is below peak."""
@@ -1251,6 +1253,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             strat.risk_pct = _risk_pct(balance)
 
             try:
+                _t0 = time.perf_counter()
                 decision = strat.evaluate(
                     pair        = pair,
                     df_weekly   = hist_w  if len(hist_w)  >= 4  else pd.DataFrame(),
@@ -1260,6 +1263,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     current_dt  = ts_utc,
                     macro_theme = active_theme if _is_theme_pair else None,
                 )
+                _eval_calls += 1
+                _eval_ms    += (time.perf_counter() - _t0) * 1000
             except Exception:
                 continue
 
@@ -1912,6 +1917,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         "max_dd":                _max_dd_pct,
         "ret_pct":               (balance - starting_bal) / starting_bal * 100,
         "dd_killswitch_blocks":  dd_killswitch_blocks,
+        "eval_calls":            _eval_calls,
+        "eval_ms_avg":           (_eval_ms / _eval_calls) if _eval_calls else 0.0,
         "max_dollar_loss":       min((t["pnl"] for t in trades), default=0.0),
         "api_calls":             _api_call_count,   # 0 on full cache hit
     }
@@ -1960,6 +1967,9 @@ Examples:
     parser.add_argument("--max-trades", type=int, default=None,
                         help="Override MAX_CONCURRENT_TRADES_BACKTEST. Default=1 (parity with live). "
                              "Values >1 are tagged EXPERIMENTAL in results — never use as baseline.")
+    parser.add_argument("--timing", action="store_true", default=False,
+                        help="Print performance stats after each run: total bars, evaluate() calls, "
+                             "avg ms per call, total runtime.")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -2052,12 +2062,26 @@ Examples:
         _tcfg      = TRAIL_ARMS[_arm_key]
         _arm_notes = f"{notes} [arm={_arm_key}]".strip()
 
+        _t_run = time.perf_counter()
         result = run_backtest(
             start_dt=start, end_dt=end, starting_bal=args.balance,
             notes=_arm_notes, trail_cfg=_tcfg,
             preloaded_candle_data=_shared_candles,
             use_cache=_use_cache,
         )
+        _t_run_elapsed = time.perf_counter() - _t_run
+
+        if args.timing and result:
+            _ec  = result.get("eval_calls", 0)
+            _ems = result.get("eval_ms_avg", 0)
+            _ac  = result.get("api_calls", 0)
+            print(f"\n  ── Timing ──────────────────────────────────────────")
+            print(f"    Total runtime:        {_t_run_elapsed:.1f}s")
+            print(f"    evaluate() calls:     {_ec:,}")
+            print(f"    avg ms / evaluate():  {_ems:.2f} ms")
+            print(f"    OANDA API calls:      {_ac}")
+            _n_pairs = len(result.get("candle_data", {}))
+            print(f"    Pairs simulated:      {_n_pairs}")
 
         # Share candle data from first arm with all subsequent arms in-process.
         # Bypasses cache overhead entirely for arms 2+ in a single run.
