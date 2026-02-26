@@ -118,7 +118,7 @@ BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = False
 # levels. Keeping engulf-only biases the sample by undertrading retests where
 # price wicks through the level and snaps back — a very common Alex entry.
 # The pin bar spec below is intentionally tight to avoid opening the floodgates.
-ENGULFING_ONLY: bool = False
+ENGULFING_ONLY: bool = True    # Alex's #1 rule: no engulfing candle = no trade
 
 # ── Pin bar entry spec ─────────────────────────────────────────────────────
 # Only active when ENGULFING_ONLY=False.
