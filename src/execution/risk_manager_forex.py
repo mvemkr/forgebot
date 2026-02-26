@@ -647,15 +647,54 @@ class ForexRiskManager:
 
     # ── Status ─────────────────────────────────────────────────────────
 
-    def status(self, account_balance: float) -> Dict:
+    def status(self, account_balance: float, consecutive_losses: int = 0) -> Dict:
+        """
+        Full risk decomposition for dashboard + orchestrator.
+
+        Returns both the base tier % and the fully-capped final % so the UI can
+        show exactly which control is active (DD_CAP_10, STREAK_CAP_6, DOLLAR_CAP,
+        DD_KILLSWITCH) and how many risk dollars that translates to right now.
+        """
+        base_pct                = self.get_risk_pct(account_balance)
+        peak                    = self._peak_balance or account_balance
+        final_pct, dd_flag      = self.get_risk_pct_with_dd(
+            account_balance,
+            peak_equity=peak,               # resolved peak, not raw _peak_balance
+            consecutive_losses=consecutive_losses,
+        )
+        drawdown_pct            = round(
+            (peak - account_balance) / peak * 100, 1
+        ) if peak > account_balance else 0.0
+        final_risk_dollars      = round(account_balance * final_pct / 100, 2) if final_pct > 0 else 0.0
+
+        # Human-readable label for the active cap
+        cap_labels = {
+            "DD_KILLSWITCH": "🛑 Kill-switch (≥40% DD)",
+            "DD_CAP_6":      "⚠️ DD cap 6% (≥25% DD)",
+            "DD_CAP_10":     "⚠️ DD cap 10% (≥15% DD)",
+            "STREAK_CAP_3":  "📉 Streak brake 3% (3+ losses)",
+            "STREAK_CAP_6":  "📉 Streak brake 6% (2 losses)",
+            "DOLLAR_CAP":    "💵 Dollar cap active",
+            "":              "✅ Normal (no caps)",
+        }
+
         return {
-            "mode":           self._mode.value,
-            "is_halted":      self.is_halted,
-            "regroup_reason": self._regroup_reason,
-            "regroup_ends":   self._regroup_ends.isoformat() if self._regroup_ends else None,
-            "risk_pct":       self.get_risk_pct(account_balance),
-            "tier_label":     self.get_tier_label(account_balance),
-            "account_balance": account_balance,
-            "peak_balance":   self._peak_balance,
+            "mode":               self._mode.value,
+            "is_halted":          self.is_halted,
+            "regroup_reason":     self._regroup_reason,
+            "regroup_ends":       self._regroup_ends.isoformat() if self._regroup_ends else None,
+            # risk decomposition
+            "base_risk_pct":      base_pct,
+            "final_risk_pct":     final_pct,
+            "risk_pct":           final_pct,        # backward-compat alias
+            "dd_flag":            dd_flag,
+            "active_cap_label":   cap_labels.get(dd_flag, dd_flag),
+            "final_risk_dollars": final_risk_dollars,
+            "consecutive_losses": consecutive_losses,
+            # equity / drawdown
+            "tier_label":         self.get_tier_label(account_balance),
+            "account_balance":    account_balance,
+            "peak_balance":       peak,
+            "drawdown_pct":       drawdown_pct,
             "drawdown_threshold_pct": self.DRAWDOWN_THRESHOLD_PCT,
         }

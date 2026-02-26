@@ -17,6 +17,7 @@ LOG_DIR        = Path.home() / "trading-bot" / "logs"
 HEARTBEAT_FILE = LOG_DIR / "forex_orchestrator.heartbeat"
 STATE_FILE     = LOG_DIR / "bot_state.json"
 DECISIONS_FILE = LOG_DIR / "decision_log.jsonl"
+CONTROL_FILE   = LOG_DIR / "bot_control.json"
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.WARNING)
@@ -136,24 +137,33 @@ def api_status():
                                  if k not in heartbeat or bot_state.get(k) is not None}}
 
     # Risk / mode enrichment from bot_state stats block
-    bot_stats   = bot_state.get("stats", {})
-    risk_pct    = merged_hb.get("risk_pct") or bot_stats.get("risk_pct", 0)
-    mode        = merged_hb.get("mode") or bot_stats.get("mode", "unknown")
-    tier_label  = bot_stats.get("tier", "—")
-    peak_bal    = bot_stats.get("peak_balance", 0)
-    regroup_ends= bot_stats.get("regroup_ends")
-    pattern_ct  = len(bot_stats.get("traded_pattern_keys", []))
-    dry_run     = merged_hb.get("dry_run", True)
-    halted      = merged_hb.get("halted", False)
+    bot_stats         = bot_state.get("stats", {})
+    risk_pct          = merged_hb.get("risk_pct") or bot_stats.get("final_risk_pct", 0)
+    mode              = merged_hb.get("mode") or bot_stats.get("mode", "unknown")
+    tier_label        = bot_stats.get("tier", "—")
+    peak_bal          = bot_stats.get("peak_balance", 0)
+    regroup_ends      = bot_stats.get("regroup_ends")
+    pattern_ct        = len(bot_stats.get("traded_pattern_keys", []))
+    dry_run           = merged_hb.get("dry_run", True)
+    halted            = merged_hb.get("halted", False)
+    # Risk decomposition — all caps
+    base_risk_pct      = bot_stats.get("base_risk_pct",      merged_hb.get("base_risk_pct", 0))
+    final_risk_pct     = bot_stats.get("final_risk_pct",     merged_hb.get("final_risk_pct", risk_pct))
+    dd_flag            = bot_stats.get("dd_flag",            merged_hb.get("dd_flag", ""))
+    active_cap_label   = bot_stats.get("active_cap_label",   merged_hb.get("active_cap_label", ""))
+    final_risk_dollars = bot_stats.get("final_risk_dollars", merged_hb.get("final_risk_dollars", 0))
+    consecutive_losses = bot_stats.get("consecutive_losses", merged_hb.get("consecutive_losses", 0))
+    drawdown_pct_saved = bot_stats.get("drawdown_pct",       merged_hb.get("drawdown_pct", 0))
 
     # Win rate from stats
     wr      = stats.get("win_rate", 0) if isinstance(stats, dict) else 0
     tot_tr  = stats.get("trades", 0)   if isinstance(stats, dict) else 0
     tot_pnl = stats.get("total_pnl", 0) if isinstance(stats, dict) else 0
 
-    # Drawdown from peak
-    bal = account.get("balance", 0) if isinstance(account, dict) else 0
-    dd_pct = round((peak_bal - bal) / peak_bal * 100, 1) if peak_bal > 0 and bal < peak_bal else 0.0
+    # Drawdown from peak — prefer live OANDA balance, fall back to saved
+    bal    = account.get("balance", 0) if isinstance(account, dict) else 0
+    bal    = bal or bot_state.get("account_balance", 0)
+    dd_pct = round((peak_bal - bal) / peak_bal * 100, 1) if peak_bal > 0 and bal < peak_bal else (drawdown_pct_saved or 0.0)
 
     # Confluence state: dict keyed by pair, sorted by decision priority
     raw_confluence = bot_state.get("confluence_state", {})
@@ -181,17 +191,52 @@ def api_status():
         "mode":               mode,
         "dry_run":            dry_run,
         "halted":             halted,
-        "risk_pct":           risk_pct,
+        # risk decomposition
+        "risk_pct":           final_risk_pct,
+        "base_risk_pct":      base_risk_pct,
+        "final_risk_pct":     final_risk_pct,
+        "dd_flag":            dd_flag,
+        "active_cap_label":   active_cap_label,
+        "final_risk_dollars": final_risk_dollars,
+        "consecutive_losses": consecutive_losses,
+        # equity / drawdown
         "tier_label":         tier_label,
         "peak_balance":       peak_bal,
         "drawdown_pct":       dd_pct,
         "regroup_ends":       regroup_ends,
         "pattern_memory_count": pattern_ct,
         "account_balance":    bal,
+        # performance
         "win_rate":           round(wr * 100, 1),
         "total_trades":       tot_tr,
         "total_pnl":          tot_pnl,
     })
+
+@app.route("/api/pause", methods=["POST"])
+def api_pause():
+    """Write a pause command to bot_control.json. Orchestrator picks it up next cycle."""
+    data   = request.get_json() or {}
+    reason = data.get("reason", "Dashboard pause request")
+    try:
+        CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONTROL_FILE.write_text(json.dumps({"command": "pause", "reason": reason}))
+        return jsonify({"status": "ok", "command": "pause", "reason": reason})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/resume", methods=["POST"])
+def api_resume():
+    """Write a resume command to bot_control.json. Orchestrator picks it up next cycle."""
+    data   = request.get_json() or {}
+    reason = data.get("reason", "Dashboard resume request")
+    try:
+        CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONTROL_FILE.write_text(json.dumps({"command": "resume", "reason": reason}))
+        return jsonify({"status": "ok", "command": "resume", "reason": reason})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 
 @app.route("/api/weekly_pnl")
 def api_weekly_pnl():

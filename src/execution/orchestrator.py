@@ -182,6 +182,11 @@ class ForexOrchestrator:
         # Shows what each pair is waiting for before the bot will enter.
         self._confluence_state:    Dict[str, dict]   = {}
 
+        # Consecutive loss streak — used by risk manager for streak brake cap.
+        # Loaded from saved state on startup; updated when positions close.
+        # A ratchet exit near 0R counts as a win (doesn't increment streak).
+        self._consecutive_losses:  int               = 0
+
         # ── Crash recovery — restore full state from last save ───────────
         # Reconciles saved state with OANDA live data:
         #   - Open positions: restores full context (entry, stop, direction,
@@ -223,6 +228,15 @@ class ForexOrchestrator:
                     logger.info(f"Restored {len(restored)} exhausted pattern(s) from state")
         except Exception as e:
             logger.warning(f"Pattern memory restore failed: {e}")
+
+        # Restore consecutive loss streak from saved state
+        try:
+            saved = self.state.load()
+            self._consecutive_losses = int(saved.get("stats", {}).get("consecutive_losses", 0))
+            if self._consecutive_losses:
+                logger.info(f"Restored consecutive_losses={self._consecutive_losses} from state")
+        except Exception:
+            pass
 
         # Load Tier 1 news calendar on startup
         try:
@@ -957,10 +971,36 @@ class ForexOrchestrator:
 
     # ── State Save ────────────────────────────────────────────────────
 
+    def _refresh_consecutive_losses(self):
+        """
+        Recompute _consecutive_losses from recent journal entries.
+        Called at the start of each state save so the dashboard is always current.
+        Scratch exits (|pnl| < 0.10 × risk) count as wins (don't extend streak).
+        """
+        try:
+            trades = self.journal.get_recent_trades(30)  # most-recent first
+            count = 0
+            for t in trades:
+                pnl = t.get("pnl", 0) or 0
+                r   = t.get("r",   None)
+                # Use R if available (more robust than pnl for micro-positions)
+                is_loss = (r is not None and r < -0.10) or (r is None and pnl < 0)
+                if is_loss:
+                    count += 1
+                else:
+                    break
+            self._consecutive_losses = count
+        except Exception:
+            pass  # keep existing value on error
+
     def _save_state(self):
         """Save full bot state to disk — dashboard reads this."""
         try:
-            risk_status = self.risk.status(self.account_balance)
+            self._refresh_consecutive_losses()
+            risk_status = self.risk.status(
+                self.account_balance,
+                consecutive_losses=self._consecutive_losses,
+            )
             self.state.save(
                 account_balance  = self.account_balance,
                 dry_run          = self.dry_run,
@@ -973,11 +1013,18 @@ class ForexOrchestrator:
                 mode             = risk_status["mode"],
                 confluence_state = self._confluence_state,
                 stats            = {
-                    "traded_patterns": len(self.strategy.traded_patterns),
-                    "mode":            risk_status["mode"],
-                    "tier":            risk_status["tier_label"],
-                    "peak_balance":    risk_status["peak_balance"],
-                    "regroup_ends":    risk_status["regroup_ends"],
+                    "traded_patterns":     len(self.strategy.traded_patterns),
+                    "mode":                risk_status["mode"],
+                    "tier":                risk_status["tier_label"],
+                    "peak_balance":        risk_status["peak_balance"],
+                    "drawdown_pct":        risk_status["drawdown_pct"],
+                    "regroup_ends":        risk_status["regroup_ends"],
+                    "base_risk_pct":       risk_status["base_risk_pct"],
+                    "final_risk_pct":      risk_status["final_risk_pct"],
+                    "dd_flag":             risk_status["dd_flag"],
+                    "active_cap_label":    risk_status["active_cap_label"],
+                    "final_risk_dollars":  risk_status["final_risk_dollars"],
+                    "consecutive_losses":  self._consecutive_losses,
                     "traded_pattern_keys": list(self.strategy.traded_patterns.keys()),
                 },
             )
@@ -988,17 +1035,28 @@ class ForexOrchestrator:
 
     def _write_heartbeat(self, status: str = "ok"):
         try:
-            risk_status = self.risk.status(self.account_balance)
+            risk_status = self.risk.status(
+                self.account_balance,
+                consecutive_losses=self._consecutive_losses,
+            )
             HEARTBEAT_FILE.write_text(json.dumps({
-                "timestamp":       datetime.now(timezone.utc).isoformat(),
-                "status":          status,
-                "mode":            risk_status["mode"],
-                "open_positions":  list(self.strategy.open_positions.keys()),
-                "account_balance": self.account_balance,
-                "risk_pct":        risk_status["risk_pct"],
-                "tier":            risk_status["tier_label"],
-                "regroup_ends":    risk_status["regroup_ends"],
-                "dry_run":         self.dry_run,
+                "timestamp":          datetime.now(timezone.utc).isoformat(),
+                "status":             status,
+                "mode":               risk_status["mode"],
+                "open_positions":     list(self.strategy.open_positions.keys()),
+                "account_balance":    self.account_balance,
+                "risk_pct":           risk_status["risk_pct"],
+                "base_risk_pct":      risk_status["base_risk_pct"],
+                "final_risk_pct":     risk_status["final_risk_pct"],
+                "dd_flag":            risk_status["dd_flag"],
+                "active_cap_label":   risk_status["active_cap_label"],
+                "final_risk_dollars": risk_status["final_risk_dollars"],
+                "consecutive_losses": self._consecutive_losses,
+                "tier":               risk_status["tier_label"],
+                "drawdown_pct":       risk_status["drawdown_pct"],
+                "peak_balance":       risk_status["peak_balance"],
+                "regroup_ends":       risk_status["regroup_ends"],
+                "dry_run":            self.dry_run,
             }, indent=2))
         except Exception:
             pass
