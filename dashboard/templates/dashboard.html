@@ -142,6 +142,17 @@
   </span>
 </div>
 
+<!-- Whitelist active banner (info, not alarm) -->
+<div x-show="!state.paused && botOnline && state.whitelist_enabled"
+     class="alert alert-warning rounded-none py-2">
+  <i class="ph ph-funnel ph-bold text-xl"></i>
+  <span>
+    🔒 <strong>WHITELIST ON</strong> —
+    Trading only: <strong x-text="(state.whitelist_pairs||[]).join(', ') || '(none)'"></strong>.
+    <a href="#" @click.prevent="activeTab='backtests'; loadBacktests()" class="underline ml-1 text-sm">Edit →</a>
+  </span>
+</div>
+
 <!-- ── TAB NAV ────────────────────────────────────────────── -->
 <div class="px-6 pt-4 border-b border-base-300 bg-base-200 flex gap-1">
   <button @click="activeTab='live'"
@@ -383,7 +394,8 @@
             <div class="rounded-xl border p-4 pair-card" :class="{
               'border-success/40 bg-success/5':  c.decision === 'ENTER',
               'border-warning/30 bg-warning/5':  c.decision === 'WAIT' && c.confidence >= 0.60,
-              'border-error/20 bg-error/5':      c.decision === 'BLOCKED',
+              'border-error/20 bg-error/5':      c.decision === 'BLOCKED' && !c.whitelist_blocked,
+              'border-base-300/50 bg-base-300/10 opacity-50': c.whitelist_blocked,
               'border-base-300 bg-base-300/30':  c.decision === 'NO_TRADE' || (c.decision !== 'BLOCKED' && c.confidence < 0.60)
             }">
 
@@ -402,9 +414,9 @@
                   <span class="badge badge-xs" :class="{
                     'badge-success': c.decision==='ENTER',
                     'badge-warning': c.decision==='WAIT',
-                    'badge-error':   c.decision==='BLOCKED',
-                    'badge-ghost':   c.decision==='NO_TRADE'
-                  }" x-text="c.decision"></span>
+                    'badge-error':   c.decision==='BLOCKED' && !c.whitelist_blocked,
+                    'badge-ghost':   c.decision==='NO_TRADE' || c.whitelist_blocked
+                  }" x-text="c.whitelist_blocked ? 'WLIST' : c.decision"></span>
                 </div>
               </div>
 
@@ -878,6 +890,79 @@
       </template>
     </div>
   </div>
+
+  <!-- ── Pair Whitelist ──────────────────────────────────────────────────── -->
+  <div class="bg-base-200 border border-base-300 rounded-2xl overflow-hidden">
+    <div class="flex items-center justify-between px-5 py-3 border-b border-base-300">
+      <div class="font-bold text-sm uppercase tracking-widest text-base-content/50">
+        <i class="ph ph-funnel mr-1"></i> Pair Whitelist
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs opacity-50" x-text="wl.updated_at ? 'Updated: ' + new Date(wl.updated_at).toLocaleString() : 'Not saved yet'"></span>
+        <span class="badge badge-sm" :class="wl.enabled ? 'badge-warning' : 'badge-ghost'"
+              x-text="wl.enabled ? '🔒 ACTIVE' : '🔓 DISABLED'"></span>
+      </div>
+    </div>
+
+    <div class="p-5 space-y-4">
+      <!-- Enable / Disable toggle -->
+      <div class="flex items-center gap-4">
+        <span class="text-sm font-medium">Whitelist enabled</span>
+        <input type="checkbox" class="toggle toggle-warning" x-model="wl.enabled">
+        <span class="text-xs opacity-50" x-text="wl.enabled
+          ? 'Only whitelisted pairs will be evaluated'
+          : 'All watchlist pairs evaluated (wide mode)'"></span>
+      </div>
+
+      <!-- Preset buttons -->
+      <div class="flex gap-2 flex-wrap items-center">
+        <span class="text-xs opacity-50">Presets:</span>
+        <button @click="wl.pairs = wl.alex_pairs.slice(); wl.enabled=true"
+                class="btn btn-xs btn-ghost border border-base-300">
+          🎯 Alex's 7
+        </button>
+        <button @click="wl.pairs = wl.all_known_pairs.slice(); wl.enabled=false"
+                class="btn btn-xs btn-ghost border border-base-300">
+          🌐 Wide (all)
+        </button>
+      </div>
+
+      <!-- Pair checklist -->
+      <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2">
+        <template x-for="pair in (wl.all_known_pairs || [])" :key="pair">
+          <label class="flex items-center gap-2 cursor-pointer p-2 rounded-lg border text-sm"
+                 :class="wl.pairs && wl.pairs.includes(pair)
+                   ? 'border-warning/50 bg-warning/10 font-medium'
+                   : 'border-base-300/30 opacity-50'">
+            <input type="checkbox" class="checkbox checkbox-xs checkbox-warning"
+                   :checked="wl.pairs && wl.pairs.includes(pair)"
+                   @change="wl.pairs && wl.pairs.includes(pair)
+                     ? wl.pairs = wl.pairs.filter(p => p !== pair)
+                     : wl.pairs.push(pair)">
+            <span class="font-mono text-xs" x-text="pair"></span>
+            <!-- Alex-pair indicator -->
+            <span x-show="wl.alex_pairs && wl.alex_pairs.includes(pair)"
+                  class="ml-auto text-warning text-xs" title="Alex's core pair">★</span>
+          </label>
+        </template>
+      </div>
+
+      <!-- Save button + feedback -->
+      <div class="flex items-center gap-3 pt-2">
+        <button @click="saveWhitelist()"
+                class="btn btn-warning btn-sm"
+                :disabled="wlSaving">
+          <i class="ph ph-floppy-disk mr-1"></i>
+          <span x-text="wlSaving ? 'Saving…' : 'Save Whitelist'"></span>
+        </button>
+        <span class="text-xs" :class="wlMsg.includes('error') ? 'text-error' : 'text-success'"
+              x-show="wlMsg" x-text="wlMsg"></span>
+        <span class="text-xs opacity-50 ml-auto"
+              x-text="(wl.pairs||[]).length + ' pair(s) selected'"></span>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <!-- ── Progress bar ─────────────────────────────────────── -->
@@ -921,10 +1006,14 @@ function dashboard() {
     btResults: [], btExpanded: null, btSelected: [],
     btStart: '2024-07-01', btEnd: '2024-10-31', btNotes: '',
     btRunning: false, btMsg: '', btPollTimer: null,
+    // ── Whitelist state ────────────────────────────────────────────────
+    wl: { enabled: false, pairs: [], all_known_pairs: [], alex_pairs: [], updated_at: null },
+    wlSaving: false, wlMsg: '',
 
     async init() {
       await this.refresh();
       await this.fetchNews();
+      await this.loadWhitelist();
       setInterval(() => this.refresh(), REFRESH_SECS * 1000);
       setInterval(() => this.fetchNews(), 5 * 60 * 1000);  // refresh news every 5 min
       setInterval(() => {
@@ -999,7 +1088,8 @@ function dashboard() {
           'tier_label','total_pnl','total_trades','win_rate','account_balance',
           'pattern_memory_count','regroup_ends',
           'last_scan_ts','last_decision_ts','last_state_write_ts','engine_sha',
-          'peak_source','session_allowed','session_reason','next_session','next_session_mins'];
+          'peak_source','session_allowed','session_reason','next_session','next_session_mins',
+          'whitelist_enabled','whitelist_pairs','whitelist_updated_at'];
         this.state = { ...(status.heartbeat || {}) };
         for (const k of _topFields) {
           if (status[k] !== undefined) this.state[k] = status[k];
@@ -1144,6 +1234,45 @@ function dashboard() {
         this.btMsg = 'Error: ' + e.message;
         this.btRunning = false;
       }
+    },
+
+    // ── Whitelist methods ──────────────────────────────────────────────
+    async loadWhitelist() {
+      try {
+        const r = await fetch('/api/whitelist');
+        const d = await r.json();
+        this.wl = { ...this.wl, ...d };
+      } catch(e) {
+        console.warn('Could not load whitelist:', e);
+      }
+    },
+
+    async saveWhitelist() {
+      this.wlSaving = true;
+      this.wlMsg = '';
+      try {
+        const r = await fetch('/api/whitelist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled: this.wl.enabled,
+            pairs:   this.wl.pairs,
+            reason:  'Dashboard update',
+          }),
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.wlMsg = `✅ ${d.message}`;
+          this.wl.updated_at = new Date().toISOString();
+          // Trigger status refresh so whitelist banner updates
+          await this.refresh();
+        } else {
+          this.wlMsg = '⚠️ Error: ' + (d.error || 'unknown');
+        }
+      } catch(e) {
+        this.wlMsg = 'Error: ' + e.message;
+      }
+      this.wlSaving = false;
     },
 
     tagColor(tag) {

@@ -18,6 +18,22 @@ HEARTBEAT_FILE = LOG_DIR / "forex_orchestrator.heartbeat"
 STATE_FILE     = LOG_DIR / "bot_state.json"
 DECISIONS_FILE = LOG_DIR / "decision_log.jsonl"
 CONTROL_FILE   = LOG_DIR / "bot_control.json"
+WHITELIST_FILE = LOG_DIR / "whitelist.json"
+
+# All known pairs across backtester + live universe (used for whitelist UI)
+ALL_KNOWN_PAIRS = [
+    "GBP/JPY", "USD/JPY", "USD/CHF", "GBP/CHF", "USD/CAD",
+    "EUR/USD", "GBP/USD", "NZD/USD", "GBP/NZD", "EUR/GBP",
+    "AUD/USD", "NZD/JPY", "EUR/CAD", "EUR/AUD", "AUD/JPY",
+    "EUR/JPY", "GBP/AUD", "GBP/CAD", "AUD/CAD", "AUD/NZD",
+    "EUR/NZD", "EUR/CHF", "NZD/CAD",
+]
+
+# Alex's 7 proven pairs (default whitelist)
+ALEX_PAIRS = [
+    "GBP/JPY", "USD/JPY", "USD/CHF", "GBP/CHF",
+    "USD/CAD", "EUR/USD", "GBP/USD",
+]
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.WARNING)
@@ -267,6 +283,9 @@ def api_status():
         "win_rate":           round(wr * 100, 1),
         "total_trades":       tot_tr,
         "total_pnl":          tot_pnl,
+        # whitelist
+        **{f"whitelist_{k}": v for k, v in _load_whitelist_state().items()
+           if k in ("enabled", "pairs", "updated_at")},
     })
 
 def _write_control_audit(command: str, reason: str):
@@ -310,6 +329,90 @@ def api_resume():
         CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONTROL_FILE.write_text(json.dumps({"command": "resume", "reason": reason}))
         return jsonify({"status": "ok", "command": "resume", "reason": reason})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+def _load_whitelist_state() -> dict:
+    """Read whitelist.json; return safe default if missing/corrupt."""
+    if WHITELIST_FILE.exists():
+        try:
+            data = json.loads(WHITELIST_FILE.read_text())
+            return {
+                "enabled":    bool(data.get("enabled", False)),
+                "pairs":      list(data.get("pairs", ALEX_PAIRS)),
+                "updated_at": data.get("updated_at"),
+                "updated_by": data.get("updated_by", "unknown"),
+            }
+        except Exception:
+            pass
+    return {
+        "enabled":    False,
+        "pairs":      list(ALEX_PAIRS),
+        "updated_at": None,
+        "updated_by": None,
+    }
+
+
+def _write_whitelist_audit(enabled: bool, pairs: list, reason: str = "UI update"):
+    """Append a WHITELIST_UPDATE entry to decision_log.jsonl."""
+    entry = {
+        "ts":      datetime.now(timezone.utc).isoformat(),
+        "event":   "WHITELIST_UPDATE",
+        "pair":    "ALL",
+        "source":  "dashboard",
+        "enabled": enabled,
+        "pairs":   pairs,
+        "reason":  reason,
+    }
+    try:
+        DECISIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DECISIONS_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        import logging
+        logging.getLogger("app").warning(f"Could not write whitelist audit: {e}")
+
+
+@app.route("/api/whitelist", methods=["GET"])
+def api_whitelist_get():
+    """Return current whitelist state + all known pairs for the UI checklist."""
+    state = _load_whitelist_state()
+    state["all_known_pairs"] = ALL_KNOWN_PAIRS
+    state["alex_pairs"]      = ALEX_PAIRS
+    return jsonify(state)
+
+
+@app.route("/api/whitelist", methods=["POST"])
+def api_whitelist_post():
+    """
+    Update whitelist state.  Body: {"enabled": bool, "pairs": [...], "reason": "..."}
+    Writes to whitelist.json (orchestrator picks it up next scan cycle).
+    Also appends a WHITELIST_UPDATE audit entry to decision_log.jsonl.
+    """
+    data    = request.get_json() or {}
+    enabled = bool(data.get("enabled", False))
+    pairs   = [str(p) for p in data.get("pairs", ALEX_PAIRS)]
+    reason  = data.get("reason", "Dashboard update")
+
+    payload = {
+        "enabled":    enabled,
+        "pairs":      pairs,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_by": "dashboard",
+        "reason":     reason,
+    }
+    try:
+        WHITELIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WHITELIST_FILE.write_text(json.dumps(payload, indent=2))
+        _write_whitelist_audit(enabled, pairs, reason)
+        return jsonify({
+            "status":  "ok",
+            "enabled": enabled,
+            "pairs":   pairs,
+            "message": f"Whitelist {'ENABLED' if enabled else 'DISABLED'} — "
+                       f"{len(pairs)} pairs active.",
+        })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 

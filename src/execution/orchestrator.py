@@ -63,6 +63,7 @@ logger = logging.getLogger("orchestrator")
 
 HEARTBEAT_FILE  = LOG_DIR / "forex_orchestrator.heartbeat"
 CONTROL_FILE    = LOG_DIR / "bot_control.json"   # Mike → Forge → bot command relay
+WHITELIST_FILE  = LOG_DIR / "whitelist.json"      # pair whitelist (persistent, UI-managed)
 
 WATCHLIST = [
     "USD/JPY", "GBP/CHF", "USD/CHF", "USD/CAD", "GBP/JPY",
@@ -456,9 +457,17 @@ class ForexOrchestrator:
                 f"watching {', '.join(macro_theme.confirming_pairs[:4])}"
             )
 
+        # ── Pair whitelist ────────────────────────────────────────────────────
+        wl_enabled, wl_pairs = self._load_whitelist()
+        if wl_enabled:
+            logger.info(f"Whitelist ACTIVE — trading only: {', '.join(sorted(wl_pairs))}")
+
         for pair in WATCHLIST:
             try:
-                self._evaluate_pair(pair, overnight=is_overnight, macro_theme=macro_theme)
+                self._evaluate_pair(
+                    pair, overnight=is_overnight, macro_theme=macro_theme,
+                    whitelist_enabled=wl_enabled, whitelist_pairs=wl_pairs,
+                )
             except Exception as e:
                 logger.error(f"{pair}: Evaluation error: {e}")
 
@@ -507,41 +516,9 @@ class ForexOrchestrator:
         conf_req     = MIN_CONFIDENCE
         conf_ok      = conf_val >= conf_req
 
-        # ── Derive "waiting for" — ordered by what needs to happen first
-        waiting = []
-        if not has_pattern:
-            waiting.append("Pattern to form")
-        if not has_level:
-            waiting.append("Price near key level")
-        if not trend_ok:
-            waiting.append("Multi-TF trend alignment")
-        if has_pattern and has_level and trend_ok and not conf_ok:
-            waiting.append(f"Confidence {conf_val:.0%} → {conf_req:.0%}")
-        if has_pattern and has_level and trend_ok and conf_ok and not has_signal:
-            waiting.append("Engulfing candle / entry signal")
-        # Pip equity gate — show if pattern exists but measured move is too small
+        # ── Pip equity: measured move in pips (neckline → target_1) ─────────
+        # Must be computed BEFORE the waiting-for list (used in pip equity gate).
         from src.strategy.forex import strategy_config as _sc_live
-        if has_pattern and _pip_equity > 0 and _pip_equity < _sc_live.MIN_PIP_EQUITY:
-            waiting.append(f"Pip equity {_pip_equity:.0f}p → {_sc_live.MIN_PIP_EQUITY:.0f}p min")
-        if not session_ok:
-            waiting.append("London session (3–8 AM ET)")
-        if not news_ok:
-            waiting.append("News blackout to clear")
-        if "max_concurrent" in ff:
-            waiting.append("Open position to close first")
-        if "currency_overlap" in ff:
-            waiting.append("Currency exposure to free up")
-        if "winner_rule" in ff:
-            waiting.append("Winner running — door closed until it stops")
-        if not waiting and decision.decision.value == "ENTER":
-            waiting.append("Nothing — ready to enter")
-        elif not waiting:
-            waiting.append("Building setup")
-
-        # Pip equity: measured move in pips (neckline → target_1)
-        # Reflects how much room the trade has to run — key priority signal.
-        # consolidation_breakout: use target_2 (2× range) — T1 is small by
-        # construction (= 1× range) but Alex runs these 2-3× minimum.
         _pip_mult   = 100.0 if "JPY" in pair.upper() else 10000.0
         _pip_equity = 0.0
         if has_pattern and decision.pattern.target_1 and decision.pattern.neckline:
@@ -550,6 +527,42 @@ class ForexOrchestrator:
                           if _is_cb and decision.pattern.target_2
                           else decision.pattern.target_1)
             _pip_equity = abs(decision.pattern.neckline - _pe_target) * _pip_mult
+
+        # ── Whitelist-blocked shortcut ────────────────────────────────────────
+        is_whitelist_blocked = "whitelist_blocked" in ff
+
+        # ── Derive "waiting for" — ordered by what needs to happen first ─────
+        waiting = []
+        if is_whitelist_blocked:
+            waiting.append("Not in active whitelist — edit in Backtests → Whitelist")
+        else:
+            if not has_pattern:
+                waiting.append("Pattern to form")
+            if not has_level:
+                waiting.append("Price near key level")
+            if not trend_ok:
+                waiting.append("Multi-TF trend alignment")
+            if has_pattern and has_level and trend_ok and not conf_ok:
+                waiting.append(f"Confidence {conf_val:.0%} → {conf_req:.0%}")
+            if has_pattern and has_level and trend_ok and conf_ok and not has_signal:
+                waiting.append("Engulfing candle / entry signal")
+            # Pip equity gate
+            if has_pattern and _pip_equity > 0 and _pip_equity < _sc_live.MIN_PIP_EQUITY:
+                waiting.append(f"Pip equity {_pip_equity:.0f}p → {_sc_live.MIN_PIP_EQUITY:.0f}p min")
+            if not session_ok:
+                waiting.append("London session (3–8 AM ET)")
+            if not news_ok:
+                waiting.append("News blackout to clear")
+            if "max_concurrent" in ff:
+                waiting.append("Open position to close first")
+            if "currency_overlap" in ff:
+                waiting.append("Currency exposure to free up")
+            if "winner_rule" in ff:
+                waiting.append("Winner running — door closed until it stops")
+            if not waiting and decision.decision.value == "ENTER":
+                waiting.append("Nothing — ready to enter")
+            elif not waiting:
+                waiting.append("Building setup")
 
         self._confluence_state[pair] = {
             "pair":        pair,
@@ -578,11 +591,32 @@ class ForexOrchestrator:
                 "session":       session_ok,
                 "news":          news_ok,
             },
-            "failed_filters": list(ff),
-            "waiting_for":    waiting,
+            "failed_filters":     list(ff),
+            "waiting_for":        waiting,
+            "whitelist_blocked":  is_whitelist_blocked,
         }
 
-    def _evaluate_pair(self, pair: str, overnight: bool = False, macro_theme=None):
+    def _evaluate_pair(
+        self, pair: str, overnight: bool = False, macro_theme=None,
+        whitelist_enabled: bool = False, whitelist_pairs: set = None,
+    ):
+        # ── Whitelist gate (before any API fetch — saves quota) ──────────────
+        if whitelist_enabled and whitelist_pairs is not None:
+            if pair not in whitelist_pairs:
+                from ..strategy.forex.set_and_forget import Decision, TradeDecision
+                blocked = TradeDecision(
+                    decision=Decision.BLOCKED,
+                    pair=pair,
+                    direction=None,
+                    reason=f"⛔ WHITELIST: {pair} not in active whitelist. "
+                           f"Enabled pairs: {', '.join(sorted(whitelist_pairs))}",
+                    confidence=0.0,
+                    failed_filters=["whitelist_blocked"],
+                )
+                self._capture_confluence(pair, blocked, macro_theme)
+                logger.debug(f"{pair}: WHITELIST_BLOCKED — skipping data fetch")
+                return
+
         df_w  = self._fetch_oanda_candles(pair, "W",  count=100)
         df_d  = self._fetch_oanda_candles(pair, "D",  count=200)
         df_4h = self._fetch_oanda_candles(pair, "H4", count=200)
@@ -933,6 +967,23 @@ class ForexOrchestrator:
         return now.day == 1 and now.hour == 9
 
     # ── Control File ──────────────────────────────────────────────────
+
+    def _load_whitelist(self) -> tuple[bool, set]:
+        """
+        Read logs/whitelist.json and return (enabled, pairs_set).
+        Returns (False, empty_set) if file missing → no whitelist active.
+        Called once per scan cycle (not per-pair) to avoid repeated disk reads.
+        """
+        if not WHITELIST_FILE.exists():
+            return False, set()
+        try:
+            data = json.loads(WHITELIST_FILE.read_text())
+            enabled = bool(data.get("enabled", False))
+            pairs   = set(str(p) for p in data.get("pairs", []))
+            return enabled, pairs
+        except Exception as e:
+            logger.warning(f"Could not read whitelist.json: {e}")
+            return False, set()
 
     def _check_control_file(self):
         """
