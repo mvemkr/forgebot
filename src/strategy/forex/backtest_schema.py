@@ -74,7 +74,9 @@ class BacktestResult:
     dd_killswitch_blocks:     int = 0   # DD kill-switch blocks
     adaptive_time_blocks:     int = 0   # ADAPTIVE_TIME_GATE (regime-gated Thu/Fri)
     strict_htf_blocks:        int = 0   # STRICT_PROTREND_HTF (all 3 must agree)
+    wd_htf_blocks:            int = 0   # WD_PROTREND_HTF (W+D required, 4H exempt)
     dyn_pip_eq_blocks:        int = 0   # DYN_PIP_EQUITY (stop_pips × MIN_RR)
+    wd_alignment_pct:         float = 0.0  # % entered trades where W==D agreed with direction
 
     # ── Regime score analytics ───────────────────────────────────────────
     regime_avg:          float = 0.0

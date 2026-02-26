@@ -34,7 +34,17 @@ from typing import Optional, Tuple, Any
 import src.strategy.forex.strategy_config as _cfg
 
 
-# ── HTF alignment helper ─────────────────────────────────────────────────────
+# ── HTF alignment helpers ─────────────────────────────────────────────────────
+
+def _bull(t: Any) -> bool:
+    """True when trend is bullish or strong_bullish."""
+    return t is not None and hasattr(t, "value") and t.value in ("bullish", "strong_bullish")
+
+
+def _bear(t: Any) -> bool:
+    """True when trend is bearish or strong_bearish."""
+    return t is not None and hasattr(t, "value") and t.value in ("bearish", "strong_bearish")
+
 
 def htf_aligned(
     direction: str,
@@ -43,26 +53,50 @@ def htf_aligned(
     trend_4h:     Any = None,
 ) -> Optional[bool]:
     """
+    ALL-THREE gate: weekly + daily + 4H must agree with direction.
+
     Returns:
-      True  — all 3 HTFs agree with direction (pro-trend)
+      True  — all 3 HTFs agree with direction (strict pro-trend)
       False — at least one HTF opposes direction (counter/mixed)
       None  — insufficient trend data to determine
 
-    trend_* can be a Trend enum or None.
+    Use htf_aligned_wd() when 4H alignment is intentionally excluded
+    (e.g. retracement entries where 4H is mid-reversal).
     """
     if trend_weekly is None or trend_daily is None or trend_4h is None:
         return None
-
-    def _bull(t) -> bool:
-        return t is not None and hasattr(t, "value") and t.value in ("bullish", "strong_bullish")
-
-    def _bear(t) -> bool:
-        return t is not None and hasattr(t, "value") and t.value in ("bearish", "strong_bearish")
 
     if direction == "long":
         return _bull(trend_weekly) and _bull(trend_daily) and _bull(trend_4h)
     elif direction == "short":
         return _bear(trend_weekly) and _bear(trend_daily) and _bear(trend_4h)
+    return None
+
+
+def htf_aligned_wd(
+    direction: str,
+    trend_weekly: Any = None,
+    trend_daily:  Any = None,
+) -> Optional[bool]:
+    """
+    WEEKLY+DAILY gate: only weekly AND daily must agree with direction.
+    4H is intentionally excluded — Alex enters during 4H retracements;
+    the 1H engulfing candle at a key level IS the effective 4H confirmation.
+
+    Returns:
+      True  — weekly and daily both agree with direction
+      False — weekly or daily opposes direction
+      None  — insufficient data (weekly or daily is None)
+
+    Use htf_aligned() when you also need the 4H to agree.
+    """
+    if trend_weekly is None or trend_daily is None:
+        return None
+
+    if direction == "long":
+        return _bull(trend_weekly) and _bull(trend_daily)
+    elif direction == "short":
+        return _bear(trend_weekly) and _bear(trend_daily)
     return None
 
 

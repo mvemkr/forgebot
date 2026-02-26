@@ -492,7 +492,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  adaptive_threshold: float = 0.5,
                  policy_tag: str = "",
                  strict_protrend_htf: bool = False,
-                 dynamic_pip_equity: bool = False):
+                 dynamic_pip_equity: bool = False,
+                 wd_protrend_htf: bool = False):
     """Run a single backtest simulation.
 
     quiet=True suppresses all stdout (useful when called from compare scripts).
@@ -521,6 +522,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             policy_tag=policy_tag,
             strict_protrend_htf=strict_protrend_htf,
             dynamic_pip_equity=dynamic_pip_equity,
+            wd_protrend_htf=wd_protrend_htf,
         )
     finally:
         _sys.stdout = _orig_stdout
@@ -536,7 +538,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                        adaptive_threshold: float = 0.5,
                        policy_tag: str = "",
                        strict_protrend_htf: bool = False,
-                       dynamic_pip_equity: bool = False):
+                       dynamic_pip_equity: bool = False,
+                       wd_protrend_htf: bool = False):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     # Extend data fetch so open positions can run to natural close after the entry window.
     # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
@@ -767,7 +770,9 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _min_rr_small_blocks:   int  = 0   # blocked by MIN_RR_ALIGN (non-protrend)
     _adaptive_time_blocks:  int  = 0   # blocked by adaptive Thu/Fri regime gate
     _strict_htf_blocks:     int  = 0   # blocked by strict protrend HTF gate (all 3 must agree)
+    _wd_htf_blocks:         int  = 0   # blocked by W+D protrend gate (W==D required, 4H exempt)
     _dyn_pip_eq_blocks:     int  = 0   # blocked by dynamic pip equity (stop_pips × MIN_RR)
+    _wd_aligned_entries:    int  = 0   # entered trades where W==D agreed with direction
     _countertrend_htf_blocks: int = 0  # blocked by COUNTERTREND_HTF filter
     _time_block_counts:     dict = {}  # {reason_code: count} — Sunday/Thu/Fri blocks
 
@@ -1544,10 +1549,9 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                             f"already used ISO {_iso_key_adp[0]}-W{_iso_key_adp[1]:02d}")
                     continue
 
-            # ── Gate 4 (strict_protrend): ALL three HTFs must agree with direction ──
-            # Stricter than REQUIRE_HTF_TREND_ALIGNMENT (which only blocks when all 3
-            # oppose).  This gate blocks any trade where W, D, and 4H are NOT all
-            # explicitly aligned with the trade direction — mixed signals blocked too.
+            # ── Gate 4a (strict_protrend): ALL three HTFs must agree with direction ──
+            # Requires W+D+4H all agree.  Usually overconstrained at entry since 4H
+            # is often mid-retracement — prefer Gate 4b (wd_protrend_htf) instead.
             if strict_protrend_htf:
                 _sp_htf = alex_policy.htf_aligned(
                     decision.direction or "",
@@ -1565,6 +1569,39 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     log_gap(ts_utc, pair, "ENTER", "BLOCKED", "STRICT_PROTREND_HTF",
                             f"{_sp_reason} (direction={decision.direction})")
                     continue
+
+            # ── Gate 4b (wd_protrend_htf): Weekly AND Daily must agree, 4H exempt ──
+            # Alex enters during 4H retracements; W+D bias sets the macro direction.
+            # The 1H engulfing at a key level IS the 4H flip/confirmation — requiring
+            # 4H to already agree means you miss the entry entirely.
+            # Gate: block if W or D opposes direction; allow 4H mixed/neutral/counter.
+            if wd_protrend_htf:
+                _wd_flag = alex_policy.htf_aligned_wd(
+                    decision.direction or "",
+                    decision.trend_weekly,
+                    decision.trend_daily,
+                )
+                if _wd_flag is not True:
+                    _wd_htf_blocks += 1
+                    _wd_reason = (
+                        "W/D trend data missing"
+                        if _wd_flag is None
+                        else f"W/D not both {decision.direction} (4H exempt)"
+                    )
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "WD_PROTREND_HTF",
+                            f"{_wd_reason} (direction={decision.direction})")
+                    continue
+
+            # ── W==D alignment tracker (always, for all entered trades) ──────────
+            # Tracks % of entered trades that had W+D protrend — useful diagnostic
+            # independent of whether any gate is active.
+            _wd_check = alex_policy.htf_aligned_wd(
+                decision.direction or "",
+                decision.trend_weekly,
+                decision.trend_daily,
+            )
+            if _wd_check is True:
+                _wd_aligned_entries += 1
 
             strat = strategies[pair]
 
@@ -1743,7 +1780,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
           f"({len(wins)}W / {len(losses)}L / {len(scratches)}S)")
     print(f"  Win rate:     {wr:.0f}%  (all)    "
           f"Conditional (excl scratch): {cond_wr:.0f}%")
-    print(f"  Scratch rate: {len(scratches)/len(trades)*100:.0f}%  "
+    _scratch_pct = len(scratches) / len(trades) * 100 if trades else 0.0
+    print(f"  Scratch rate: {_scratch_pct:.0f}%  "
           f"({len(scratches)} of {len(trades)} trades)")
     print(f"  Avg R:        {avg_r:>+.2f}R  "
           f"(W: {avg_r_w:>+.1f}R  L: {avg_r_l:>+.1f}R  S: {avg_r_s:>+.1f}R)")
@@ -1770,12 +1808,15 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _rr_p95  = _rr_vals[int(len(_rr_vals)*0.95)] if _rr_vals else 0
 
     print(f"\n  ── Per-trade postmortem ───────────────────────────────────")
-    print(f"    Exec RR avg:          {_avg_plan_rr:.2f}R  (n={_plan_rr_n})")
-    print(f"    Exec RR p50/p95:      {_rr_p50:.2f}R / {_rr_p95:.2f}R")
-    print(f"    Exec RR < 2.8:        {len(_low_rr)} trades ({len(_low_rr)/len(trades)*100:.0f}%)  ← should be ~0 after fix")
-    print(f"    Exec RR = 0 (N/A):    {len(_zero_rr)} trades  ← no qualifying target at entry")
-    print(f"    Avg MFE:              {_avg_mfe:+.2f}R")
-    print(f"    Avg MAE:              {_avg_mae:+.2f}R")
+    if trades:
+        print(f"    Exec RR avg:          {_avg_plan_rr:.2f}R  (n={_plan_rr_n})")
+        print(f"    Exec RR p50/p95:      {_rr_p50:.2f}R / {_rr_p95:.2f}R")
+        print(f"    Exec RR < 2.8:        {len(_low_rr)} trades ({len(_low_rr)/len(trades)*100:.0f}%)  ← should be ~0 after fix")
+        print(f"    Exec RR = 0 (N/A):    {len(_zero_rr)} trades  ← no qualifying target at entry")
+        print(f"    Avg MFE:              {_avg_mfe:+.2f}R")
+        print(f"    Avg MAE:              {_avg_mae:+.2f}R")
+    else:
+        print("    (no trades — all entries blocked by active gates)")
     print(f"\n  ── Exit reason counts ────────────────────────────────────")
     _reason_order = ["target_reached", "weekend_proximity",
                      "ratchet_stop_hit", "stop_hit", "max_hold", "runout_expired"]
@@ -1786,7 +1827,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         cnt = _exit_counts[reason]
         avg_r = (sum(t["r"] for t in trades if t["reason"] == reason) / cnt
                  if cnt else 0.0)
-        print(f"    {reason:<30} {cnt:>3}  ({cnt/len(trades)*100:.0f}%)  "
+        _epct = cnt / len(trades) * 100 if trades else 0.0
+        print(f"    {reason:<30} {cnt:>3}  ({_epct:.0f}%)  "
               f"avg {avg_r:+.2f}R")
 
     if _trigger_counts:
@@ -2103,6 +2145,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             "adaptive_gates":                    adaptive_gates,
             "adaptive_threshold":                adaptive_threshold,
             "strict_protrend_htf":               strict_protrend_htf,
+            "wd_protrend_htf":                   wd_protrend_htf,
             "dynamic_pip_equity":                dynamic_pip_equity,
             "policy_tag":                        policy_tag,
         },
@@ -2197,7 +2240,10 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         dd_killswitch_blocks     = dd_killswitch_blocks,
         adaptive_time_blocks     = _adaptive_time_blocks,
         strict_htf_blocks        = _strict_htf_blocks,
+        wd_htf_blocks            = _wd_htf_blocks,
         dyn_pip_eq_blocks        = _dyn_pip_eq_blocks,
+        wd_alignment_pct         = (_wd_aligned_entries / len(trades) * 100
+                                    if trades else 0.0),
         # ── Regime analytics ─────────────────────────────────────────
         regime_scores      = _regime_scores,
         regime_avg         = sum(_regime_scores) / len(_regime_scores) if _regime_scores else 0.0,
