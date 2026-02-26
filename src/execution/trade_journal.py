@@ -362,3 +362,28 @@ class TradeJournal:
             except Exception:
                 pass
         return dict(sorted(weekly.items()))
+
+    def get_trades_this_week(self, as_of: "datetime | None" = None) -> int:
+        """
+        Return the number of trades *entered* (TRADE_OPENED events) in the
+        current ISO calendar week up to *as_of* (defaults to now UTC).
+
+        Used by the live orchestrator to enforce the weekly punch-card gate
+        (alex_policy.check_weekly_trade_limit).
+        """
+        if as_of is None:
+            as_of = datetime.now(timezone.utc)
+        iso_year, iso_week, _ = as_of.isocalendar()
+        entries = self._load_all()
+        count = 0
+        for e in entries:
+            if e.get("event") != "TRADE_OPENED":
+                continue
+            try:
+                dt = datetime.fromisoformat(e["timestamp"])
+                y, w, _ = dt.isocalendar()
+                if y == iso_year and w == iso_week:
+                    count += 1
+            except Exception:
+                pass
+        return count

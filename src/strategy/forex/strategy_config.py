@@ -647,16 +647,24 @@ def load_profile(profile_name: str) -> dict:
 
 
 # ── Model tag helper ────────────────────────────────────────────────────────
-def get_model_tags() -> list:
+def get_model_tags(trail_arm: str = "", pairs_hash: str = "") -> list:
     """
     Returns a list of short descriptive tags capturing ALL active levers.
     Written into every backtest result record so you can always reproduce
     exactly what config produced a given number.
 
     Tags are stable short strings — sort + join them to get a run fingerprint.
+
+    Args:
+        trail_arm:   Trail arm key ("A", "B", "C") — injected by run_backtest().
+        pairs_hash:  MD5[:6] of sorted active pairs list — injected by run_backtest().
     """
     m = _sys.modules[__name__]
     tags = []
+
+    # ── Trail arm (injected by caller) ───────────────────────────────────────
+    if trail_arm:
+        tags.append(f"trail_{trail_arm}")
 
     # ── Peak direction + weekly stall ───────────────────────────────────────
     if not m.REQUIRE_PEAKS_AT_LEVEL:
@@ -749,4 +757,25 @@ def get_model_tags() -> list:
     tags.append(f"rr_{m.MIN_RR:.1f}")
     tags.append(f"max_concurrent_{m.MAX_CONCURRENT_TRADES_BACKTEST}")
 
-    return tags
+    # ── Alex small-account gate flags ────────────────────────────────────────
+    # These must be recorded per-run so compare harnesses are reproducible.
+    # Convention: "on" suffix = gate active; absence = gate off.
+    if getattr(m, "NO_SUNDAY_TRADES_ENABLED",    False): tags.append("no_sun")
+    if getattr(m, "NO_THU_FRI_TRADES_ENABLED",   False): tags.append("no_thu_fri")
+    if getattr(m, "REQUIRE_HTF_TREND_ALIGNMENT",  False): tags.append("htf_gate")
+    _wk_small = getattr(m, "MAX_TRADES_PER_WEEK_SMALL", 999)
+    if _wk_small < 999:
+        _wk_std = getattr(m, "MAX_TRADES_PER_WEEK_STANDARD", 999)
+        tags.append(f"wk_{_wk_small}s_{_wk_std}n")   # e.g. wk_1s_2n = 1/wk small, 2/wk normal
+    _rr_small = getattr(m, "MIN_RR_SMALL_ACCOUNT", 0.0)
+    _rr_std   = getattr(m, "MIN_RR_STANDARD",      0.0)
+    if _rr_small and _rr_small != _rr_std:
+        tags.append(f"dyn_rr_{_rr_small:.1f}s")
+    if getattr(m, "INDECISION_FILTER_ENABLED", False): tags.append("doji_gate")
+
+    # ── Pairs hash (injected by caller) ─────────────────────────────────────
+    if pairs_hash:
+        tags.append(f"pairs_{pairs_hash}")
+
+    # ── Defensive: ensure all tags are plain strings (no dict / object leak) ─
+    return [str(t) for t in tags]

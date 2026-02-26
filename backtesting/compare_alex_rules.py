@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import src.strategy.forex.strategy_config as _cfg
 from backtesting.oanda_backtest_v2 import run_backtest, TRAIL_ARMS
+from src.strategy.forex.backtest_schema import BacktestResult
 
 # ── Parity assertions ─────────────────────────────────────────────────────
 assert _cfg.MAX_CONCURRENT_TRADES_LIVE == 1, "MAX_CONCURRENT_LIVE must be 1"
@@ -74,9 +75,11 @@ WINDOWS = {
         datetime(2024, 7, 15, tzinfo=timezone.utc),
         datetime(2024, 10, 31, tzinfo=timezone.utc),
     ),
-    "W2_Jan_2026": (
-        datetime(2026, 1,  1, tzinfo=timezone.utc),
-        datetime(2026, 1, 31, tzinfo=timezone.utc),
+    # W2: extended to Dec–Feb to get 20+ trades (Jan alone is 8 — too small).
+    # Cache covers through Feb 25 2026; keep end at Feb 25 to avoid OANDA refetch.
+    "W2_Dec2025-Feb2026": (
+        datetime(2025, 12,  1, tzinfo=timezone.utc),
+        datetime(2026,  2, 25, tzinfo=timezone.utc),
     ),
 }
 
@@ -112,42 +115,64 @@ def _restore() -> None:
     _cfg.MIN_RR_STANDARD             = 2.5
 
 
-def _run(arm: ArmConfig, start: datetime, end: datetime) -> dict:
+def _run(arm: ArmConfig, start: datetime, end: datetime) -> BacktestResult:
     _patch(arm)
     try:
         return run_backtest(
-            start_dt     = start,
-            end_dt       = end,
-            starting_bal = STARTING_BAL,
-            trail_cfg    = TRAIL_ARMS[ARM_KEY],
-            quiet        = True,
+            start_dt      = start,
+            end_dt        = end,
+            starting_bal  = STARTING_BAL,
+            trail_cfg     = TRAIL_ARMS[ARM_KEY],
+            trail_arm_key = ARM_KEY,
+            quiet         = True,
         )
     finally:
         _restore()
 
 
-def _fmt(r: dict, arm: ArmConfig) -> tuple:
-    trades  = r.get("trades", [])
-    n       = len(trades)
-    ret     = r.get("ret_pct", 0.0)
-    dd      = r.get("max_dd_pct", 0.0)
-    wr      = r.get("win_rate", 0.0)
-    avg_r   = sum(t.get("r", 0) for t in trades) / n if n else 0.0
-    best_r  = max((t.get("r", 0) for t in trades), default=0.0)
-    worst_r = min((t.get("r", 0) for t in trades), default=0.0)
+def _arm_config_str(arm: ArmConfig) -> str:
+    """One-line config summary for a table row."""
+    parts = [f"trail={ARM_KEY}", f"min_rr=2.5", f"pairs=alex7"]
+    parts.append("sun=off" if arm.time_rules else "sun=ON")
+    parts.append("thu_fri=off" if arm.time_rules else "thu_fri=ON")
+    parts.append("htf=off" if arm.htf_alignment else "htf=ON")
+    parts.append(f"wk={'1s/2n' if arm.weekly_limit else 'off'}")
+    parts.append(f"dyn_rr={'3.0s' if arm.dynamic_min_rr else 'off'}")
+    parts.append("doji=on")   # always on (production default)
+    return "  ".join(parts)
+
+
+def _fmt(r: BacktestResult, arm: ArmConfig) -> tuple:
+    n       = r.n_trades
+    avg_r   = r.avg_r
+    best_r  = r.best_r
+    worst_r = r.worst_r
+    dd      = r.max_dd_pct
+    ret     = r.return_pct
+    wr      = r.win_rate
+    trades  = r.trades
     wins    = sum(1 for t in trades if t.get("r", 0) > 0.1)
     losses  = sum(1 for t in trades if t.get("r", 0) < -0.1)
     scratch = n - wins - losses
     wl = f"{wins}W/{losses}L/{scratch}S"
-    blocks = (
-        f"time={r.get('time_blocks',0)} "
-        f"htf={r.get('countertrend_htf_blocks',0)} "
-        f"wkly={r.get('weekly_limit_blocks',0)} "
-        f"rr={r.get('min_rr_small_blocks',0)} "
-        f"doji={r.get('indecision_doji_blocks',0)}"
+    # Gate hit counts — per-gate columns so delta is instantly readable
+    return (
+        arm.label,
+        n,
+        wl,
+        f"{avg_r:+.2f}R",
+        f"{best_r:+.2f}R",
+        f"{worst_r:+.2f}R",
+        f"{dd:.1f}%",
+        f"{ret:+.1f}%",      # return% secondary — small N makes it noisy
+        f"{wr:.0%}",
+        # gate hit counts as individual cells
+        str(r.time_blocks),
+        str(r.countertrend_htf_blocks),
+        str(r.weekly_limit_blocks),
+        str(r.min_rr_small_blocks),
+        str(r.indecision_doji_blocks),
     )
-    return (arm.label, n, f"{ret:+.1f}%", f"{dd:.1f}%", f"{wr:.0%}",
-            f"{avg_r:+.2f}R", f"{best_r:+.2f}R", f"{worst_r:+.2f}R", wl, blocks)
 
 
 def _exit_summary(trades: list) -> str:
@@ -165,26 +190,44 @@ def _exit_summary(trades: list) -> str:
 
 
 def main() -> None:
-    HDR = ["Arm", "N", "Ret%", "MaxDD", "WR", "AvgR", "BestR", "WorstR", "W/L/S", "Blocks"]
-    WID = [48,     4,   8,      7,       5,    8,       8,       8,        14,       55]
+    # ── Column layout — performance FIRST, gate counts last ──────────────
+    # Primary headline: N trades / W/L/S / AvgR / BestR / WorstR / MaxDD
+    # Return% is secondary: small N makes it statistically noisy.
+    # Gate counts: individual columns (not a compound string) so Δ is instant.
+    HDR = ["Arm", "N", "W/L/S", "AvgR", "BestR", "WrstR", "MaxDD", "Ret%", "WR",
+           "sun", "htf", "wkly", "rr", "doji"]
+    WID = [48,     4,   14,      8,      8,        8,       7,       8,     5,
+           4,     4,    5,      4,     5]
 
-    print("\n" + "═" * 100)
+    print("\n" + "═" * 110)
     print("  ALEX SMALL-ACCOUNT RULES — GATE-BY-GATE IMPACT")
-    print("═" * 100)
-    print(f"  Trail: Arm {ARM_KEY} | MAX_CONCURRENT=1 | MIN_RR=2.5→3.0(dynamic) | START=${STARTING_BAL:,.0f}")
-    print(f"  Each arm adds one gate cumulatively (B = A + time; C = B + HTF; etc.)")
+    print("═" * 110)
+    print(f"  Trail Arm {ARM_KEY} | MAX_CONCURRENT=1 | START=${STARTING_BAL:,.0f} | pairs=Alex 7")
+    print(f"  Arms are CUMULATIVE: B = A + time gates; C = B + HTF; D = C + weekly; E = D + dyn-RR")
+    print(f"  Headline: N / W/L/S / AvgR / BestR / WorstR / MaxDD")
+    print(f"  Return% is secondary — N<20 makes it statistically noisy (1 outlier = ±20%)")
+    print(f"  Gate cols: blocked entries by gate type (not trades — one entry can be blocked N times)")
 
-    all_results: dict[str, dict[str, dict]] = {}
+    all_results: dict[str, dict[str, BacktestResult]] = {}
 
     for win_name, (start, end) in WINDOWS.items():
-        print(f"\n{'─' * 100}")
-        print(f"  Window: {win_name}  [{start.date()} → {end.date()}]")
-        print(f"{'─' * 100}")
+        days = (end - start).days
+        print(f"\n{'─' * 110}")
+        print(f"  Window: {win_name}  [{start.date()} → {end.date()}]  ({days}d)")
+        print(f"{'─' * 110}")
+
+        # Config header — one line per arm showing active gates
+        print(f"  {'Config':<48}  {'Gates active'}")
+        print(f"  {'─' * 107}")
+        for arm_name, arm in ARMS.items():
+            print(f"  {arm.label:<48}  {_arm_config_str(arm)}")
+        print()
+
         hdr_str = "  ".join(f"{h:<{w}}" for h, w in zip(HDR, WID))
         print(f"  {hdr_str}")
-        print(f"  {'─' * 95}")
+        print(f"  {'─' * 107}")
 
-        win_res: dict[str, dict] = {}
+        win_res: dict[str, BacktestResult] = {}
         for arm_name, arm in ARMS.items():
             r    = _run(arm, start, end)
             win_res[arm_name] = r
@@ -194,57 +237,59 @@ def main() -> None:
         all_results[win_name] = win_res
 
     # ── Detailed exit breakdown ───────────────────────────────────────────
-    print(f"\n\n{'═' * 100}")
+    print(f"\n\n{'═' * 110}")
     print("  EXIT BREAKDOWN BY ARM")
     print("═" * 100)
     for win_name, win_res in all_results.items():
         print(f"\n  [{win_name}]")
         for arm_name, arm in ARMS.items():
-            trades = win_res[arm_name].get("trades", [])
-            if not trades:
+            r: BacktestResult = win_res[arm_name]
+            if not r.trades:
                 print(f"    {arm.label[:46]}  — no trades")
                 continue
             print(f"    {arm.label}")
-            print(f"      {_exit_summary(trades)}")
+            print(f"      {_exit_summary(r.trades)}")
 
     # ── Δ table: gate-by-gate impact ─────────────────────────────────────
-    print(f"\n\n{'═' * 100}")
-    print("  GATE-BY-GATE DELTA (vs A_baseline)")
-    print("═" * 100)
+    print(f"\n\n{'═' * 110}")
+    print("  GATE-BY-GATE DELTA (vs A_baseline)  — primary: AvgRΔ / N-Δ / DDΔ")
+    print("═" * 110)
     arm_seq = list(ARMS.keys())
     for win_name, win_res in all_results.items():
         print(f"\n  [{win_name}]")
-        base = win_res["A_baseline"]
-        base_ret  = base.get("return_pct", 0)
-        base_dd   = base.get("max_dd_pct", 0)
-        base_n    = len(base.get("trades", []))
-        base_wr   = base.get("win_rate", 0)
-        base_avgr = sum(t.get("r",0) for t in base.get("trades",[])) / max(base_n,1)
-        print(f"    {'Gate':<48}  N-Δ   RetΔ    DDΔ     WRΔ    AvgRΔ  Blocks")
-        print(f"    {'─' * 95}")
+        base: BacktestResult = win_res["A_baseline"]
+        base_n    = base.n_trades
+        base_ret  = base.return_pct
+        base_dd   = base.max_dd_pct
+        base_wr   = base.win_rate
+        base_avgr = base.avg_r
+        base_best = base.best_r
+        print(f"    {'Gate':<48}  N-Δ  AvgRΔ    BestRΔ   DDΔ     WRΔ    RetΔ    sun htf wkly rr doji")
+        print(f"    {'─' * 107}")
         for arm_name in arm_seq[1:]:
-            arm    = ARMS[arm_name]
-            r      = win_res[arm_name]
-            n      = len(r.get("trades", []))
-            avgr   = sum(t.get("r",0) for t in r.get("trades",[])) / max(n,1)
-            nd     = n - base_n
-            retd   = r.get("ret_pct",0) - base_ret
-            ddd    = r.get("max_dd",0) - base_dd
-            wrd    = r.get("win_rate",0) - base_wr
-            avgrd  = avgr - base_avgr
-            total_blk = (r.get("time_blocks",0) + r.get("countertrend_htf_blocks",0) +
-                         r.get("weekly_limit_blocks",0) + r.get("min_rr_small_blocks",0) +
-                         r.get("indecision_doji_blocks",0))
+            arm = ARMS[arm_name]
+            r: BacktestResult = win_res[arm_name]
+            nd    = r.n_trades - base_n
+            avgrd = r.avg_r      - base_avgr
+            bestd = r.best_r     - base_best
+            ddd   = r.max_dd_pct - base_dd
+            wrd   = r.win_rate   - base_wr
+            retd  = r.return_pct - base_ret
             print(f"    {arm.label:<48}  "
-                  f"{nd:+3}   {retd:+6.1f}%  {ddd:+6.1f}%  {wrd:+5.0%}  {avgrd:+.2f}R  {total_blk}")
+                  f"{nd:+3}  {avgrd:+.2f}R   {bestd:+.2f}R   "
+                  f"{ddd:+5.1f}%  {wrd:+4.0%}  {retd:+6.1f}%  "
+                  f"{r.time_blocks:3} {r.countertrend_htf_blocks:3} "
+                  f"{r.weekly_limit_blocks:4} {r.min_rr_small_blocks:2} "
+                  f"{r.indecision_doji_blocks:4}")
 
     # ── Entry hour histogram ─────────────────────────────────────────────
-    print(f"\n\n{'═' * 100}")
+    print(f"\n\n{'═' * 110}")
     print("  ENTRY HOUR HISTOGRAM (UTC) — Arm A baseline")
     print("═" * 100)
     from collections import Counter
     for win_name, win_res in all_results.items():
-        trades = win_res["A_baseline"].get("trades", [])
+        r_base: BacktestResult = win_res["A_baseline"]
+        trades = r_base.trades
         hours  = Counter()
         for t in trades:
             ts = t.get("entry_ts", "")
@@ -262,22 +307,20 @@ def main() -> None:
                        "Asian"  if 0 <= h < 7  else "Late")
             print(f"    {h:02d}:00 UTC  {bar:<12}  {hours[h]}  ({session})")
 
-    print(f"\n{'═' * 100}")
+    print(f"\n{'═' * 110}")
     print("  VERDICT")
     print("═" * 100)
     for win_name, win_res in all_results.items():
-        ra = win_res["A_baseline"]
-        rf = win_res[list(ARMS.keys())[-1]]
-        nA = len(ra.get("trades", []))
-        nF = len(rf.get("trades", []))
+        ra: BacktestResult = win_res["A_baseline"]
+        rf: BacktestResult = win_res[list(ARMS.keys())[-1]]
         print(f"\n  {win_name}:")
-        print(f"    Baseline → All-gates:  {nA} trades → {nF} trades  "
-              f"return {ra.get('return_pct',0):+.1f}% → {rf.get('return_pct',0):+.1f}%  "
-              f"DD {ra.get('max_dd_pct',0):.1f}% → {rf.get('max_dd_pct',0):.1f}%  "
-              f"avgR {sum(t.get('r',0) for t in ra.get('trades',[])) / max(nA,1):+.2f} → "
-              f"{sum(t.get('r',0) for t in rf.get('trades',[])) / max(nF,1):+.2f}")
-        total_blk = (rf.get("time_blocks",0) + rf.get("countertrend_htf_blocks",0) +
-                     rf.get("weekly_limit_blocks",0) + rf.get("min_rr_small_blocks",0))
+        print(f"    Baseline → All-gates:  {ra.n_trades} trades → {rf.n_trades} trades  "
+              f"return {ra.return_pct:+.1f}% → {rf.return_pct:+.1f}%  "
+              f"DD {ra.max_dd_pct:.1f}% → {rf.max_dd_pct:.1f}%  "
+              f"avgR {ra.avg_r:+.2f}R → {rf.avg_r:+.2f}R")
+        total_blk = (rf.time_blocks + rf.countertrend_htf_blocks +
+                     rf.weekly_limit_blocks + rf.min_rr_small_blocks +
+                     rf.indecision_doji_blocks)
         print(f"    Total entries blocked by new gates: {total_blk}")
     print()
 

@@ -76,6 +76,8 @@ from src.strategy.forex.strategy_config import (
     DRY_RUN_PAPER_BALANCE,
     CACHE_VERSION,
 )
+from src.strategy.forex.backtest_schema import BacktestResult
+from src.strategy.forex import alex_policy
 
 # ── Backtest-only config ──────────────────────────────────────────────────────
 BACKTEST_START  = datetime(2025, 7, 1, tzinfo=timezone.utc)   # ~7 months of history
@@ -479,22 +481,33 @@ def _load_cache() -> Optional[tuple]:  # noqa: deprecated
 def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  starting_bal: float = STARTING_BAL, notes: str = "",
                  trail_cfg: Optional[dict] = None,
+                 trail_arm_key: str = "",
                  preloaded_candle_data: Optional[dict] = None,
                  use_cache: bool = True,
                  quiet: bool = False):
     """Run a single backtest simulation.
 
     quiet=True suppresses all stdout (useful when called from compare scripts).
-    The return dict is always populated regardless of quiet mode.
+    The BacktestResult is always populated regardless of quiet mode.
+
+    trail_arm_key: label stored in model_tags and _result_record (e.g. "A", "B", "C").
+                   Auto-detected from trail_cfg if omitted.
     """
-    import io, contextlib, sys as _sys
+    import io, sys as _sys
+    # Auto-detect arm key from trail_cfg if not provided
+    if not trail_arm_key and trail_cfg:
+        for _k, _v in TRAIL_ARMS.items():
+            if all(trail_cfg.get(f) == _v.get(f)
+                   for f in ("TRAIL_ACTIVATE_R", "TRAIL_LOCK_R", "TRAIL_STAGE2_R")):
+                trail_arm_key = _k
+                break
     _orig_stdout = _sys.stdout
     if quiet:
         _sys.stdout = io.StringIO()
     try:
         return _run_backtest_body(
             start_dt=start_dt, end_dt=end_dt, starting_bal=starting_bal,
-            notes=notes, trail_cfg=trail_cfg,
+            notes=notes, trail_cfg=trail_cfg, trail_arm_key=trail_arm_key,
             preloaded_candle_data=preloaded_candle_data, use_cache=use_cache,
         )
     finally:
@@ -504,6 +517,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
 def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                        starting_bal: float = STARTING_BAL, notes: str = "",
                        trail_cfg: Optional[dict] = None,
+                       trail_arm_key: str = "",
                        preloaded_candle_data: Optional[dict] = None,
                        use_cache: bool = True):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
@@ -1424,34 +1438,29 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             if units <= 0:
                 continue
 
-            # ── Alex small-account gates ───────────────────────────────────
+            # ── Alex small-account gates (via shared alex_policy module) ──
+            # Parity note: live orchestrator calls the same functions from
+            # src/strategy/forex/alex_policy.py — single source of truth.
 
             # Gate 1: Dynamic MIN_RR — stricter when equity < $25K
-            _dynamic_min_rr = (
-                _sc.MIN_RR_SMALL_ACCOUNT
-                if balance < _sc.SMALL_ACCOUNT_THRESHOLD
-                else _sc.MIN_RR_STANDARD
+            _rr_blocked, _rr_reason = alex_policy.check_dynamic_min_rr(
+                decision.exec_rr, balance
             )
-            if decision.exec_rr < _dynamic_min_rr:
+            if _rr_blocked:
                 _min_rr_small_blocks += 1
                 log_gap(ts_utc, pair, "ENTER", "BLOCKED", "MIN_RR_SMALL_ACCOUNT",
-                        f"exec_rr={decision.exec_rr:.2f}R < {_dynamic_min_rr:.1f}R "
-                        f"(equity ${balance:,.0f} {'< $25K threshold' if balance < _sc.SMALL_ACCOUNT_THRESHOLD else ''})")
+                        _rr_reason)
                 continue
 
             # Gate 2: Weekly punch-card limit (ISO week)
             _iso_key = ts_utc.isocalendar()[:2]   # (year, week)
-            _max_week = (
-                _sc.MAX_TRADES_PER_WEEK_SMALL
-                if balance < _sc.SMALL_ACCOUNT_THRESHOLD
-                else _sc.MAX_TRADES_PER_WEEK_STANDARD
+            _wk_blocked, _wk_reason = alex_policy.check_weekly_trade_limit(
+                _weekly_trade_counts.get(_iso_key, 0), balance
             )
-            if _weekly_trade_counts.get(_iso_key, 0) >= _max_week:
+            if _wk_blocked:
                 _weekly_limit_blocks += 1
                 log_gap(ts_utc, pair, "ENTER", "BLOCKED", "WEEKLY_TRADE_LIMIT",
-                        f"Already {_weekly_trade_counts.get(_iso_key,0)} trade(s) "
-                        f"this week (ISO {_iso_key[0]}-W{_iso_key[1]:02d}), "
-                        f"max={_max_week}")
+                        _wk_reason + f" (ISO {_iso_key[0]}-W{_iso_key[1]:02d})")
                 continue
 
             strat = strategies[pair]
@@ -1936,11 +1945,23 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     except Exception:
         _commit, _dirty = "unknown", False
 
+    # ── Pairs hash — reproducibility fingerprint ──────────────────────────
+    import hashlib as _hl
+    _active_pairs  = sorted(candle_data.keys())
+    _pairs_hash    = _hl.md5(",".join(_active_pairs).encode()).hexdigest()[:6]
+
     _result_record = {
         "run_dt":       datetime.now(timezone.utc).isoformat(),
         "commit":       _commit + ("-dirty" if _dirty else ""),
         "notes":        notes,
-        "model_tags":   _sc.get_model_tags(),   # reads live module state → captures lever overrides
+        # model_tags: all active levers + trail arm + pairs fingerprint.
+        # Always a list[str] — never contains dicts or None (defensive str() cast
+        # inside get_model_tags guarantees this).
+        "model_tags":   _sc.get_model_tags(trail_arm=trail_arm_key or "?",
+                                           pairs_hash=_pairs_hash),
+        "trail_arm":    trail_arm_key or "?",
+        "pairs":        _active_pairs,
+        "pairs_hash":   _pairs_hash,
         "window_start": start_dt.isoformat(),
         "window_end":   (end_dt or datetime.now(timezone.utc)).isoformat(),
         "config": {
@@ -1961,6 +1982,15 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             "OVEREXTENSION_THRESHOLD":           _sc.OVEREXTENSION_THRESHOLD,
             "ALLOW_TIER3_REVERSALS":             _sc.ALLOW_TIER3_REVERSALS,
             "REQUIRE_THEME_GATE":                _sc.REQUIRE_THEME_GATE,
+            # Alex small-account gates
+            "NO_SUNDAY_TRADES_ENABLED":          _sc.NO_SUNDAY_TRADES_ENABLED,
+            "NO_THU_FRI_TRADES_ENABLED":         _sc.NO_THU_FRI_TRADES_ENABLED,
+            "REQUIRE_HTF_TREND_ALIGNMENT":       _sc.REQUIRE_HTF_TREND_ALIGNMENT,
+            "MAX_TRADES_PER_WEEK_SMALL":         _sc.MAX_TRADES_PER_WEEK_SMALL,
+            "MAX_TRADES_PER_WEEK_STANDARD":      _sc.MAX_TRADES_PER_WEEK_STANDARD,
+            "MIN_RR_SMALL_ACCOUNT":              _sc.MIN_RR_SMALL_ACCOUNT,
+            "MIN_RR_STANDARD":                   _sc.MIN_RR_STANDARD,
+            "INDECISION_FILTER_ENABLED":         _sc.INDECISION_FILTER_ENABLED,
         },
         "results": {
             "n_trades":   len(trades),
@@ -2025,42 +2055,49 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _ec     = Counter(t["reason"] for t in trades)
     _rrs    = sorted([t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0])
 
-    return {
-        "trades":        trades,
-        "balance":       balance,
-        "gap_log":       gap_log,
-        "candle_data":   candle_data,
-        "n_trades":      len(trades),
-        "win_rate":      len(_wins) / len(trades) if trades else 0,
-        "avg_r":         sum(t["r"] for t in trades) / len(trades) if trades else 0,
-        "best_r":        max((t["r"] for t in trades), default=0),
-        "avg_r_win":     sum(t["r"] for t in _wins)   / len(_wins)   if _wins   else 0,
-        "avg_r_loss":    sum(t["r"] for t in _losses) / len(_losses) if _losses else 0,
-        "n_target":              _ec.get("target_reached", 0) + _ec.get("weekend_proximity", 0),
-        "n_ratchet":             _ec.get("ratchet_stop_hit", 0),
-        "n_sl":                  _ec.get("stop_hit", 0),
-        "exec_rr_p50":           _rrs[len(_rrs) // 2] if _rrs else 0,
-        "max_dd":                _max_dd_pct,
-        "ret_pct":               (balance - starting_bal) / starting_bal * 100,
-        "dd_killswitch_blocks":  dd_killswitch_blocks,
-        "weekly_limit_blocks":   _weekly_limit_blocks,
-        "min_rr_small_blocks":   _min_rr_small_blocks,
-        "countertrend_htf_blocks": _htf_block_n,
-        "time_blocks":           _time_block_n,
-        "indecision_doji_blocks": _indes_block_n,
-        "trades_per_week":       dict(_weekly_trade_counts),
-        "eval_calls":            _eval_calls,
-        "eval_ms_avg":           (_eval_ms / _eval_calls) if _eval_calls else 0.0,
-        "regime_scores":         [t.get("regime_score_at_entry", 0.0) for t in trades],
-        "regime_avg":            (sum(t.get("regime_score_at_entry",0) for t in trades) / len(trades)
-                                  if trades else 0.0),
-        "regime_pct_high":       (sum(1 for t in trades if t.get("regime_score_at_entry",0) >= 3.0)
-                                  / len(trades) * 100 if trades else 0.0),
-        "regime_pct_extreme":    (sum(1 for t in trades if t.get("regime_score_at_entry",0) >= 3.5)
-                                  / len(trades) * 100 if trades else 0.0),
-        "max_dollar_loss":       min((t["pnl"] for t in trades), default=0.0),
-        "api_calls":             _api_call_count,   # 0 on full cache hit
-    }
+    _regime_scores = [t.get("regime_score_at_entry", 0.0) for t in trades]
+    return BacktestResult(
+        # ── Core performance (canonical names) ───────────────────────
+        return_pct     = (balance - starting_bal) / starting_bal * 100,
+        max_dd_pct     = _max_dd_pct,
+        win_rate       = len(_wins) / len(trades) if trades else 0,
+        avg_r          = sum(t["r"] for t in trades) / len(trades) if trades else 0,
+        best_r         = max((t["r"] for t in trades), default=0),
+        worst_r        = min((t["r"] for t in trades), default=0),
+        n_trades       = len(trades),
+        balance        = balance,
+        # ── Trade breakdown ───────────────────────────────────────────
+        avg_r_win      = sum(t["r"] for t in _wins)   / len(_wins)   if _wins   else 0,
+        avg_r_loss     = sum(t["r"] for t in _losses) / len(_losses) if _losses else 0,
+        n_target       = _ec.get("target_reached", 0) + _ec.get("weekend_proximity", 0),
+        n_ratchet      = _ec.get("ratchet_stop_hit", 0),
+        n_sl           = _ec.get("stop_hit", 0),
+        exec_rr_p50    = _rrs[len(_rrs) // 2] if _rrs else 0,
+        max_dollar_loss= min((t["pnl"] for t in trades), default=0.0),
+        # ── Gate hit counts (all 6 Alex rules) ───────────────────────
+        time_blocks              = _time_block_n,
+        countertrend_htf_blocks  = _htf_block_n,
+        weekly_limit_blocks      = _weekly_limit_blocks,
+        min_rr_small_blocks      = _min_rr_small_blocks,
+        indecision_doji_blocks   = _indes_block_n,
+        dd_killswitch_blocks     = dd_killswitch_blocks,
+        # ── Regime analytics ─────────────────────────────────────────
+        regime_scores      = _regime_scores,
+        regime_avg         = sum(_regime_scores) / len(_regime_scores) if _regime_scores else 0.0,
+        regime_pct_high    = (sum(1 for s in _regime_scores if s >= 3.0)
+                              / len(_regime_scores) * 100 if _regime_scores else 0.0),
+        regime_pct_extreme = (sum(1 for s in _regime_scores if s >= 3.5)
+                              / len(_regime_scores) * 100 if _regime_scores else 0.0),
+        # ── Profiling ────────────────────────────────────────────────
+        api_calls     = _api_call_count,
+        eval_calls    = _eval_calls,
+        eval_ms_avg   = (_eval_ms / _eval_calls) if _eval_calls else 0.0,
+        # ── Raw lists ────────────────────────────────────────────────
+        trades         = trades,
+        trades_per_week= dict(_weekly_trade_counts),
+        gap_log        = gap_log,
+        candle_data    = candle_data,
+    )
 
 
 if __name__ == "__main__":
@@ -2204,7 +2241,7 @@ Examples:
         _t_run = time.perf_counter()
         result = run_backtest(
             start_dt=start, end_dt=end, starting_bal=args.balance,
-            notes=_arm_notes, trail_cfg=_tcfg,
+            notes=_arm_notes, trail_cfg=_tcfg, trail_arm_key=_arm_key,
             preloaded_candle_data=_shared_candles,
             use_cache=_use_cache,
         )

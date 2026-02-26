@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import src.strategy.forex.strategy_config as _cfg
 from backtesting.oanda_backtest_v2 import run_backtest, TRAIL_ARMS
+from src.strategy.forex.backtest_schema import BacktestResult
 
 _MAX_CONCURRENT = _cfg.MAX_CONCURRENT_TRADES_LIVE
 _MIN_RR         = _cfg.MIN_RR
@@ -109,17 +110,12 @@ def _signal_table(trades: list[dict]) -> str:
     return "  ".join(f"{sig}×{cnt}" for sig, cnt in ctr.most_common())
 
 
-def _indecision_blocks(result: dict) -> int:
-    """Count INDECISION_DOJI blocks from decisions log."""
-    decisions = result.get("decisions", [])
-    n = 0
-    for d in decisions:
-        if "INDECISION_DOJI" in d.get("failed_filters", []):
-            n += 1
-    return n
+def _indecision_blocks(result: BacktestResult) -> int:
+    """Return the INDECISION_DOJI block count from BacktestResult."""
+    return result.indecision_doji_blocks
 
 
-def _run_arm(arm_cfg: dict, start: datetime, end: datetime) -> dict:
+def _run_arm(arm_cfg: dict, start: datetime, end: datetime) -> BacktestResult:
     """Run one backtest arm, capturing all output."""
     _patch(arm_cfg["trigger_mode"], arm_cfg["indecision_filter"])
     try:
@@ -135,16 +131,16 @@ def _run_arm(arm_cfg: dict, start: datetime, end: datetime) -> dict:
     return result
 
 
-def _fmt_row(arm_name: str, arm_cfg: dict, result: dict) -> list:
+def _fmt_row(arm_name: str, arm_cfg: dict, result: BacktestResult) -> list:
     """Return a list of cells for the results table."""
-    trades   = result.get("trades", [])
-    n_trades = len(trades)
-    ret_pct  = result.get("return_pct", 0.0)
-    max_dd   = result.get("max_dd_pct", 0.0)
-    wr       = result.get("win_rate", 0.0)
-    avg_r    = sum(t.get("r", 0) for t in trades) / n_trades if n_trades else 0
-    best_r   = max((t.get("r", 0) for t in trades), default=0)
-    worst_r  = min((t.get("r", 0) for t in trades), default=0)
+    n_trades = result.n_trades
+    ret_pct  = result.return_pct
+    max_dd   = result.max_dd_pct
+    wr       = result.win_rate
+    avg_r    = result.avg_r
+    best_r   = result.best_r
+    worst_r  = result.worst_r
+    trades   = result.trades
     n_doji   = _indecision_blocks(result)
     wins     = sum(1 for t in trades if t.get("r", 0) > 0.1)
     losses   = sum(1 for t in trades if t.get("r", 0) < -0.1)
@@ -208,16 +204,14 @@ def main():
     for win_name, win_results in all_results.items():
         print(f"\n  [{win_name}]")
         for arm_name, arm_cfg in ARMS.items():
-            result = win_results[arm_name]
-            trades = result.get("trades", [])
-            if not trades:
+            result: BacktestResult = win_results[arm_name]
+            if not result.trades:
                 print(f"    {arm_cfg['label']:42}  — no trades")
                 continue
             print(f"    {arm_cfg['label']}")
-            print(f"      Exits:   {_exit_table(trades)}")
-            print(f"      Signals: {_signal_table(trades)}")
-            # Show star trades specifically
-            star_trades = [t for t in trades
+            print(f"      Exits:   {_exit_table(result.trades)}")
+            print(f"      Signals: {_signal_table(result.trades)}")
+            star_trades = [t for t in result.trades
                            if t.get("signal_type","") in ("morning_star","evening_star")]
             if star_trades:
                 print(f"      Stars ({len(star_trades)}):")
@@ -231,41 +225,37 @@ def main():
     print("  INDECISION FILTER IMPACT  (Arm A [no filter] → Arm B [filter ON])")
     print("═" * 90)
     for win_name, win_results in all_results.items():
-        rA = win_results.get("A_engulf_only_no_filter", {})
-        rB = win_results.get("B_engulf_only_doji_gate", {})
+        rA: BacktestResult = win_results.get("A_engulf_only_no_filter")
+        rB: BacktestResult = win_results.get("B_engulf_only_doji_gate")
         if not rA or not rB:
             continue
         dA = _indecision_blocks(rA); dB = _indecision_blocks(rB)
-        nA = len(rA.get("trades", [])); nB = len(rB.get("trades", []))
-        retA = rA.get("return_pct", 0); retB = rB.get("return_pct", 0)
-        ddA  = rA.get("max_dd_pct", 0); ddB  = rB.get("max_dd_pct", 0)
-        wrA  = rA.get("win_rate", 0);   wrB  = rB.get("win_rate", 0)
-        avgA = (sum(t.get("r",0) for t in rA.get("trades",[])) / max(nA,1))
-        avgB = (sum(t.get("r",0) for t in rB.get("trades",[])) / max(nB,1))
+        nA = rA.n_trades; nB = rB.n_trades
         print(f"\n  {win_name}")
         print(f"    Doji blocks:  A={dA}  B={dB}  (net removed = {nA-nB} trades)")
-        print(f"    Return:       A={retA:+.1f}%  B={retB:+.1f}%  (Δ={retB-retA:+.1f}%)")
-        print(f"    Max DD:       A={ddA:.1f}%   B={ddB:.1f}%")
-        print(f"    WR:           A={wrA:.0%}   B={wrB:.0%}")
-        print(f"    Avg R:        A={avgA:+.2f}   B={avgB:+.2f}")
+        print(f"    Return:       A={rA.return_pct:+.1f}%  B={rB.return_pct:+.1f}%  "
+              f"(Δ={rB.return_pct-rA.return_pct:+.1f}%)")
+        print(f"    Max DD:       A={rA.max_dd_pct:.1f}%   B={rB.max_dd_pct:.1f}%")
+        print(f"    WR:           A={rA.win_rate:.0%}   B={rB.win_rate:.0%}")
+        print(f"    Avg R:        A={rA.avg_r:+.2f}   B={rB.avg_r:+.2f}")
 
     print(f"\n{'═' * 90}")
     print("  VERDICT")
     print("═" * 90)
     for win_name, win_results in all_results.items():
-        rA = win_results.get("A_engulf_only_no_filter", {})
-        rB = win_results.get("B_engulf_only_doji_gate", {})
-        rC = win_results.get("C_star_at_level_doji_gate", {})
-        retA = rA.get("return_pct", 0)
-        retB = rB.get("return_pct", 0)
-        retC = rC.get("return_pct", 0)
-        nC   = len(rC.get("trades", []))
-        star_count = sum(1 for t in rC.get("trades", [])
+        rA: BacktestResult = win_results.get("A_engulf_only_no_filter")
+        rB: BacktestResult = win_results.get("B_engulf_only_doji_gate")
+        rC: BacktestResult = win_results.get("C_star_at_level_doji_gate")
+        if not rA or not rB or not rC:
+            continue
+        star_count = sum(1 for t in rC.trades
                          if t.get("signal_type","") in ("morning_star","evening_star"))
         print(f"\n  {win_name}:")
-        print(f"    Doji filter:   {retA:+.1f}% → {retB:+.1f}% (Δ={retB-retA:+.1f}%)")
-        print(f"    Stars added:   {retB:+.1f}% → {retC:+.1f}% (Δ={retC-retB:+.1f}%)  "
-              f"| {star_count} star trades out of {nC} total")
+        print(f"    Doji filter:   {rA.return_pct:+.1f}% → {rB.return_pct:+.1f}% "
+              f"(Δ={rB.return_pct-rA.return_pct:+.1f}%)")
+        print(f"    Stars added:   {rB.return_pct:+.1f}% → {rC.return_pct:+.1f}% "
+              f"(Δ={rC.return_pct-rB.return_pct:+.1f}%)  "
+              f"| {star_count} star trades out of {rC.n_trades} total")
 
     _restore()
     print()

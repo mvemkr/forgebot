@@ -90,6 +90,7 @@ from ..strategy.forex.strategy_config import (
     DRY_RUN_PAPER_BALANCE,
     winner_rule_check,
 )
+from ..strategy.forex import alex_policy   # shared Alex small-account gate logic
 
 
 class ForexOrchestrator:
@@ -706,6 +707,27 @@ class ForexOrchestrator:
                         f"wants {_theme_dir}, pattern wants {decision.direction}."
                     )
                     return
+
+            # ── Alex small-account gates (live parity via alex_policy) ──
+            # Parity note: backtester calls the same functions from
+            # src/strategy/forex/alex_policy.py — single source of truth.
+
+            # Gate 1: Dynamic MIN_RR (3.0R required when equity < $25K)
+            _rr_blk, _rr_rsn = alex_policy.check_dynamic_min_rr(
+                decision.exec_rr, self.account_balance
+            )
+            if _rr_blk:
+                logger.info(f"⚠ {pair}: ENTER BLOCKED — {_rr_rsn}")
+                return
+
+            # Gate 2: Weekly trade punch-card
+            _wk_count = self.journal.get_trades_this_week()
+            _wk_blk, _wk_rsn = alex_policy.check_weekly_trade_limit(
+                _wk_count, self.account_balance
+            )
+            if _wk_blk:
+                logger.info(f"⚠ {pair}: ENTER BLOCKED — {_wk_rsn}")
+                return
 
             # ── Winner rule: don't compete with your winner ───────────────
             # Block new entries only when any open position is ACTIVELY up
