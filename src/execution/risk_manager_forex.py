@@ -91,6 +91,7 @@ class ForexRiskManager:
         self._regroup_reason: Optional[str] = None
         self._regroup_started: Optional[datetime] = None
         self._regroup_ends: Optional[datetime] = None
+        self._paused_at: Optional[datetime] = None
         self._peak_balance: float = 0.0
 
         KILL_SWITCH_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -357,6 +358,7 @@ class ForexRiskManager:
         """Mike manually pauses the bot (indefinite — must manually resume)."""
         self._mode = BotMode.PAUSED
         self._regroup_reason = reason
+        self._paused_at = datetime.now(timezone.utc)
         logger.warning(f"Bot PAUSED: {reason}")
         self._save_regroup_state()
 
@@ -364,6 +366,7 @@ class ForexRiskManager:
         """Mike manually unpauses."""
         self._mode = BotMode.ACTIVE
         self._regroup_reason = None
+        self._paused_at = None
         logger.info("Bot unpaused → ACTIVE")
         self._save_regroup_state()
 
@@ -375,6 +378,7 @@ class ForexRiskManager:
             "regroup_reason": self._regroup_reason,
             "regroup_started": self._regroup_started.isoformat() if self._regroup_started else None,
             "regroup_ends":    self._regroup_ends.isoformat()    if self._regroup_ends    else None,
+            "paused_at":       self._paused_at.isoformat()       if self._paused_at       else None,
             "peak_balance":    self._peak_balance,
         }
         try:
@@ -394,6 +398,8 @@ class ForexRiskManager:
             re = state.get("regroup_ends")
             self._regroup_started = datetime.fromisoformat(rs) if rs else None
             self._regroup_ends    = datetime.fromisoformat(re) if re else None
+            pa = state.get("paused_at")
+            self._paused_at = datetime.fromisoformat(pa) if pa else None
             if self._mode == BotMode.REGROUP:
                 logger.warning(
                     f"Restored REGROUP state from disk. "
@@ -681,6 +687,8 @@ class ForexRiskManager:
         return {
             "mode":               self._mode.value,
             "is_halted":          self.is_halted,
+            "paused":             self._mode == BotMode.PAUSED,
+            "paused_since":       self._paused_at.isoformat() if self._paused_at else None,
             "regroup_reason":     self._regroup_reason,
             "regroup_ends":       self._regroup_ends.isoformat() if self._regroup_ends else None,
             # risk decomposition

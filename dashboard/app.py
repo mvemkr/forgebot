@@ -154,6 +154,8 @@ def api_status():
     final_risk_dollars = bot_stats.get("final_risk_dollars", merged_hb.get("final_risk_dollars", 0))
     consecutive_losses = bot_stats.get("consecutive_losses", merged_hb.get("consecutive_losses", 0))
     drawdown_pct_saved = bot_stats.get("drawdown_pct",       merged_hb.get("drawdown_pct", 0))
+    paused             = bot_stats.get("paused",             merged_hb.get("paused", False)) or (mode == "paused")
+    paused_since       = bot_stats.get("paused_since",       merged_hb.get("paused_since"))
 
     # Win rate from stats
     wr      = stats.get("win_rate", 0) if isinstance(stats, dict) else 0
@@ -191,6 +193,8 @@ def api_status():
         "mode":               mode,
         "dry_run":            dry_run,
         "halted":             halted,
+        "paused":             paused,
+        "paused_since":       paused_since,
         # risk decomposition
         "risk_pct":           final_risk_pct,
         "base_risk_pct":      base_risk_pct,
@@ -212,12 +216,30 @@ def api_status():
         "total_pnl":          tot_pnl,
     })
 
+def _write_control_audit(command: str, reason: str):
+    """Append a pause/resume audit entry to decision_log.jsonl."""
+    entry = json.dumps({
+        "ts":      datetime.now(timezone.utc).isoformat(),
+        "event":   f"CONTROL_{command.upper()}",
+        "pair":    "ALL",
+        "source":  "dashboard",
+        "command": command,
+        "reason":  reason,
+    })
+    try:
+        with open(DECISIONS_FILE, "a") as f:
+            f.write(entry + "\n")
+    except Exception:
+        pass
+
+
 @app.route("/api/pause", methods=["POST"])
 def api_pause():
     """Write a pause command to bot_control.json. Orchestrator picks it up next cycle."""
     data   = request.get_json() or {}
     reason = data.get("reason", "Dashboard pause request")
     try:
+        _write_control_audit("pause", reason)
         CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONTROL_FILE.write_text(json.dumps({"command": "pause", "reason": reason}))
         return jsonify({"status": "ok", "command": "pause", "reason": reason})
@@ -231,6 +253,7 @@ def api_resume():
     data   = request.get_json() or {}
     reason = data.get("reason", "Dashboard resume request")
     try:
+        _write_control_audit("resume", reason)
         CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONTROL_FILE.write_text(json.dumps({"command": "resume", "reason": reason}))
         return jsonify({"status": "ok", "command": "resume", "reason": reason})

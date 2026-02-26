@@ -1025,6 +1025,8 @@ class ForexOrchestrator:
                     "active_cap_label":    risk_status["active_cap_label"],
                     "final_risk_dollars":  risk_status["final_risk_dollars"],
                     "consecutive_losses":  self._consecutive_losses,
+                    "paused":              risk_status["paused"],
+                    "paused_since":        risk_status["paused_since"],
                     "traded_pattern_keys": list(self.strategy.traded_patterns.keys()),
                 },
             )

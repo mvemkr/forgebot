@@ -57,8 +57,11 @@
       <div class="font-mono font-bold text-success text-lg" x-text="'$' + fmt(state.account_balance)">—</div>
     </div>
     <div class="text-right">
-      <div class="text-xs text-base-content/50">Risk/trade</div>
-      <div class="font-mono font-bold" x-text="(state.risk_pct || '—') + '%'">—</div>
+      <div class="text-xs text-base-content/50">Risk / trade</div>
+      <div class="font-mono font-bold"
+           :class="state.dd_flag ? 'text-warning' : 'text-base-content'"
+           x-text="'$' + fmt(state.final_risk_dollars||0) + ' (' + (state.final_risk_pct||state.risk_pct||'—') + '%)'">—</div>
+      <div class="text-xs opacity-60" x-show="state.dd_flag" x-text="state.active_cap_label"></div>
     </div>
     <div class="divider divider-horizontal m-0"></div>
     <div class="flex items-center gap-2">
@@ -67,6 +70,21 @@
         <div :class="botOnline ? 'text-success' : 'text-error'" x-text="botOnline ? 'Bot Online' : 'Bot Offline'"></div>
         <div class="text-base-content/40" x-text="lastSeen">—</div>
       </div>
+    </div>
+    <!-- Pause / Resume controls -->
+    <div class="flex gap-1">
+      <button class="btn btn-xs btn-error gap-1"
+              x-show="!state.paused"
+              @click="pauseBot()"
+              title="Pause trading (bot stops entering new trades)">
+        <i class="ph ph-pause-circle"></i> Pause
+      </button>
+      <button class="btn btn-xs btn-success gap-1"
+              x-show="state.paused"
+              @click="resumeBot()"
+              title="Resume trading">
+        <i class="ph ph-play-circle"></i> Resume
+      </button>
     </div>
     <div class="countdown font-mono text-sm opacity-40">
       <span x-text="refreshIn + 's'"></span>
@@ -84,9 +102,18 @@
   </span>
 </div>
 <!-- Paused banner -->
-<div x-show="state.mode === 'paused'" class="alert alert-error rounded-none">
-  <i class="ph ph-warning-diamond ph-bold text-xl"></i>
-  <span>⏸ <strong>BOT PAUSED</strong> — No new trades. Tell Forge "resume trading" to restart.</span>
+<div x-show="state.paused || state.mode === 'paused'" class="alert alert-error rounded-none flex justify-between">
+  <div class="flex items-center gap-3">
+    <i class="ph ph-warning-diamond ph-bold text-xl"></i>
+    <span>⏸ <strong>BOT PAUSED</strong> — No new entries.
+      <span x-show="state.paused_since" class="opacity-70">
+        Since <span x-text="state.paused_since ? new Date(state.paused_since).toLocaleString() : ''"></span>
+      </span>
+    </span>
+  </div>
+  <button class="btn btn-sm btn-success gap-1" @click="resumeBot()">
+    <i class="ph ph-play-circle"></i> Resume Trading
+  </button>
 </div>
 
 <!-- ── TAB NAV ────────────────────────────────────────────── -->
@@ -161,6 +188,12 @@
            :class="state.mode==='active'?'text-success':state.mode==='regroup'?'text-warning':'text-error'"
            x-text="(state.mode||'—').toUpperCase()">—</div>
       <div class="stat-desc" x-text="(state.tier_label||'—') + ' · ' + (state.pattern_memory_count||0) + ' patterns locked'"></div>
+      <div class="stat-desc mt-1 font-semibold"
+           x-show="state.dd_flag"
+           :class="state.dd_flag === 'DD_KILLSWITCH' ? 'text-error' : 'text-warning'"
+           x-text="state.active_cap_label"></div>
+      <div class="stat-desc" x-show="state.consecutive_losses > 0"
+           x-text="'Streak: ' + state.consecutive_losses + ' loss' + (state.consecutive_losses > 1 ? 'es' : '')"></div>
     </div>
   </div>
 
@@ -410,6 +443,22 @@
                     <span class="opacity-30" x-show="i < (c.waiting_for||[]).length - 1"> · </span>
                   </span>
                 </template>
+              </div>
+
+              <!-- Risk bar — shows what bot will actually risk on this pair's next entry -->
+              <div class="mt-2 pt-2 border-t border-base-300/50 text-xs flex items-center gap-2 flex-wrap"
+                   x-show="state.final_risk_dollars > 0 || state.dd_flag">
+                <span class="opacity-40">Risk:</span>
+                <span class="font-mono font-semibold"
+                      :class="state.dd_flag ? 'text-warning' : 'text-success'"
+                      x-text="'$' + fmt(state.final_risk_dollars||0) + ' (' + (state.final_risk_pct||state.risk_pct||'—') + '%)'"></span>
+                <span x-show="state.dd_flag" class="badge badge-xs"
+                      :class="state.dd_flag === 'DD_KILLSWITCH' ? 'badge-error' : 'badge-warning'"
+                      x-text="state.dd_flag"></span>
+                <span x-show="state.drawdown_pct > 0" class="opacity-50"
+                      x-text="'DD ' + (state.drawdown_pct||0) + '%'"></span>
+                <span x-show="state.consecutive_losses >= 2" class="opacity-50"
+                      x-text="'streak ' + state.consecutive_losses"></span>
               </div>
 
               <div class="text-xs opacity-30 mt-2" x-text="timeAgo(c.timestamp)"></div>
@@ -855,6 +904,41 @@ function dashboard() {
       }, 1000);
     },
 
+    async pauseBot() {
+      if (!confirm('Pause trading? The bot will stop entering new trades until you resume.')) return;
+      try {
+        const r = await fetch('/api/pause', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Dashboard pause request'})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.paused = true;
+          await this.refresh();
+        } else {
+          alert('Pause failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Pause request failed: ' + e); }
+    },
+
+    async resumeBot() {
+      try {
+        const r = await fetch('/api/resume', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Dashboard resume request'})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.paused = false;
+          await this.refresh();
+        } else {
+          alert('Resume failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Resume request failed: ' + e); }
+    },
+
     async fetchNews() {
       try {
         const r = await fetch('/api/news');
@@ -879,7 +963,16 @@ function dashboard() {
           fetch('/api/weekly_pnl').then(r => r.json()),
         ]);
 
-        this.state    = status.heartbeat || {};
+        // Merge heartbeat with top-level status fields so templates can use state.X for all
+        const _topFields = ['mode','dry_run','halted','paused','paused_since',
+          'risk_pct','base_risk_pct','final_risk_pct','dd_flag','active_cap_label',
+          'final_risk_dollars','consecutive_losses','drawdown_pct','peak_balance',
+          'tier_label','total_pnl','total_trades','win_rate','account_balance',
+          'pattern_memory_count','regroup_ends'];
+        this.state = { ...(status.heartbeat || {}) };
+        for (const k of _topFields) {
+          if (status[k] !== undefined) this.state[k] = status[k];
+        }
         this.acct     = status.account   || {};
         this.stats    = status.stats     || {};
         this.openTrades    = status.open_trades || [];
