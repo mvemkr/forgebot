@@ -44,6 +44,42 @@ class EntrySignal:
         return self.strength >= 0.40
 
 
+def is_indecision(candle: pd.Series) -> bool:
+    """
+    Returns True when the candle is a doji / spinning top / long-legged doji.
+
+    Definition (objective, deterministic):
+      body / range  ≤  INDECISION_MAX_BODY_RATIO   (tiny body)
+      AND upper_wick / range  ≥  INDECISION_MIN_WICK_RATIO
+      AND lower_wick / range  ≥  INDECISION_MIN_WICK_RATIO
+
+    This catches: classic doji, long-legged doji, spinning top.
+    It does NOT catch: hammer (one-sided wick), shooting star (one-sided wick).
+
+    Exception rule: when this candle is the middle bar of a Morning/Evening Star,
+    it is allowed to be indecision — that's the whole point of the pattern.
+    Call sites must handle that exception explicitly.
+    """
+    rng = float(candle["high"] - candle["low"])
+    if rng <= 1e-10:
+        return True   # flat/zero-range bar → treat as indecision
+
+    body       = abs(float(candle["close"]) - float(candle["open"]))
+    body_high  = max(float(candle["open"]), float(candle["close"]))
+    body_low   = min(float(candle["open"]), float(candle["close"]))
+    upper_wick = float(candle["high"]) - body_high
+    lower_wick = body_low - float(candle["low"])
+
+    body_ratio  = body / rng
+    upper_ratio = upper_wick / rng
+    lower_ratio = lower_wick / rng
+
+    if body_ratio > _cfg.INDECISION_MAX_BODY_RATIO:
+        return False
+    return (upper_ratio >= _cfg.INDECISION_MIN_WICK_RATIO
+            and lower_ratio >= _cfg.INDECISION_MIN_WICK_RATIO)
+
+
 class EntrySignalDetector:
     """
     Detects engulfing candles and other entry confirmation signals.
@@ -130,22 +166,38 @@ class EntrySignalDetector:
         signals.sort(key=lambda s: s.strength, reverse=True)
         return signals[0]
 
-    def has_signal(self, df: pd.DataFrame, direction: str) -> tuple[bool, Optional[EntrySignal], str]:
+    def has_signal(
+        self,
+        df: pd.DataFrame,
+        direction: str,
+        level: float = 0.0,
+    ) -> tuple[bool, Optional[EntrySignal], str]:
         """
         Check if there's a valid entry signal in the given direction.
         Returns (found, signal_or_None, reason_code).
 
+        level : key price level (neckline / round number) used by at-level
+                confirmation modes.  Pass 0.0 (default) to skip level gate.
+
         reason_code when False:
-          NO_ENGULF       — engulfing tried, not found (ENTRY_TRIGGER_MODE="engulf_only")
-          NO_ENGULF|NO_PIN — both tried, neither found (ENTRY_TRIGGER_MODE="engulf_or_pin")
-          NO_TRIGGER      — signal found but wrong direction or below strength threshold
+          NO_ENGULF            — engulfing not found (engulf_only)
+          NO_ENGULF|NO_PIN     — neither (engulf_or_pin)
+          NO_ENGULF|NO_STAR    — neither (engulf_or_star_at_level)
+          NO_ENGULF|NO_STRICTPIN — neither (engulf_or_strict_pin_at_level)
+          NO_TRIGGER           — signal found but wrong direction/strength
         """
         if len(df) < 3:
             return False, None, "NO_TRIGGER"
 
-        tried_pin   = (_cfg.ENTRY_TRIGGER_MODE == "engulf_or_pin")
+        mode = _cfg.ENTRY_TRIGGER_MODE
+        tried_pin        = (mode == "engulf_or_pin")
+        tried_at_level   = mode in (
+            "engulf_or_star_at_level",
+            "engulf_or_strict_pin_at_level",
+            "engulf_or_star_or_strict_pin_at_level",
+        )
         found_engulf = False
-        found_pin    = False
+        found_alt    = False          # pin | star | strict_pin
         best: Optional[EntrySignal] = None
 
         for i in range(-self.lookback, 0):
@@ -177,20 +229,50 @@ class EntrySignalDetector:
                     if best is None or sig.strength > best.strength:
                         best = sig
 
-            # ── Pin bar (only when ENTRY_TRIGGER_MODE="engulf_or_pin") ──
+            # ── Loose pin bar (engulf_or_pin mode) ────────────────────
             if tried_pin:
                 pb = self._pin_bar(current, direction)
                 if pb:
-                    found_pin = True
+                    found_alt = True
                     if best is None or pb.strength > best.strength:
                         best = pb
 
+        # ── At-level confirmations (star / strict pin) ─────────────────
+        # These look at the last 2-3 bars as a unit, so called once outside loop.
+        if tried_at_level and level > 0:
+            from .candle_confirmations import detect_at_level_confirmation
+            al_sig = detect_at_level_confirmation(df, direction, level, mode)
+            if al_sig:
+                found_alt = True
+                if best is None or al_sig.strength > best.strength:
+                    best = al_sig
+
         if best and best.direction == direction and best.is_valid:
+            # ── Indecision / doji filter ─────────────────────────────
+            # Block if the trigger candle itself is a doji / spinning top.
+            # Exception: morning_star / evening_star check bar3 internally —
+            # those signals already guarantee bar3 is decisive.
+            if _cfg.INDECISION_FILTER_ENABLED:
+                _is_star_signal = best.signal_type in ("morning_star", "evening_star")
+                if not _is_star_signal:
+                    try:
+                        trigger_bar = df.iloc[best.candle_index]
+                        if is_indecision(trigger_bar):
+                            return False, None, "INDECISION_DOJI"
+                    except (IndexError, KeyError):
+                        pass   # safety: if lookup fails, allow entry
+
             return True, best, ""
 
         # ── Diagnostic reason ──────────────────────────────────────────
         if tried_pin:
-            reason = "NO_ENGULF|NO_PIN" if (not found_engulf and not found_pin) else "NO_TRIGGER"
+            reason = "NO_ENGULF|NO_PIN"   if (not found_engulf and not found_alt)  else "NO_TRIGGER"
+        elif mode == "engulf_or_star_at_level":
+            reason = "NO_ENGULF|NO_STAR"  if (not found_engulf and not found_alt)  else "NO_TRIGGER"
+        elif mode == "engulf_or_strict_pin_at_level":
+            reason = "NO_ENGULF|NO_STRICTPIN" if (not found_engulf and not found_alt) else "NO_TRIGGER"
+        elif mode == "engulf_or_star_or_strict_pin_at_level":
+            reason = "NO_ENGULF|NO_STAR|NO_STRICTPIN" if (not found_engulf and not found_alt) else "NO_TRIGGER"
         else:
             reason = "NO_ENGULF" if not found_engulf else "NO_TRIGGER"
         return False, None, reason

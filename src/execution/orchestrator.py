@@ -202,6 +202,11 @@ class ForexOrchestrator:
         # Shows what each pair is waiting for before the bot will enter.
         self._confluence_state:    Dict[str, dict]   = {}
 
+        # Regime score — computed each scan from H4 slices collected during
+        # pair evaluation (no extra API calls). Stored as a dict for status API.
+        self._last_h4_slices:      Dict[str, object] = {}   # pair → DataFrame (H4)
+        self._last_regime_score:   Optional[dict]    = None  # RegimeScore.to_dict()
+
         # Consecutive loss streak — used by risk manager for streak brake cap.
         # Loaded from saved state on startup; updated when positions close.
         # A ratchet exit near 0R counts as a win (doesn't increment streak).
@@ -464,6 +469,9 @@ class ForexOrchestrator:
         if wl_enabled:
             logger.info(f"Whitelist ACTIVE — trading only: {', '.join(sorted(wl_pairs))}")
 
+        # Reset H4 slices collection before scan so stale data doesn't persist
+        self._last_h4_slices = {}
+
         for pair in WATCHLIST:
             try:
                 self._evaluate_pair(
@@ -472,6 +480,30 @@ class ForexOrchestrator:
                 )
             except Exception as e:
                 logger.error(f"{pair}: Evaluation error: {e}")
+
+        # ── Regime score (post-scan) ──────────────────────────────────────
+        # Uses H4 data already fetched during pair evaluation — no extra API calls.
+        # Representative primary H4: use first available scanned pair.
+        try:
+            from ..strategy.forex.regime_score import compute_regime_score
+            _primary_h4 = next(iter(self._last_h4_slices.values()), None)
+            if _primary_h4 is not None:
+                _recent_trades = self.journal.get_recent_trades(10)
+                _rs = compute_regime_score(
+                    df_h4        = _primary_h4,
+                    recent_trades = _recent_trades,
+                    h4_slices    = self._last_h4_slices,
+                )
+                self._last_regime_score = _rs.to_dict()
+                logger.info(
+                    f"📊 RegimeScore: {_rs.total:.1f}  "
+                    f"vol={_rs.vol_expansion} trend={_rs.trend_persistence} "
+                    f"perf={_rs.recent_performance} cluster={_rs.correlation_cluster}  "
+                    f"{'✅ HIGH_ELIGIBLE' if _rs.eligible_high else ''}"
+                    f"{'⚡ EXTREME_ELIGIBLE' if _rs.eligible_extreme else ''}"
+                )
+        except Exception as e:
+            logger.warning(f"Regime score computation failed: {e}")
 
         # Always log one entry per scan cycle so the dashboard Decision Feed is alive
         self._write_scan_heartbeat()
@@ -630,6 +662,10 @@ class ForexOrchestrator:
         if any(df is None or len(df) < 20 for df in [df_w, df_d, df_4h, df_1h]):
             logger.debug(f"{pair}: Insufficient data, skipping")
             return
+
+        # Collect H4 for regime score (reuses already-fetched data — no extra API calls)
+        if df_4h is not None and len(df_4h) >= 20:
+            self._last_h4_slices[pair] = df_4h
 
         decision = self.strategy.evaluate(
             pair=pair,
@@ -1015,6 +1051,7 @@ class ForexOrchestrator:
                     else (f"WAIT: {top_wait_notes[0]}" if top_wait_notes
                           else f"No setups — scanning {total} pairs")
                 ),
+                "regime_score": self._last_regime_score,
             }
             DECISIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(DECISIONS_FILE, "a") as f:
@@ -1157,6 +1194,7 @@ class ForexOrchestrator:
                     "next_session":        session_info["next_session"],
                     "next_session_mins":   session_info["next_session_mins"],
                     "traded_pattern_keys": list(self.strategy.traded_patterns.keys()),
+                    "regime_score":        self._last_regime_score,
                 },
             )
         except Exception as e:

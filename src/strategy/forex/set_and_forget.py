@@ -1162,6 +1162,47 @@ class SetAndForgetStrategy:
             )
 
         # ─────────────────────────────────────────────
+        # FILTER 3.5: HTF trend alignment gate
+        # When REQUIRE_HTF_TREND_ALIGNMENT=True, require ALL of weekly/daily/4H
+        # to be non-opposing.  "Opposing" = strongly trending against direction.
+        #
+        # Alex rule: "don't fight the tape on ALL timeframes at once."
+        # Counter-trend is OK when at confirmed extremes — but if W+D+4H are ALL
+        # bullish on a SHORT entry, the trade lacks any institutional backing.
+        #
+        # Gate:  direction == 'short' AND all 3 HTFs are BULLISH → block
+        #        direction == 'long'  AND all 3 HTFs are BEARISH → block
+        # (Strict 3-of-3 consensus avoids blocking counter-trend-at-extreme setups
+        #  where weekly drove price to resistance but D/4H are already rolling over.)
+        # ─────────────────────────────────────────────
+        if _cfg.REQUIRE_HTF_TREND_ALIGNMENT and trade_direction is not None:
+            _is_short = (trade_direction == 'short')
+            _is_long  = (trade_direction == 'long')
+            _all_bullish = w_bullish and d_bullish and h4_bullish
+            _all_bearish = w_bearish and d_bearish and h4_bearish
+            _htf_blocked = (_is_short and _all_bullish) or (_is_long and _all_bearish)
+            if _htf_blocked:
+                _htf_dir = "bullish" if _all_bullish else "bearish"
+                failed_filters.append("COUNTERTREND_HTF")
+                return TradeDecision(
+                    decision=Decision.WAIT,
+                    pair=pair,
+                    direction=trade_direction,
+                    reason=(
+                        f"COUNTERTREND_HTF: pattern says {trade_direction} "
+                        f"but ALL 3 HTFs are {_htf_dir} "
+                        f"(W={trend_w.value} D={trend_d.value} 4H={trend_4.value}). "
+                        f"Not taking a trade against full-stack HTF consensus."
+                    ),
+                    confidence=0.10,
+                    failed_filters=["COUNTERTREND_HTF"],
+                    pattern=matching_pattern,
+                    trend_weekly=trend_w,
+                    trend_daily=trend_d,
+                    trend_4h=trend_4,
+                )
+
+        # ─────────────────────────────────────────────
         # FILTER 4: Key level validation — Round Number OR Structural Level
         #
         # Alex's level hierarchy (from his strategy notes, highest priority first):
@@ -1394,7 +1435,15 @@ class SetAndForgetStrategy:
         # A 200-pip NFP spike looks like a perfect engulfing candle.
         # It isn't. It's a data release — not tradeable price action.
         # ─────────────────────────────────────────────
-        has_signal, signal, _sig_reason = self.signal_detector.has_signal(df_1h, trade_direction)
+        # Level for at-level confirmation modes: prefer neckline, fall back to pattern_level
+        _signal_level = float(
+            matching_pattern.neckline
+            if getattr(matching_pattern, "neckline", None)
+            else matching_pattern.pattern_level or 0.0
+        )
+        has_signal, signal, _sig_reason = self.signal_detector.has_signal(
+            df_1h, trade_direction, level=_signal_level,
+        )
 
         # Check if the triggering candle is a news candle — if so, treat as no signal
         if has_signal and signal and len(df_1h) > 0:
@@ -1427,7 +1476,9 @@ class SetAndForgetStrategy:
              'inverted_head_and_shoulders', 'consolidation_breakout',
              'tweezer_top', 'tweezer_bottom', 'evening_star', 'morning_star'))
         if (not has_signal or signal is None) and _is_reversal_pattern and len(df_4h) >= 2:
-            has_signal_4h, signal_4h, _sig_reason_4h = self.signal_detector.has_signal(df_4h, trade_direction)
+            has_signal_4h, signal_4h, _sig_reason_4h = self.signal_detector.has_signal(
+                df_4h, trade_direction, level=_signal_level,
+            )
             if has_signal_4h and signal_4h:
                 signal_4h.signal_type = signal_4h.signal_type + '_4h'
                 has_signal = True

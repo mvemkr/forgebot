@@ -54,6 +54,35 @@ TARGET_PROXIMITY_PIPS: float = 15.0
 # Blocks patterns where the measured move is smaller than the stop.
 MIN_RR: float = 2.5   # minimum exec R:R — select_target() rejects any candidate below this
 
+# ── Small-account / Alex money-game rules ─────────────────────────────────
+# Alex treats equity < $25K as "money game" — capital preservation is the
+# primary objective.  Dollar caps become primary; percent caps secondary.
+# Equity ≥ $25K flips back to percent-cap-primary mode.
+#
+# These constants drive the backtester and live risk manager; all gates
+# log their reason codes for funnel reporting.
+SMALL_ACCOUNT_THRESHOLD:  float = 25_000.0   # USD equity boundary
+MIN_RR_SMALL_ACCOUNT:     float = 3.0        # stricter RR gate when < $25K
+MIN_RR_STANDARD:          float = 2.5        # normal RR gate (same as MIN_RR)
+
+# Weekly punch-card behaviour — Alex: "pretend you only have 2 trades per month"
+# Implementation: per-calendar-week cap (ISO week).
+MAX_TRADES_PER_WEEK_SMALL:    int = 1   # equity < SMALL_ACCOUNT_THRESHOLD
+MAX_TRADES_PER_WEEK_STANDARD: int = 2   # equity ≥ SMALL_ACCOUNT_THRESHOLD
+
+# HTF trend alignment — require ALL of weekly/daily/4H to agree with direction.
+# When True, block counter-trend entries with reason COUNTERTREND_HTF.
+# NOTE: Alex trades counter-trend at extremes; set False to preserve his style.
+# Default True here for measurement; production default may differ after backtests.
+REQUIRE_HTF_TREND_ALIGNMENT:  bool = True
+
+# Time-based session rules (Alex: "no Thu/Fri, not worth the spread")
+# NO_SUNDAY_TRADES: block all of Sunday (forex wick creation period)
+# NO_THU_FRI_TRADES: block Thu from 09:00 ET onward and all Friday
+NO_SUNDAY_TRADES_ENABLED:    bool = True
+NO_THU_FRI_TRADES_ENABLED:   bool = True
+THU_ENTRY_CUTOFF_HOUR_ET:     int  = 9   # 9:00 AM ET = start of block on Thu
+
 # ── ATR stop filter ────────────────────────────────────────────────────────
 # Stop must be ≤ ATR_STOP_MULTIPLIER × 14-day ATR.
 # Rejects entries where the pattern stop is wider than typical volatility
@@ -143,7 +172,14 @@ BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = False
 #
 # To compare: run backtester with ENTRY_TRIGGER_MODE overridden per arm.
 # Never change this to "engulf_or_pin" in production without data supporting it.
-ENTRY_TRIGGER_MODE: str = "engulf_only"   # "engulf_only" | "engulf_or_pin"
+ENTRY_TRIGGER_MODE: str = "engulf_only"
+# Valid modes (sourced from Alex's confirmed "daily driver" confirmations):
+#   "engulf_only"                         — baseline: engulfing only (Alex #1 rule)
+#   "engulf_or_pin"                       — engulfing OR loose pin bar
+#   "engulf_or_star_at_level"             — engulfing OR Morning/Evening Star at tested level
+#   "engulf_or_strict_pin_at_level"       — engulfing OR strict hammer/shooting star at level
+#   "engulf_or_star_or_strict_pin_at_level" — all three at-level confirmations
+# PRODUCTION DEFAULT: engulf_only.  Do NOT change without backtest support.
 
 # Backward-compatible derived flag — all existing call sites work unchanged.
 # Do not set ENGULFING_ONLY directly; change ENTRY_TRIGGER_MODE instead.
@@ -151,16 +187,42 @@ ENGULFING_ONLY: bool = (ENTRY_TRIGGER_MODE == "engulf_only")
 
 # ── Pin bar entry spec ─────────────────────────────────────────────────────
 # Only active when ENTRY_TRIGGER_MODE == "engulf_or_pin".
-# Tight spec prevents noise pin bars from triggering entries:
-#   1. Rejection wick must be ≥ PIN_BAR_MIN_WICK_BODY_RATIO × body size
-#   2. Close must be in the outer PIN_BAR_CLOSE_OUTER_PCT of candle range
-#      in the trade direction (bearish pin: close near bottom; long pin: near top)
-#   3. Candle must have wicked into the zone (verified in set_and_forget zone check)
-#
-# Alex pin bar examples: USD/JPY retest of 157.5 — wick poked through, closed
-# clean back on sell side. Classic rejection. Body was ~20% of range.
 PIN_BAR_MIN_WICK_BODY_RATIO: float = 2.0   # wick ≥ 2× body
 PIN_BAR_CLOSE_OUTER_PCT:     float = 0.30  # close in outer 30% (trade-direction end)
+
+# ── At-level candle confirmation spec ─────────────────────────────────────
+# Governs Morning/Evening Star and Strict Hammer/Shooting Star modes.
+# ALL of the following are only valid when price has RECENTLY TESTED the level.
+#
+# Level-touch check:  retest zone is the last LEVEL_TOUCH_H1_BARS H1 bars.
+# "5 M15 bars" ≈ 75 min ≈ 1-2 H1 bars; we use 5 H1 bars as conservative window.
+LEVEL_TOUCH_H1_BARS:        int   = 5       # how many recent H1 bars to check for level touch
+LEVEL_TOUCH_TOLERANCE_PCT:  float = 0.0015  # price within 0.15% of level = "touched"
+
+# Morning/Evening Star thresholds
+STAR_BAR1_MIN_BODY_PCT:     float = 0.45    # bar-1 body ≥ 45% of its range (large candle)
+STAR_BAR2_MAX_BODY_PCT:     float = 0.30    # bar-2 body ≤ 30% of its range (small star)
+STAR_BAR3_MIN_BODY_PCT:     float = 0.40    # bar-3 body ≥ 40% of its range (confirmation)
+STAR_BAR3_MIDPOINT_CLOSE:   float = 0.50    # bar-3 close must pass mid of bar-1 by this fraction
+
+# Strict Hammer / Shooting Star thresholds (stricter than regular pin bar)
+STRICT_HAMMER_WICK_BODY_RATIO:     float = 3.0   # rejection wick ≥ 3× body (vs 2× for pin)
+STRICT_HAMMER_CLOSE_OUTER_PCT:     float = 0.35  # close in outer 35% of range
+STRICT_HAMMER_MAX_OPPOSITE_PCT:    float = 0.10  # opposite wick ≤ 10% of range
+STRICT_HAMMER_MAX_BODY_RANGE_PCT:  float = 0.25  # body ≤ 25% of range (not a big candle)
+
+# ── Doji / Indecision candle filter ───────────────────────────────────────
+# Blocks entries where the TRIGGER CANDLE is an indecision candle.
+# Objective definition (from transcript): body ≤ 15% of range AND
+# both upper AND lower wicks ≥ 35% of range (classic doji / spinning top).
+#
+# Exception: Morning/Evening Star — bar2 (the "star") MAY be indecision;
+# bar3 (the final confirmation) must still pass.
+#
+# Set INDECISION_FILTER_ENABLED=False to disable globally (backtest comparison).
+INDECISION_FILTER_ENABLED:      bool  = True
+INDECISION_MAX_BODY_RATIO:      float = 0.15   # body ≤ 15% of range → tiny body
+INDECISION_MIN_WICK_RATIO:      float = 0.35   # both wicks ≥ 35% → long-legged
 
 # Unrealized-R threshold that defines a "winner running."
 # A position must be THIS many R's in profit RIGHT NOW (at current price)
@@ -625,7 +687,14 @@ def get_model_tags() -> list:
         tags.append("news_filter_on")
 
     # ── Entry signal ────────────────────────────────────────────────────────
-    tags.append("engulfing_only" if m.ENTRY_TRIGGER_MODE == "engulf_only" else "pin_bars_allowed")
+    _mode_tag = {
+        "engulf_only":                          "engulfing_only",
+        "engulf_or_pin":                        "pin_bars_allowed",
+        "engulf_or_star_at_level":              "star_at_level",
+        "engulf_or_strict_pin_at_level":        "strict_pin_at_level",
+        "engulf_or_star_or_strict_pin_at_level":"star_or_strict_pin",
+    }.get(m.ENTRY_TRIGGER_MODE, m.ENTRY_TRIGGER_MODE)
+    tags.append(_mode_tag)
     if m.ENTRY_TRIGGER_MODE == "engulf_or_pin":
         tags.append(f"pin_wick_{m.PIN_BAR_MIN_WICK_BODY_RATIO:.1f}x")
 

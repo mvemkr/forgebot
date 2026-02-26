@@ -177,7 +177,15 @@ def get_scan_state():
 
 @app.route("/")
 def index():
-    return render_template("dashboard.html")
+    return render_template("dashboard.html", page="live")
+
+@app.route("/backtests")
+def page_backtests():
+    return render_template("dashboard.html", page="backtests")
+
+@app.route("/whitelist")
+def page_whitelist():
+    return render_template("dashboard.html", page="whitelist")
 
 @app.route("/api/status")
 def api_status():
@@ -308,6 +316,7 @@ def api_status():
         "entry_trigger_mode":           ENTRY_TRIGGER_MODE,
         "max_concurrent_live":          MAX_CONCURRENT_TRADES_LIVE,
         "max_concurrent_backtest":      MAX_CONCURRENT_TRADES_BACKTEST,
+        "regime_score":                 bot_stats.get("regime_score"),  # dict or None
     })
 
 def _write_control_audit(command: str, reason: str):

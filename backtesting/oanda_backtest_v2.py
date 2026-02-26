@@ -43,6 +43,7 @@ from typing import Optional, Dict, List
 from src.exchange.oanda_client import OandaClient, INSTRUMENT_MAP
 from src.strategy.forex.set_and_forget   import SetAndForgetStrategy, Decision
 from src.strategy.forex.news_filter      import NewsFilter
+from src.strategy.forex.regime_score     import compute_regime_score, RegimeScore
 from src.strategy.forex.targeting        import select_target, find_next_structure_level
 from src.execution.risk_manager_forex    import ForexRiskManager
 from src.execution.trade_journal         import TradeJournal
@@ -729,6 +730,13 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _eval_calls: int = 0            # performance counter: evaluate() call count
     _eval_ms:    float = 0.0        # total ms spent in evaluate()
 
+    # ── Alex small-account gate counters ───────────────────────────────────
+    _weekly_trade_counts:   dict = {}  # {(iso_year, iso_week): count} — opened trades
+    _weekly_limit_blocks:   int  = 0   # blocked by MAX_TRADES_PER_WEEK
+    _min_rr_small_blocks:   int  = 0   # blocked by MIN_RR_SMALL_ACCOUNT
+    _countertrend_htf_blocks: int = 0  # blocked by COUNTERTREND_HTF filter
+    _time_block_counts:     dict = {}  # {reason_code: count} — Sunday/Thu/Fri blocks
+
     def _risk_pct(bal):
         """DD-aware risk: applies graduated caps when equity is below peak."""
         pct, _dd_flag = risk.get_risk_pct_with_dd(
@@ -1093,6 +1101,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         "final_risk_pct":     pos.get("final_risk_pct", 0),
                         "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
                         "target_1":     target,
+                        "regime_score_at_entry": pos.get("regime_score", 0.0),
                     })
                     r_sign   = "+" if risk_r >= 0 else ""
                     pnl_sign = "+" if pnl >= 0 else ""
@@ -1160,6 +1169,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     "entry_equity":       pos.get("entry_equity", 0),
                     "final_risk_pct":     pos.get("final_risk_pct", 0),
                     "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
+                    "regime_score_at_entry": pos.get("regime_score", 0.0),
                 })
 
                 r_sign = "+" if risk_r >= 0 else ""
@@ -1414,6 +1424,36 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             if units <= 0:
                 continue
 
+            # ── Alex small-account gates ───────────────────────────────────
+
+            # Gate 1: Dynamic MIN_RR — stricter when equity < $25K
+            _dynamic_min_rr = (
+                _sc.MIN_RR_SMALL_ACCOUNT
+                if balance < _sc.SMALL_ACCOUNT_THRESHOLD
+                else _sc.MIN_RR_STANDARD
+            )
+            if decision.exec_rr < _dynamic_min_rr:
+                _min_rr_small_blocks += 1
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "MIN_RR_SMALL_ACCOUNT",
+                        f"exec_rr={decision.exec_rr:.2f}R < {_dynamic_min_rr:.1f}R "
+                        f"(equity ${balance:,.0f} {'< $25K threshold' if balance < _sc.SMALL_ACCOUNT_THRESHOLD else ''})")
+                continue
+
+            # Gate 2: Weekly punch-card limit (ISO week)
+            _iso_key = ts_utc.isocalendar()[:2]   # (year, week)
+            _max_week = (
+                _sc.MAX_TRADES_PER_WEEK_SMALL
+                if balance < _sc.SMALL_ACCOUNT_THRESHOLD
+                else _sc.MAX_TRADES_PER_WEEK_STANDARD
+            )
+            if _weekly_trade_counts.get(_iso_key, 0) >= _max_week:
+                _weekly_limit_blocks += 1
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "WEEKLY_TRADE_LIMIT",
+                        f"Already {_weekly_trade_counts.get(_iso_key,0)} trade(s) "
+                        f"this week (ISO {_iso_key[0]}-W{_iso_key[1]:02d}), "
+                        f"max={_max_week}")
+                continue
+
             strat = strategies[pair]
 
             # ── Target: use exec_target from strategy (single source of truth) ──
@@ -1429,6 +1469,21 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         f"Skipping to avoid uncontrolled RR. pattern={decision.pattern.pattern_type if decision.pattern else '?'}")
                 continue
 
+            # ── Regime score at entry ─────────────────────────────────────
+            # Compute once at entry (cheap: ~17 times in Alex window).
+            # All 4 components use data already loaded; no new OANDA calls.
+            _h4_slices_rs = {
+                _p: candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]
+                for _p in candle_data
+                if candle_data[_p].get("4h") is not None
+                and len(candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]) >= 20
+            }
+            _rs = compute_regime_score(
+                df_h4        = hist_4h,
+                recent_trades = trades,          # closed trades so far
+                h4_slices    = _h4_slices_rs,
+            )
+
             open_pos[pair] = {
                 "entry_price":  decision.entry_price,
                 "stop_loss":    decision.stop_loss,
@@ -1443,6 +1498,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                 "trail_locked": False,                  # True after stage-1 lock fires (Arm C)
                 "streak_at_entry": consecutive_losses,  # for per-trade risk audit
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
+                "regime_score": _rs.total,              # RegimeScore at entry
                 "target_price": _target,
                 "target_type":  decision.exec_target_type,
                 "stop_type":    decision.stop_type,
@@ -1459,6 +1515,9 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                 "mfe_r":  0.0,
                 "mae_r":  0.0,
             }
+            # Record this week's trade (ISO week key)
+            _weekly_trade_counts[_iso_key] = _weekly_trade_counts.get(_iso_key, 0) + 1
+
             strat.register_open_position(
                 pair=pair,
                 entry_price=decision.entry_price,
@@ -1523,6 +1582,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             "notes": pos.get("notes", ""),
             "macro_theme": pos.get("macro_theme"),
             "target_1": pos.get("target_price"),
+            "regime_score_at_entry": pos.get("regime_score", 0.0),
         })
 
     # ── Results ───────────────────────────────────────────────────────
@@ -1632,6 +1692,30 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             print(f"    Stop pips:  min={_sp_vals[0]:.0f}p  p50={_sp_vals[len(_sp_vals)//2]:.0f}p  "
                   f"p90={_sp_vals[int(len(_sp_vals)*0.9)]:.0f}p  max={_sp_vals[-1]:.0f}p")
 
+    # ── Regime score distribution ─────────────────────────────────────────
+    _rs_vals = [t.get("regime_score_at_entry", 0.0) for t in trades]
+    if _rs_vals:
+        _rs_by_band = {"LOW(<2)": 0, "MED(2-3)": 0, "HIGH(3-3.5)": 0, "EXTREME(3.5+)": 0}
+        for _rsv in _rs_vals:
+            if _rsv >= 3.5:   _rs_by_band["EXTREME(3.5+)"] += 1
+            elif _rsv >= 3.0: _rs_by_band["HIGH(3-3.5)"] += 1
+            elif _rsv >= 2.0: _rs_by_band["MED(2-3)"] += 1
+            else:              _rs_by_band["LOW(<2)"] += 1
+        _rs_high_pct  = sum(1 for v in _rs_vals if v >= 3.0) / len(_rs_vals) * 100
+        _rs_ext_pct   = sum(1 for v in _rs_vals if v >= 3.5) / len(_rs_vals) * 100
+        _rs_avg       = sum(_rs_vals) / len(_rs_vals)
+        print(f"\n  ── Regime score @ entry ──────────────────────────────────")
+        print(f"    Avg score:            {_rs_avg:.2f}")
+        print(f"    % score ≥ 3.0 (HIGH): {_rs_high_pct:.0f}%")
+        print(f"    % score ≥ 3.5 (EXTR): {_rs_ext_pct:.0f}%")
+        _band_bounds = {"LOW(<2)": (0,2), "MED(2-3)": (2,3), "HIGH(3-3.5)": (3,3.5), "EXTREME(3.5+)": (3.5,99)}
+        for _band, _cnt in _rs_by_band.items():
+            if _cnt == 0: continue
+            _lo, _hi = _band_bounds[_band]
+            _brs    = [t["r"] for t in trades if _lo <= t.get("regime_score_at_entry", 0) < _hi]
+            _avg_r  = sum(_brs) / len(_brs) if _brs else 0
+            print(f"    {_band:<18}  {_cnt:>2} trades  avg R={_avg_r:+.2f}")
+
     # ── Spread model summary ──────────────────────────────────────────────
     import src.strategy.forex.strategy_config as _sc_ref
     if _sc_ref.SPREAD_MODEL_ENABLED and trades:
@@ -1714,6 +1798,48 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
               f"equity@entry ${_max_ot.get('entry_equity',0):,.0f}  "
               f"rpct={_max_ot.get('final_risk_pct',0):.2f}%  "
               f"dd_flag={_max_ot.get('dd_flag','')!r})")
+
+    # ── Alex small-account rules summary ──────────────────────────────────
+    print(f"\n  ── Alex small-account rules ─────────────────────────────────")
+    print(f"    MIN_RR blocks (exec_rr < {_sc.MIN_RR_SMALL_ACCOUNT}R when <$25K): {_min_rr_small_blocks}x")
+    print(f"    Weekly limit blocks (punch-card):                {_weekly_limit_blocks}x")
+    # Extract time blocks and HTF blocks from all_decisions
+    _all_blocked  = [d for d in all_decisions if d.get("decision") == "BLOCKED"]
+    _all_filters  = [f for d in all_decisions
+                     for f in (d.get("failed_filters") or []) + [d.get("event","")]]
+    _time_block_n  = sum(1 for d in all_decisions
+                         for f in (d.get("failed_filters") or [])
+                         if f in ("NO_SUNDAY_TRADES", "NO_THU_FRI_TRADES", "MONDAY_WICK_GUARD"))
+    _htf_block_n   = sum(1 for d in all_decisions
+                         for f in (d.get("failed_filters") or [])
+                         if f == "COUNTERTREND_HTF")
+    _indes_block_n = sum(1 for d in all_decisions
+                         for f in (d.get("failed_filters") or [])
+                         if f == "INDECISION_DOJI")
+    _gap_blocks    = [d for d in all_decisions if d.get("event") == "GAP"]
+    _gap_weekly    = sum(1 for d in _gap_blocks if d.get("gap_type","") == "WEEKLY_TRADE_LIMIT")
+    _gap_rr_sm     = sum(1 for d in _gap_blocks if d.get("gap_type","") == "MIN_RR_SMALL_ACCOUNT")
+    print(f"    Time blocks (NO_SUNDAY/NO_THU_FRI):              {_time_block_n}x")
+    print(f"    HTF alignment blocks (COUNTERTREND_HTF):         {_htf_block_n}x")
+    print(f"    Indecision doji blocks (INDECISION_DOJI):        {_indes_block_n}x")
+    # Trades per week distribution
+    if _weekly_trade_counts:
+        _week_vals = sorted(_weekly_trade_counts.values())
+        _week_hist: dict = {}
+        for v in _week_vals:
+            _week_hist[v] = _week_hist.get(v, 0) + 1
+        _hist_str = "  ".join(f"{cnt}trade×{wks}wk" for cnt, wks in sorted(_week_hist.items()))
+        print(f"    Trades/week distribution:  {_hist_str}"
+              f"  (avg {sum(_week_vals)/len(_week_vals):.1f}/week  max {max(_week_vals)})")
+    # HTF alignment pass rate
+    _htf_checked = sum(1 for d in all_decisions
+                       if any(f in ("COUNTERTREND_HTF", "no_pattern", "trend_alignment")
+                              for f in (d.get("failed_filters") or [])))
+    _n_enter_raw = len([d for d in all_decisions if d.get("decision") == "ENTER"])
+    if (_n_enter_raw + _htf_block_n) > 0:
+        _htf_pass_rate = _n_enter_raw / (_n_enter_raw + _htf_block_n) * 100
+        print(f"    HTF alignment pass rate:   {_htf_pass_rate:.0f}%"
+              f"  ({_n_enter_raw} passed / {_htf_block_n} blocked by HTF gate)")
 
     # ── Funnel: rejection reasons from WAIT decisions ─────────────────
     _wait_decisions = [d for d in all_decisions if d.get("decision") == "WAIT"]
@@ -1917,8 +2043,21 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         "max_dd":                _max_dd_pct,
         "ret_pct":               (balance - starting_bal) / starting_bal * 100,
         "dd_killswitch_blocks":  dd_killswitch_blocks,
+        "weekly_limit_blocks":   _weekly_limit_blocks,
+        "min_rr_small_blocks":   _min_rr_small_blocks,
+        "countertrend_htf_blocks": _htf_block_n,
+        "time_blocks":           _time_block_n,
+        "indecision_doji_blocks": _indes_block_n,
+        "trades_per_week":       dict(_weekly_trade_counts),
         "eval_calls":            _eval_calls,
         "eval_ms_avg":           (_eval_ms / _eval_calls) if _eval_calls else 0.0,
+        "regime_scores":         [t.get("regime_score_at_entry", 0.0) for t in trades],
+        "regime_avg":            (sum(t.get("regime_score_at_entry",0) for t in trades) / len(trades)
+                                  if trades else 0.0),
+        "regime_pct_high":       (sum(1 for t in trades if t.get("regime_score_at_entry",0) >= 3.0)
+                                  / len(trades) * 100 if trades else 0.0),
+        "regime_pct_extreme":    (sum(1 for t in trades if t.get("regime_score_at_entry",0) >= 3.5)
+                                  / len(trades) * 100 if trades else 0.0),
         "max_dollar_loss":       min((t["pnl"] for t in trades), default=0.0),
         "api_calls":             _api_call_count,   # 0 on full cache hit
     }

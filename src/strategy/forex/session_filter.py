@@ -1,27 +1,35 @@
 """
 Session Filter — The Patience Gate
 
-Blocks trades during low-quality sessions and Sunday night.
-Rule: No trades Sunday 5PM ET → Monday 8AM ET (weekly wick creation period).
-Rule: Prefer London session (8AM–12PM London / 3AM–8AM ET) and NY session (8AM–12PM ET).
+Blocks trades during low-quality sessions and restricted days/times.
+
+Alex's time rules (from transcript):
+  • No trades Sunday  — forex wick creation period, fills happen at worst prices
+  • No trades Thursday ≥ 09:00 ET or any Friday — spread widens into week-end,
+    positions often stopped at week-close wick.  "Not worth the spread."
+  • Prefer Mon–Wed entries; London session (23:00–05:00 ET) optimal.
+
+Implementation note: all hard-block reasons carry a unique reason code so the
+backtester and orchestrator can count blocks separately in funnel reporting.
 """
 from datetime import datetime, time
 import pytz
+
+from . import strategy_config as _cfg
 
 ET  = pytz.timezone("America/New_York")
 LON = pytz.timezone("Europe/London")
 
 
 class SessionFilter:
-    # Hard block: Sunday 5PM ET → Monday 8AM ET
-    SUNDAY_HARD_BLOCK_START = time(17, 0)   # Sunday 5PM ET
+    # Monday opening wick guard (unchanged from original)
     MONDAY_HARD_BLOCK_END   = time(8,  0)   # Monday 8AM ET
 
     # Preferred entry windows (ET)
-    LONDON_OPEN_ET  = time(3,  0)   # 8AM London
-    LONDON_CLOSE_ET = time(12, 0)   # 12PM London / NY open
+    LONDON_OPEN_ET  = time(3,  0)   # 8AM London ≈ 3AM ET
+    LONDON_CLOSE_ET = time(12, 0)
     NY_OPEN_ET      = time(8,  0)
-    NY_CLOSE_ET     = time(12, 0)   # Best overlap
+    NY_CLOSE_ET     = time(12, 0)
 
     def __init__(self):
         pass
@@ -33,24 +41,40 @@ class SessionFilter:
         """
         Returns (blocked: bool, reason: str).
         Hard blocks prevent ANY entry — non-negotiable.
+
+        Reason codes (used by backtester funnel counter):
+          NO_SUNDAY_TRADES    — all of Sunday
+          NO_THU_FRI_TRADES   — Thursday ≥ THU_ENTRY_CUTOFF_HOUR_ET, all Friday
+          MARKET_CLOSED       — Saturday
+          MONDAY_WICK_GUARD   — Monday pre-8AM ET
         """
         if dt is None:
             dt = self.now_et()
         dt_et = dt.astimezone(ET)
-        weekday = dt_et.weekday()  # 0=Mon, 6=Sun
-        t = dt_et.time()
+        weekday = dt_et.weekday()   # 0=Mon … 6=Sun
+        t       = dt_et.time()
 
-        # Sunday after 5PM ET
-        if weekday == 6 and t >= self.SUNDAY_HARD_BLOCK_START:
-            return True, "Sunday post-5PM ET — weekly wick creation, no entries"
-
-        # Monday before 8AM ET
-        if weekday == 0 and t < self.MONDAY_HARD_BLOCK_END:
-            return True, "Monday pre-8AM ET — market still creating weekly wick"
-
-        # Saturday entirely
+        # Saturday — market closed
         if weekday == 5:
-            return True, "Saturday — market closed"
+            return True, "MARKET_CLOSED: Saturday"
+
+        # Sunday ALL DAY (Alex: wick creation, awful fills)
+        if weekday == 6 and _cfg.NO_SUNDAY_TRADES_ENABLED:
+            return True, "NO_SUNDAY_TRADES"
+
+        # Monday before 8AM ET — weekly opening wick still printing
+        if weekday == 0 and t < self.MONDAY_HARD_BLOCK_END:
+            return True, "MONDAY_WICK_GUARD: pre-8AM ET"
+
+        # Thursday ≥ 09:00 ET — spread widens into week-end
+        if weekday == 3 and _cfg.NO_THU_FRI_TRADES_ENABLED:
+            cutoff = time(_cfg.THU_ENTRY_CUTOFF_HOUR_ET, 0)
+            if t >= cutoff:
+                return True, "NO_THU_FRI_TRADES: Thursday post-09:00 ET"
+
+        # Friday ALL DAY (Alex: "not worth it")
+        if weekday == 4 and _cfg.NO_THU_FRI_TRADES_ENABLED:
+            return True, "NO_THU_FRI_TRADES: Friday"
 
         return False, ""
 

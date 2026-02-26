@@ -12,11 +12,13 @@
 <!-- Alpine.js -->
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 
-<!-- Chart.js -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+{% if page == 'live' %}
+<!-- Chart.js — only needed for the P&L bar chart on the live page -->
+<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+{% endif %}
 
-<!-- Phosphor Icons -->
-<script src="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/index.js"></script>
+<!-- Phosphor Icons — defer so it never blocks page render -->
+<script defer src="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/index.js"></script>
 
 <style>
   body { background: #0a0e1a; }
@@ -149,7 +151,7 @@
   <span>
     🔒 <strong>LIVE WHITELIST ON</strong> —
     Trading only: <strong x-text="(state.whitelist_live_pairs||[]).join(', ') || '(none)'"></strong>.
-    <a href="#" @click.prevent="activeTab='whitelist'; loadWhitelist('live')" class="underline ml-1 text-sm">Edit →</a>
+    <a href="/whitelist" class="underline ml-1 text-sm">Edit →</a>
   </span>
 </div>
 
@@ -178,22 +180,21 @@
 
 <!-- ── TAB NAV ────────────────────────────────────────────── -->
 <div class="px-6 pt-4 border-b border-base-300 bg-base-200 flex gap-1">
-  <button @click="activeTab='live'"
-    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
-    :class="activeTab==='live' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
+  <a href="/"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors
+           {% if page == 'live' %}bg-base-100 border-base-300 text-base-content{% else %}border-transparent text-base-content/40 hover:text-base-content/70{% endif %}">
     <i class="ph ph-pulse mr-1"></i> Live
-  </button>
-  <button @click="activeTab='backtests'; loadBacktests()"
-    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
-    :class="activeTab==='backtests' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
+  </a>
+  <a href="/backtests"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors
+           {% if page == 'backtests' %}bg-base-100 border-base-300 text-base-content{% else %}border-transparent text-base-content/40 hover:text-base-content/70{% endif %}">
     <i class="ph ph-chart-bar mr-1"></i> Backtests
-  </button>
-  <button @click="activeTab='whitelist'; loadWhitelist(wlScope)"
-    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
-    :class="activeTab==='whitelist' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
+  </a>
+  <a href="/whitelist"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors
+           {% if page == 'whitelist' %}bg-base-100 border-base-300 text-base-content{% else %}border-transparent text-base-content/40 hover:text-base-content/70{% endif %}">
     <i class="ph ph-funnel mr-1"></i> Whitelist
-    <span x-show="state.whitelist_live_enabled || state.whitelist_backtest_enabled" class="badge badge-xs badge-warning ml-1">ON</span>
-  </button>
+  </a>
 </div>
 
 <!-- ── MAIN GRID ──────────────────────────────────────────── -->
@@ -940,8 +941,7 @@
 
   <!-- Whitelist shortcut -->
   <div class="text-center py-2 opacity-50 text-sm">
-    <a href="#" @click.prevent="activeTab='whitelist'; loadWhitelist(wlScope)"
-       class="underline">
+    <a href="/whitelist" class="underline">
       <i class="ph ph-funnel mr-1"></i> Manage Pair Whitelist →
     </a>
   </div>
@@ -1160,7 +1160,7 @@ function dashboard() {
     newsEvents: [],
 
     // ── Backtests tab ───────────────────────────────────────────────
-    activeTab: 'live',
+    activeTab: '{{ page }}',
     btResults: [], btExpanded: null, btSelected: [],
     btStart: '2024-07-01', btEnd: '2024-10-31', btNotes: '',
     btRunning: false, btMsg: '', btPollTimer: null,
@@ -1170,15 +1170,22 @@ function dashboard() {
     wlSaving: false, wlMsg: '',
 
     async init() {
-      await this.refresh();
-      await this.fetchNews();
-      await this.loadWhitelist('live');
-      setInterval(() => this.refresh(), REFRESH_SECS * 1000);
-      setInterval(() => this.fetchNews(), 5 * 60 * 1000);  // refresh news every 5 min
-      setInterval(() => {
-        this.refreshIn = Math.max(0, this.refreshIn - 1);
-        this.progressPct = (this.refreshIn / REFRESH_SECS) * 100;
-      }, 1000);
+      const page = '{{ page }}';
+
+      if (page === 'live') {
+        await this.refresh();
+        await this.fetchNews();
+        setInterval(() => this.refresh(), REFRESH_SECS * 1000);
+        setInterval(() => this.fetchNews(), 5 * 60 * 1000);
+        setInterval(() => {
+          this.refreshIn = Math.max(0, this.refreshIn - 1);
+          this.progressPct = (this.refreshIn / REFRESH_SECS) * 100;
+        }, 1000);
+      } else if (page === 'backtests') {
+        await this.loadBacktests();
+      } else if (page === 'whitelist') {
+        await this.loadWhitelist('live');
+      }
     },
 
     async pauseBot() {
@@ -1502,6 +1509,9 @@ function dashboard() {
         x-text="'trigger: ' + (state.entry_trigger_mode || '—')"></span>
   <span x-show="state.max_concurrent_live !== undefined"
         x-text="'concurrent: live=' + state.max_concurrent_live + ' bt=' + state.max_concurrent_backtest"></span>
+  <span x-show="state.regime_score"
+        :class="state.regime_score?.regime_score >= 3.0 ? 'text-success' : ''"
+        x-text="state.regime_score ? 'regime: ' + state.regime_score.regime_score.toFixed(1) + (state.regime_score.eligible_high ? ' ✓HIGH' : '') + (state.regime_score.eligible_extreme ? ' ⚡EXTREME' : '') : ''"></span>
 </div>
 </body>
 </html>
