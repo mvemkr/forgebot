@@ -143,13 +143,13 @@
 </div>
 
 <!-- Whitelist active banner (info, not alarm) -->
-<div x-show="!state.paused && botOnline && state.whitelist_enabled"
+<div x-show="!state.paused && botOnline && state.whitelist_live_enabled"
      class="alert alert-warning rounded-none py-2">
   <i class="ph ph-funnel ph-bold text-xl"></i>
   <span>
-    🔒 <strong>WHITELIST ON</strong> —
-    Trading only: <strong x-text="(state.whitelist_pairs||[]).join(', ') || '(none)'"></strong>.
-    <a href="#" @click.prevent="activeTab='backtests'; loadBacktests()" class="underline ml-1 text-sm">Edit →</a>
+    🔒 <strong>LIVE WHITELIST ON</strong> —
+    Trading only: <strong x-text="(state.whitelist_live_pairs||[]).join(', ') || '(none)'"></strong>.
+    <a href="#" @click.prevent="activeTab='whitelist'; loadWhitelist('live')" class="underline ml-1 text-sm">Edit →</a>
   </span>
 </div>
 
@@ -187,6 +187,12 @@
     class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
     :class="activeTab==='backtests' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
     <i class="ph ph-chart-bar mr-1"></i> Backtests
+  </button>
+  <button @click="activeTab='whitelist'; loadWhitelist(wlScope)"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
+    :class="activeTab==='whitelist' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
+    <i class="ph ph-funnel mr-1"></i> Whitelist
+    <span x-show="state.whitelist_live_enabled || state.whitelist_backtest_enabled" class="badge badge-xs badge-warning ml-1">ON</span>
   </button>
 </div>
 
@@ -916,75 +922,172 @@
     </div>
   </div>
 
-  <!-- ── Pair Whitelist ──────────────────────────────────────────────────── -->
-  <div class="bg-base-200 border border-base-300 rounded-2xl overflow-hidden">
-    <div class="flex items-center justify-between px-5 py-3 border-b border-base-300">
+  <!-- Whitelist shortcut -->
+  <div class="text-center py-2 opacity-50 text-sm">
+    <a href="#" @click.prevent="activeTab='whitelist'; loadWhitelist(wlScope)"
+       class="underline">
+      <i class="ph ph-funnel mr-1"></i> Manage Pair Whitelist →
+    </a>
+  </div>
+
+</div>
+
+<!-- ── WHITELIST TAB ──────────────────────────────────────── -->
+<div x-show="activeTab==='whitelist'" class="p-6 space-y-5">
+
+  <!-- Scope toggle -->
+  <div class="flex items-center gap-3">
+    <span class="text-sm font-semibold uppercase tracking-widest text-base-content/50">Scope:</span>
+    <div class="join">
+      <button class="join-item btn btn-sm"
+              :class="wlScope==='live' ? 'btn-warning' : 'btn-ghost border border-base-300'"
+              @click="wlScope='live'; loadWhitelist('live')">
+        <i class="ph ph-pulse mr-1"></i> Live Trading
+      </button>
+      <button class="join-item btn btn-sm"
+              :class="wlScope==='backtest' ? 'btn-info' : 'btn-ghost border border-base-300'"
+              @click="wlScope='backtest'; loadWhitelist('backtest')">
+        <i class="ph ph-chart-bar mr-1"></i> Backtests
+      </button>
+    </div>
+    <span class="text-xs opacity-40 ml-2">
+      Live and Backtest are <strong>independent</strong> — changing one never affects the other.
+    </span>
+  </div>
+
+  <!-- Status card -->
+  <div class="bg-base-200 border rounded-2xl p-5 space-y-4"
+       :class="wlScope==='live' ? 'border-warning/30' : 'border-info/30'">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between">
       <div class="font-bold text-sm uppercase tracking-widest text-base-content/50">
-        <i class="ph ph-funnel mr-1"></i> Pair Whitelist
+        <span x-text="wlScope==='live' ? '🔴 Live Trading Whitelist' : '🔵 Backtest Whitelist'"></span>
       </div>
-      <div class="flex items-center gap-2">
-        <span class="text-xs opacity-50" x-text="wl.updated_at ? 'Updated: ' + new Date(wl.updated_at).toLocaleString() : 'Not saved yet'"></span>
-        <span class="badge badge-sm" :class="wl.enabled ? 'badge-warning' : 'badge-ghost'"
-              x-text="wl.enabled ? '🔒 ACTIVE' : '🔓 DISABLED'"></span>
+      <div class="flex items-center gap-3">
+        <span class="text-xs opacity-40"
+              x-text="wl.updated_at ? 'Saved ' + new Date(wl.updated_at).toLocaleString() : 'Not saved yet'"></span>
+        <span class="badge"
+              :class="wl.enabled
+                ? (wlScope==='live' ? 'badge-warning' : 'badge-info')
+                : 'badge-ghost'"
+              x-text="wl.enabled ? '🔒 ACTIVE' : '🔓 OFF'"></span>
       </div>
     </div>
 
-    <div class="p-5 space-y-4">
-      <!-- Enable / Disable toggle -->
-      <div class="flex items-center gap-4">
-        <span class="text-sm font-medium">Whitelist enabled</span>
-        <input type="checkbox" class="toggle toggle-warning" x-model="wl.enabled">
-        <span class="text-xs opacity-50" x-text="wl.enabled
-          ? 'Only whitelisted pairs will be evaluated'
-          : 'All watchlist pairs evaluated (wide mode)'"></span>
-      </div>
+    <!-- What this scope does -->
+    <div class="text-xs opacity-50 bg-base-300/30 rounded-lg px-4 py-2">
+      <span x-show="wlScope==='live'">
+        When ACTIVE: orchestrator skips non-whitelisted pairs entirely (no OANDA API calls = quota saved).
+        Blocked pairs show as <strong>WLIST</strong> on the Live tab confluence cards.
+      </span>
+      <span x-show="wlScope==='backtest'">
+        When ACTIVE: backtester filters pairs after loading cache — only whitelisted pairs are simulated.
+        Useful for Alex-only runs without re-fetching data.
+      </span>
+    </div>
 
-      <!-- Preset buttons -->
-      <div class="flex gap-2 flex-wrap items-center">
-        <span class="text-xs opacity-50">Presets:</span>
-        <button @click="wl.pairs = wl.alex_pairs.slice(); wl.enabled=true"
-                class="btn btn-xs btn-ghost border border-base-300">
-          🎯 Alex's 7
-        </button>
-        <button @click="wl.pairs = wl.all_known_pairs.slice(); wl.enabled=false"
-                class="btn btn-xs btn-ghost border border-base-300">
-          🌐 Wide (all)
-        </button>
-      </div>
+    <!-- Enable toggle -->
+    <div class="flex items-center gap-4">
+      <label class="flex items-center gap-3 cursor-pointer">
+        <input type="checkbox" class="toggle"
+               :class="wlScope==='live' ? 'toggle-warning' : 'toggle-info'"
+               x-model="wl.enabled">
+        <span class="text-sm font-medium"
+              x-text="wl.enabled ? 'Whitelist ACTIVE — only selected pairs' : 'Off — all pairs evaluated'"></span>
+      </label>
+    </div>
 
-      <!-- Pair checklist -->
-      <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2">
+    <!-- Presets -->
+    <div>
+      <div class="text-xs text-base-content/40 mb-2 uppercase tracking-widest">Presets</div>
+      <div class="flex gap-2 flex-wrap">
+        <template x-for="[name, label, icon] in [
+          ['alex',    'Alex Core (7)',  '🎯'],
+          ['majors',  'Majors (7)',     '💱'],
+          ['jpy',     'JPY Complex',    '🇯🇵'],
+          ['chf',     'CHF Block',      '🇨🇭'],
+          ['wide',    'Wide (all)',     '🌐']
+        ]" :key="name">
+          <button @click="applyPreset(name)"
+                  class="btn btn-xs border"
+                  :class="JSON.stringify(wl.pairs) === JSON.stringify(wl.presets && wl.presets[name])
+                    ? (wlScope==='live' ? 'btn-warning' : 'btn-info')
+                    : 'btn-ghost border-base-300'">
+            <span x-text="icon + ' ' + label"></span>
+          </button>
+        </template>
+      </div>
+    </div>
+
+    <!-- Pair grid -->
+    <div>
+      <div class="text-xs text-base-content/40 mb-2 uppercase tracking-widest">
+        Pairs
+        <span class="ml-2 font-mono" x-text="'(' + (wl.pairs||[]).length + ' selected)'"></span>
+      </div>
+      <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 xl:grid-cols-6 gap-2">
         <template x-for="pair in (wl.all_known_pairs || [])" :key="pair">
-          <label class="flex items-center gap-2 cursor-pointer p-2 rounded-lg border text-sm"
+          <label class="flex items-center gap-1.5 cursor-pointer p-2 rounded-lg border text-xs transition-all"
                  :class="wl.pairs && wl.pairs.includes(pair)
-                   ? 'border-warning/50 bg-warning/10 font-medium'
-                   : 'border-base-300/30 opacity-50'">
-            <input type="checkbox" class="checkbox checkbox-xs checkbox-warning"
+                   ? (wlScope==='live'
+                       ? 'border-warning/60 bg-warning/10 font-semibold'
+                       : 'border-info/60 bg-info/10 font-semibold')
+                   : 'border-base-300/30 opacity-40 hover:opacity-70'">
+            <input type="checkbox" class="checkbox checkbox-xs"
+                   :class="wlScope==='live' ? 'checkbox-warning' : 'checkbox-info'"
                    :checked="wl.pairs && wl.pairs.includes(pair)"
-                   @change="wl.pairs && wl.pairs.includes(pair)
-                     ? wl.pairs = wl.pairs.filter(p => p !== pair)
-                     : wl.pairs.push(pair)">
-            <span class="font-mono text-xs" x-text="pair"></span>
-            <!-- Alex-pair indicator -->
-            <span x-show="wl.alex_pairs && wl.alex_pairs.includes(pair)"
-                  class="ml-auto text-warning text-xs" title="Alex's core pair">★</span>
+                   @change="togglePair(pair)">
+            <span class="font-mono" x-text="pair"></span>
+            <!-- Alex ★ marker -->
+            <span x-show="wl.presets && wl.presets.alex && wl.presets.alex.includes(pair)"
+                  class="ml-auto opacity-60 text-warning">★</span>
           </label>
         </template>
       </div>
+    </div>
 
-      <!-- Save button + feedback -->
-      <div class="flex items-center gap-3 pt-2">
-        <button @click="saveWhitelist()"
-                class="btn btn-warning btn-sm"
-                :disabled="wlSaving">
-          <i class="ph ph-floppy-disk mr-1"></i>
-          <span x-text="wlSaving ? 'Saving…' : 'Save Whitelist'"></span>
-        </button>
-        <span class="text-xs" :class="wlMsg.includes('error') ? 'text-error' : 'text-success'"
-              x-show="wlMsg" x-text="wlMsg"></span>
-        <span class="text-xs opacity-50 ml-auto"
-              x-text="(wl.pairs||[]).length + ' pair(s) selected'"></span>
+    <!-- Save -->
+    <div class="flex items-center gap-3 pt-1 border-t border-base-300">
+      <button @click="saveWhitelist()"
+              class="btn btn-sm"
+              :class="wlScope==='live' ? 'btn-warning' : 'btn-info'"
+              :disabled="wlSaving">
+        <i class="ph ph-floppy-disk mr-1"></i>
+        <span x-text="wlSaving ? 'Saving…' : 'Save ' + (wlScope==='live' ? 'Live' : 'Backtest') + ' Whitelist'"></span>
+      </button>
+      <span class="text-xs" :class="wlMsg.includes('error')||wlMsg.includes('Error') ? 'text-error' : 'text-success'"
+            x-show="wlMsg" x-text="wlMsg"></span>
+    </div>
+  </div>
+
+  <!-- Live status summary (always visible) -->
+  <div class="grid grid-cols-2 gap-4 text-sm">
+    <div class="bg-base-200 border border-warning/20 rounded-2xl p-4 space-y-1">
+      <div class="text-xs uppercase tracking-widest text-base-content/40 mb-2">Live Trading</div>
+      <div class="flex items-center gap-2">
+        <span class="badge badge-sm" :class="state.whitelist_live_enabled ? 'badge-warning' : 'badge-ghost'"
+              x-text="state.whitelist_live_enabled ? '🔒 ACTIVE' : '🔓 OFF'"></span>
+        <span class="opacity-60 text-xs"
+              x-text="state.whitelist_live_enabled
+                ? (state.whitelist_live_pairs||[]).length + ' pairs'
+                : 'all pairs'"></span>
       </div>
+      <div class="font-mono text-xs opacity-60"
+           x-text="state.whitelist_live_enabled ? (state.whitelist_live_pairs||[]).join(', ') : '(wide)'"></div>
+    </div>
+    <div class="bg-base-200 border border-info/20 rounded-2xl p-4 space-y-1">
+      <div class="text-xs uppercase tracking-widest text-base-content/40 mb-2">Backtests</div>
+      <div class="flex items-center gap-2">
+        <span class="badge badge-sm" :class="state.whitelist_backtest_enabled ? 'badge-info' : 'badge-ghost'"
+              x-text="state.whitelist_backtest_enabled ? '🔒 ACTIVE' : '🔓 OFF'"></span>
+        <span class="opacity-60 text-xs"
+              x-text="state.whitelist_backtest_enabled
+                ? (state.whitelist_backtest_pairs||[]).length + ' pairs'
+                : 'all pairs'"></span>
+      </div>
+      <div class="font-mono text-xs opacity-60"
+           x-text="state.whitelist_backtest_enabled ? (state.whitelist_backtest_pairs||[]).join(', ') : '(wide)'"></div>
     </div>
   </div>
 
@@ -1046,13 +1149,14 @@ function dashboard() {
     btStart: '2024-07-01', btEnd: '2024-10-31', btNotes: '',
     btRunning: false, btMsg: '', btPollTimer: null,
     // ── Whitelist state ────────────────────────────────────────────────
-    wl: { enabled: false, pairs: [], all_known_pairs: [], alex_pairs: [], updated_at: null },
+    wl: { enabled: false, pairs: [], all_known_pairs: [], presets: {}, updated_at: null, scope: 'live' },
+    wlScope: 'live',
     wlSaving: false, wlMsg: '',
 
     async init() {
       await this.refresh();
       await this.fetchNews();
-      await this.loadWhitelist();
+      await this.loadWhitelist('live');
       setInterval(() => this.refresh(), REFRESH_SECS * 1000);
       setInterval(() => this.fetchNews(), 5 * 60 * 1000);  // refresh news every 5 min
       setInterval(() => {
@@ -1128,7 +1232,8 @@ function dashboard() {
           'pattern_memory_count','regroup_ends',
           'last_scan_ts','last_decision_ts','last_state_write_ts','engine_sha',
           'peak_source','session_allowed','session_reason','next_session','next_session_mins',
-          'whitelist_enabled','whitelist_pairs','whitelist_updated_at'];
+          'whitelist_live_enabled','whitelist_live_pairs','whitelist_live_updated_at',
+          'whitelist_backtest_enabled','whitelist_backtest_pairs','whitelist_backtest_updated_at'];
         this.state = { ...(status.heartbeat || {}) };
         for (const k of _topFields) {
           if (status[k] !== undefined) this.state[k] = status[k];
@@ -1278,11 +1383,13 @@ function dashboard() {
     },
 
     // ── Whitelist methods ──────────────────────────────────────────────
-    async loadWhitelist() {
+    async loadWhitelist(scope) {
+      scope = scope || this.wlScope || 'live';
+      this.wlScope = scope;
       try {
-        const r = await fetch('/api/whitelist');
+        const r = await fetch(`/api/whitelist?scope=${scope}`);
         const d = await r.json();
-        this.wl = { ...this.wl, ...d };
+        this.wl = { ...this.wl, ...d, scope };
       } catch(e) {
         console.warn('Could not load whitelist:', e);
       }
@@ -1291,21 +1398,21 @@ function dashboard() {
     async saveWhitelist() {
       this.wlSaving = true;
       this.wlMsg = '';
+      const scope = this.wlScope || 'live';
       try {
-        const r = await fetch('/api/whitelist', {
+        const r = await fetch(`/api/whitelist?scope=${scope}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             enabled: this.wl.enabled,
             pairs:   this.wl.pairs,
-            reason:  'Dashboard update',
+            reason:  `Dashboard update (${scope})`,
           }),
         });
         const d = await r.json();
         if (d.status === 'ok') {
           this.wlMsg = `✅ ${d.message}`;
           this.wl.updated_at = new Date().toISOString();
-          // Trigger status refresh so whitelist banner updates
           await this.refresh();
         } else {
           this.wlMsg = '⚠️ Error: ' + (d.error || 'unknown');
@@ -1314,6 +1421,20 @@ function dashboard() {
         this.wlMsg = 'Error: ' + e.message;
       }
       this.wlSaving = false;
+    },
+
+    applyPreset(name) {
+      const preset = (this.wl.presets || {})[name];
+      if (!preset) return;
+      this.wl.pairs   = [...preset];
+      this.wl.enabled = (name !== 'wide');
+    },
+
+    togglePair(pair) {
+      if (!this.wl.pairs) this.wl.pairs = [];
+      const idx = this.wl.pairs.indexOf(pair);
+      if (idx >= 0) this.wl.pairs.splice(idx, 1);
+      else          this.wl.pairs.push(pair);
     },
 
     tagColor(tag) {

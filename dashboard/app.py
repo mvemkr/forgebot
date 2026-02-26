@@ -18,9 +18,13 @@ HEARTBEAT_FILE = LOG_DIR / "forex_orchestrator.heartbeat"
 STATE_FILE     = LOG_DIR / "bot_state.json"
 DECISIONS_FILE = LOG_DIR / "decision_log.jsonl"
 CONTROL_FILE   = LOG_DIR / "bot_control.json"
-WHITELIST_FILE = LOG_DIR / "whitelist.json"
+# Two independent whitelist files — live never touches backtest and vice versa
+WHITELIST_LIVE_FILE      = LOG_DIR / "whitelist_live.json"
+WHITELIST_BACKTEST_FILE  = LOG_DIR / "whitelist_backtest.json"
+# Legacy path alias (for any code that may still reference the old name)
+WHITELIST_FILE           = WHITELIST_LIVE_FILE
 
-# All known pairs across backtester + live universe (used for whitelist UI)
+# ── Pair universe ──────────────────────────────────────────────────────────
 ALL_KNOWN_PAIRS = [
     "GBP/JPY", "USD/JPY", "USD/CHF", "GBP/CHF", "USD/CAD",
     "EUR/USD", "GBP/USD", "NZD/USD", "GBP/NZD", "EUR/GBP",
@@ -29,11 +33,16 @@ ALL_KNOWN_PAIRS = [
     "EUR/NZD", "EUR/CHF", "NZD/CAD",
 ]
 
-# Alex's 7 proven pairs (default whitelist)
-ALEX_PAIRS = [
-    "GBP/JPY", "USD/JPY", "USD/CHF", "GBP/CHF",
-    "USD/CAD", "EUR/USD", "GBP/USD",
-]
+# ── Named presets ──────────────────────────────────────────────────────────
+WHITELIST_PRESETS = {
+    "alex":    ["GBP/JPY", "USD/JPY", "USD/CHF", "GBP/CHF", "USD/CAD", "EUR/USD", "GBP/USD"],
+    "majors":  ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "USD/CAD", "AUD/USD", "NZD/USD"],
+    "jpy":     ["GBP/JPY", "USD/JPY", "EUR/JPY", "AUD/JPY", "NZD/JPY"],
+    "chf":     ["USD/CHF", "GBP/CHF", "EUR/CHF"],
+    "wide":    ALL_KNOWN_PAIRS,
+}
+# Back-compat alias
+ALEX_PAIRS = WHITELIST_PRESETS["alex"]
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.WARNING)
@@ -283,8 +292,12 @@ def api_status():
         "win_rate":           round(wr * 100, 1),
         "total_trades":       tot_tr,
         "total_pnl":          tot_pnl,
-        # whitelist
-        **{f"whitelist_{k}": v for k, v in _load_whitelist_state().items()
+        # whitelist — both scopes surfaced for dashboard
+        **{f"whitelist_live_{k}": v
+           for k, v in _load_whitelist_state("live").items()
+           if k in ("enabled", "pairs", "updated_at")},
+        **{f"whitelist_backtest_{k}": v
+           for k, v in _load_whitelist_state("backtest").items()
            if k in ("enabled", "pairs", "updated_at")},
     })
 
@@ -333,34 +346,44 @@ def api_resume():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
-def _load_whitelist_state() -> dict:
-    """Read whitelist.json; return safe default if missing/corrupt."""
-    if WHITELIST_FILE.exists():
+def _whitelist_file(scope: str) -> Path:
+    """Return the correct whitelist file for scope='live'|'backtest'."""
+    return WHITELIST_BACKTEST_FILE if scope == "backtest" else WHITELIST_LIVE_FILE
+
+
+def _load_whitelist_state(scope: str = "live") -> dict:
+    """Read scoped whitelist file; return safe default if missing/corrupt."""
+    wl_file = _whitelist_file(scope)
+    default_pairs = list(WHITELIST_PRESETS["alex"])
+    if wl_file.exists():
         try:
-            data = json.loads(WHITELIST_FILE.read_text())
+            data = json.loads(wl_file.read_text())
             return {
+                "scope":      scope,
                 "enabled":    bool(data.get("enabled", False)),
-                "pairs":      list(data.get("pairs", ALEX_PAIRS)),
+                "pairs":      list(data.get("pairs", default_pairs)),
                 "updated_at": data.get("updated_at"),
                 "updated_by": data.get("updated_by", "unknown"),
             }
         except Exception:
             pass
     return {
+        "scope":      scope,
         "enabled":    False,
-        "pairs":      list(ALEX_PAIRS),
+        "pairs":      default_pairs,
         "updated_at": None,
         "updated_by": None,
     }
 
 
-def _write_whitelist_audit(enabled: bool, pairs: list, reason: str = "UI update"):
+def _write_whitelist_audit(enabled: bool, pairs: list, scope: str, reason: str = "UI update"):
     """Append a WHITELIST_UPDATE entry to decision_log.jsonl."""
     entry = {
         "ts":      datetime.now(timezone.utc).isoformat(),
         "event":   "WHITELIST_UPDATE",
         "pair":    "ALL",
         "source":  "dashboard",
+        "scope":   scope,
         "enabled": enabled,
         "pairs":   pairs,
         "reason":  reason,
@@ -376,26 +399,36 @@ def _write_whitelist_audit(enabled: bool, pairs: list, reason: str = "UI update"
 
 @app.route("/api/whitelist", methods=["GET"])
 def api_whitelist_get():
-    """Return current whitelist state + all known pairs for the UI checklist."""
-    state = _load_whitelist_state()
+    """
+    Return whitelist state for a scope.
+    ?scope=live (default) | backtest
+    Also returns all pair groups and presets for the UI.
+    """
+    scope = request.args.get("scope", "live")
+    state = _load_whitelist_state(scope)
     state["all_known_pairs"] = ALL_KNOWN_PAIRS
-    state["alex_pairs"]      = ALEX_PAIRS
+    state["presets"]         = WHITELIST_PRESETS
     return jsonify(state)
 
 
 @app.route("/api/whitelist", methods=["POST"])
 def api_whitelist_post():
     """
-    Update whitelist state.  Body: {"enabled": bool, "pairs": [...], "reason": "..."}
-    Writes to whitelist.json (orchestrator picks it up next scan cycle).
-    Also appends a WHITELIST_UPDATE audit entry to decision_log.jsonl.
+    Update whitelist for a scope.
+    Query:  ?scope=live (default) | backtest
+    Body:   {"enabled": bool, "pairs": [...], "reason": "..."}
+    - Writes to whitelist_{scope}.json
+    - Appends WHITELIST_UPDATE to decision_log.jsonl with scope field
     """
+    scope   = request.args.get("scope", "live")
     data    = request.get_json() or {}
     enabled = bool(data.get("enabled", False))
-    pairs   = [str(p) for p in data.get("pairs", ALEX_PAIRS)]
+    pairs   = [str(p) for p in data.get("pairs", WHITELIST_PRESETS["alex"])]
     reason  = data.get("reason", "Dashboard update")
 
+    wl_file = _whitelist_file(scope)
     payload = {
+        "scope":      scope,
         "enabled":    enabled,
         "pairs":      pairs,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -403,14 +436,15 @@ def api_whitelist_post():
         "reason":     reason,
     }
     try:
-        WHITELIST_FILE.parent.mkdir(parents=True, exist_ok=True)
-        WHITELIST_FILE.write_text(json.dumps(payload, indent=2))
-        _write_whitelist_audit(enabled, pairs, reason)
+        wl_file.parent.mkdir(parents=True, exist_ok=True)
+        wl_file.write_text(json.dumps(payload, indent=2))
+        _write_whitelist_audit(enabled, pairs, scope, reason)
         return jsonify({
             "status":  "ok",
+            "scope":   scope,
             "enabled": enabled,
             "pairs":   pairs,
-            "message": f"Whitelist {'ENABLED' if enabled else 'DISABLED'} — "
+            "message": f"[{scope.upper()}] Whitelist {'ENABLED' if enabled else 'DISABLED'} — "
                        f"{len(pairs)} pairs active.",
         })
     except Exception as e:

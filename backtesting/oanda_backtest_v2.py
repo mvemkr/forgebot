@@ -80,7 +80,8 @@ BACKTEST_START  = datetime(2025, 7, 1, tzinfo=timezone.utc)   # ~7 months of his
 STARTING_BAL    = 8_000.0
 MAX_HOLD_BARS   = 365 * 24         # effectively no cap — strategy has no TP or hold limit
                                    # (live bot runs until stop hit or Mike manually closes)
-GAP_LOG_PATH    = Path.home() / "trading-bot" / "logs" / "backtest_gap_log.jsonl"
+GAP_LOG_PATH         = Path.home() / "trading-bot" / "logs" / "backtest_gap_log.jsonl"
+WHITELIST_BACKTEST_FILE = Path.home() / "trading-bot" / "logs" / "whitelist_backtest.json"
 DECISION_LOG    = Path.home() / "trading-bot" / "logs" / "backtest_v2_decisions.json"
 V1_DECISION_LOG = Path.home() / "trading-bot" / "logs" / "backtest_decisions.json"
 
@@ -464,6 +465,28 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         for ts in pdata["1h"].index
         if ts >= start_naive and (runout_naive is None or ts <= runout_naive)
     ))
+    # ── Backtest whitelist filter ─────────────────────────────────────
+    # Reads logs/whitelist_backtest.json when enabled — lets you run Alex-only
+    # or any subset without re-fetching data. Skipped pairs keep their cache.
+    if WHITELIST_BACKTEST_FILE.exists():
+        try:
+            _wl = json.load(open(WHITELIST_BACKTEST_FILE))
+            if _wl.get("enabled") and _wl.get("pairs"):
+                _wl_pairs = set(_wl["pairs"])
+                _before   = len(candle_data)
+                candle_data = {p: v for p, v in candle_data.items() if p in _wl_pairs}
+                _filtered  = _before - len(candle_data)
+                print(f"\n  🔒 Backtest whitelist ACTIVE ({len(candle_data)}/{_before} pairs, "
+                      f"{_filtered} filtered): {', '.join(sorted(candle_data))}")
+                # Recompute all_1h after filter
+                all_1h = sorted(set(
+                    ts for pdata in candle_data.values()
+                    for ts in pdata["1h"].index
+                    if ts >= start_naive and (runout_naive is None or ts <= runout_naive)
+                ))
+        except Exception as _e:
+            print(f"  ⚠ Could not load backtest whitelist: {_e}")
+
     print(f"\nPairs loaded: {len(candle_data)}")
     print(f"Backtesting {len(all_1h)} hourly bars: "
           f"{all_1h[0].date()} → {all_1h[-1].date()}")

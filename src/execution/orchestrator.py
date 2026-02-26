@@ -63,7 +63,8 @@ logger = logging.getLogger("orchestrator")
 
 HEARTBEAT_FILE  = LOG_DIR / "forex_orchestrator.heartbeat"
 CONTROL_FILE    = LOG_DIR / "bot_control.json"   # Mike → Forge → bot command relay
-WHITELIST_FILE  = LOG_DIR / "whitelist.json"      # pair whitelist (persistent, UI-managed)
+WHITELIST_LIVE_FILE  = LOG_DIR / "whitelist_live.json"   # live trading whitelist (UI-managed)
+WHITELIST_FILE       = WHITELIST_LIVE_FILE               # back-compat alias
 DECISIONS_FILE  = LOG_DIR / "decision_log.jsonl"  # audit + decision feed for dashboard
 
 WATCHLIST = [
@@ -1023,19 +1024,19 @@ class ForexOrchestrator:
 
     def _load_whitelist(self) -> tuple[bool, set]:
         """
-        Read logs/whitelist.json and return (enabled, pairs_set).
-        Returns (False, empty_set) if file missing → no whitelist active.
+        Read logs/whitelist_live.json and return (enabled, pairs_set).
+        Returns (False, empty_set) if file missing → no whitelist active (all pairs evaluated).
         Called once per scan cycle (not per-pair) to avoid repeated disk reads.
         """
-        if not WHITELIST_FILE.exists():
+        if not WHITELIST_LIVE_FILE.exists():
             return False, set()
         try:
-            data = json.loads(WHITELIST_FILE.read_text())
+            data    = json.loads(WHITELIST_LIVE_FILE.read_text())
             enabled = bool(data.get("enabled", False))
             pairs   = set(str(p) for p in data.get("pairs", []))
             return enabled, pairs
         except Exception as e:
-            logger.warning(f"Could not read whitelist.json: {e}")
+            logger.warning(f"Could not read whitelist_live.json: {e}")
             return False, set()
 
     def _check_control_file(self):
