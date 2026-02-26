@@ -70,24 +70,28 @@ ATR_MIN_MULTIPLIER: float = 0.15
 ATR_LOOKBACK: int = 14
 
 # ── Concurrency limits ─────────────────────────────────────────────────────
-# Two independent caps — live and backtest must NOT share a single value:
+# PARITY RULE: backtest must mirror live. Default = 1 for both.
+# Changing BACKTEST without changing LIVE produces meaningless comparisons —
+# different exposure, different compounding, different drawdown paths.
 #
-#   MAX_CONCURRENT_TRADES_LIVE     — used by orchestrator + risk_manager (real account).
-#     Default = 1: one at-risk position at a time. Conservative for live trading.
-#     Alex himself runs multiple, but his position sizing and account size ($500K+)
-#     handle the correlation risk. At $4K–$30K we keep it simple: finish one trade,
-#     then open the next. Change only when track record justifies it.
+#   MAX_CONCURRENT_TRADES_LIVE     — orchestrator + risk_manager (real account).
+#   MAX_CONCURRENT_TRADES_BACKTEST — backtester default. Must equal LIVE.
 #
-#   MAX_CONCURRENT_TRADES_BACKTEST — used by backtester only.
-#     Default = 4: matches Alex's actual multi-position behaviour for research.
-#     Running Alex's 13-week window with cap=1 would exclude his Week 7-8 JPY theme
-#     trades entirely — misrepresenting his real strategy and inflating our miss count.
+# Want to test multi-position behaviour? Use the CLI flag --max-trades N
+# in oanda_backtest_v2.py. Those runs are tagged EXPERIMENTAL in results
+# and notes so they're never confused with parity runs.
 #
-# Macro theme stacking (JPY, CHF carry theme) always bypasses this cap — covered
-# separately by STACK_MAX in currency_strength.py.
+# Note on Alex: he runs 4+ simultaneous positions in his challenge. That's
+# irrelevant here — this bot is designed around 1 position at a time by
+# explicit choice (simple rules, clear attribution, matches live constraints
+# at $4K–$30K account size). Alex's multi-position behaviour is documented
+# for reference only; it is NOT the default operating mode.
+#
+# Macro theme stacking (JPY/CHF carry) is a separate concept — handled by
+# STACK_MAX in currency_strength.py and always bypasses this cap.
 MAX_CONCURRENT_TRADES_LIVE:     int = 1   # live — one position at a time
-MAX_CONCURRENT_TRADES_BACKTEST: int = 4   # backtest — matches Alex's multi-pos behaviour
-MAX_CONCURRENT_TRADES:          int = MAX_CONCURRENT_TRADES_LIVE  # alias (live default)
+MAX_CONCURRENT_TRADES_BACKTEST: int = 1   # backtest — must equal live (parity rule)
+MAX_CONCURRENT_TRADES:          int = MAX_CONCURRENT_TRADES_LIVE  # alias
 
 # ── Alex's confirmed watchlist (extracted from first video screenshot) ─────────
 # Only evaluate pairs on this list. Anything else is outside Alex's universe.

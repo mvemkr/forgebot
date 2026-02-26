@@ -496,6 +496,38 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         print(f"Trail: {_tlabel}")
     print(f"{'='*65}")
 
+    # ── Parity header — stamped on every run ──────────────────────────
+    # Lets you verify at a glance that backtest mirrors live before trusting results.
+    # If MAX_CONCURRENT live ≠ backtest, results are NOT comparable to production.
+    try:
+        import hashlib as _hl, inspect as _ins
+        _cfg_src = _ins.getsource(_sc)
+        _cfg_hash = _hl.md5(_cfg_src.encode()).hexdigest()[:8]
+    except Exception:
+        _cfg_hash = "unknown"
+    try:
+        import subprocess as _sp
+        _sha = _sp.check_output(["git", "-C", str(Path(__file__).parent),
+                                  "rev-parse", "--short", "HEAD"],
+                                 stderr=_sp.DEVNULL).decode().strip()
+    except Exception:
+        _sha = "unknown"
+
+    _parity_ok  = _sc.MAX_CONCURRENT_TRADES_LIVE == _sc.MAX_CONCURRENT_TRADES_BACKTEST
+    _parity_sym = "✓" if _parity_ok else "⚠ MISMATCH"
+    _exp_flag   = (_sc.MAX_CONCURRENT_TRADES_BACKTEST > 1)
+
+    print(f"┌─ Parity {'─'*54}┐")
+    print(f"│  engine SHA      : {_sha:<10}  config md5 : {_cfg_hash:<12}{'':>8}│")
+    print(f"│  concurrent LIVE : {_sc.MAX_CONCURRENT_TRADES_LIVE:<4}  "
+          f"concurrent BT : {_sc.MAX_CONCURRENT_TRADES_BACKTEST:<4}  "
+          f"parity: {_parity_sym:<14}│")
+    print(f"│  trigger mode    : {_sc.ENTRY_TRIGGER_MODE:<15}  "
+          f"spread model : {'ON' if _sc.SPREAD_MODEL_ENABLED else 'OFF'}{'':>16}│")
+    if _exp_flag:
+        print(f"│  ⚠  EXPERIMENTAL RUN — BT concurrency > 1, not comparable to live{'':>3}│")
+    print(f"└{'─'*63}┘")
+
     # ── Fetch candle data ─────────────────────────────────────────────
     global _api_call_count
     _api_call_count = 0   # reset for this run
@@ -1898,6 +1930,9 @@ Examples:
     parser.add_argument("--no-cache", action="store_true", default=False,
                         help="Disable per-pair disk cache — always fetch from OANDA. "
                              f"Cache dir: {CACHE_DIR}")
+    parser.add_argument("--max-trades", type=int, default=None,
+                        help="Override MAX_CONCURRENT_TRADES_BACKTEST. Default=1 (parity with live). "
+                             "Values >1 are tagged EXPERIMENTAL in results — never use as baseline.")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -1959,12 +1994,26 @@ Examples:
     _arms_to_run = list(TRAIL_ARMS.keys()) if _arm_arg == "ALL" else [_arm_arg]
 
     # ── Cache mode ────────────────────────────────────────────────────────────
-    # Cache is ON by default (per-pair/TF disk cache in ~/.cache/forge_backtester/).
-    # --no-cache disables disk reads/writes and always fetches from OANDA.
-    # --cache is a legacy no-op kept for backward compat.
     _use_cache = not getattr(args, "no_cache", False)
     if not _use_cache:
         print("  ⚠ Cache disabled (--no-cache) — all data fetched from OANDA")
+
+    # ── Concurrency override (EXPERIMENTAL) ───────────────────────────────────
+    # Default = 1 (parity with live). --max-trades N lets you test multi-position
+    # behaviour explicitly. Any run with N > 1 is tagged EXPERIMENTAL in results
+    # so it can never be confused with a parity baseline.
+    _max_trades_override = getattr(args, "max_trades", None)
+    if _max_trades_override is not None:
+        if _max_trades_override < 1:
+            parser.error("--max-trades must be ≥ 1")
+        _sc.apply_levers({"MAX_CONCURRENT_TRADES_BACKTEST": _max_trades_override})
+        if _max_trades_override > 1:
+            _exp_tag = f"EXPERIMENTAL:max_trades={_max_trades_override}"
+            notes = (f"{_exp_tag} " + notes).strip()
+            print(f"  ⚠ EXPERIMENTAL: MAX_CONCURRENT_TRADES_BACKTEST={_max_trades_override} "
+                  f"(default=1, parity with live). Tagged in results.")
+        else:
+            print(f"  ✓ MAX_CONCURRENT_TRADES_BACKTEST={_max_trades_override} (explicit parity)")
 
     # ── Run arms ──────────────────────────────────────────────────────────────
     # For multi-arm runs, candle data is fetched once then shared in-memory

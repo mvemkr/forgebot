@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-Comparison: ENTRY_TRIGGER_MODE="engulf_only" vs "engulf_or_pin"
-Window: Jul–Oct 2024 (Alex's $100→$1M challenge window)
-Arm: A (default trail — apples-to-apples comparison, spread model ON)
+Controlled comparison: ENTRY_TRIGGER_MODE="engulf_only" vs "engulf_or_pin"
+
+Window  : Jul–Oct 2024 (Alex window)
+Arm     : C (2-stage trail — best performer)
+Spread  : ON
+Concurrency: 1 (parity rule — backtest must mirror live)
+
+NOTE: A previous run (Feb 26 AM) used BACKTEST concurrency=4, which
+contaminated the result (+15% vs -14.1%). That result is INVALID.
+This script asserts parity before running; aborts if concurrency ≠ 1.
 
 Usage:
     cd ~/trading-bot
@@ -14,12 +21,19 @@ from collections import Counter
 
 sys.path.insert(0, "/home/forge/trading-bot")
 
-# Import strategy_config module BEFORE importing the backtester so patches propagate
 import src.strategy.forex.strategy_config as _sc
+from backtesting.oanda_backtest_v2 import run_backtest, TRAIL_ARMS
 
-# Import backtester (it binds _sc at import time via 'import ... as _sc')
-from backtesting.oanda_backtest_v2 import run_backtest, TRAIL_ARMS, _DEFAULT_ARM
+# ── Parity assertion — abort if backtest concurrency ≠ live ──────────────────
+assert _sc.MAX_CONCURRENT_TRADES_BACKTEST == _sc.MAX_CONCURRENT_TRADES_LIVE, (
+    f"PARITY VIOLATION: MAX_CONCURRENT_TRADES_BACKTEST={_sc.MAX_CONCURRENT_TRADES_BACKTEST} "
+    f"≠ LIVE={_sc.MAX_CONCURRENT_TRADES_LIVE}. "
+    f"Fix strategy_config.py or use --max-trades CLI flag for explicit experiments."
+)
+print(f"✓ Parity OK: concurrent LIVE={_sc.MAX_CONCURRENT_TRADES_LIVE} "
+      f"BT={_sc.MAX_CONCURRENT_TRADES_BACKTEST}")
 
+ARM_KEY      = "C"   # 2-stage trail — best performer in ab9
 ALEX_START   = datetime(2024, 7,  1, tzinfo=timezone.utc)
 ALEX_END     = datetime(2024, 10, 31, tzinfo=timezone.utc)
 STARTING_BAL = 8_000.0
@@ -51,8 +65,8 @@ for mode, label in MODES:
         start_dt=ALEX_START,
         end_dt=ALEX_END,
         starting_bal=STARTING_BAL,
-        notes=f"trigger_compare/{mode}",
-        trail_cfg=TRAIL_ARMS[_DEFAULT_ARM],
+        notes=f"trigger_compare/{mode}/arm{ARM_KEY}/concurrent{_sc.MAX_CONCURRENT_TRADES_BACKTEST}",
+        trail_cfg=TRAIL_ARMS[ARM_KEY],
         preloaded_candle_data=candle_cache,
     )
     if candle_cache is None:
@@ -113,7 +127,7 @@ sums = {mode: summarise(results[mode]) for mode, _ in MODES}
 # ── Print table ───────────────────────────────────────────────────────────
 print(f"\n\n{'═'*68}")
 print(f"{'ENTRY TRIGGER MODE COMPARISON — Jul–Oct 2024 (Alex window)'}")
-print(f"{'Arm A, Spread ON, $8,000 start':>68}")
+print(f"{f'Arm {ARM_KEY}, Spread ON, concurrent=1, $8,000 start':>68}")
 print(f"{'═'*68}")
 
 col_w = 26
