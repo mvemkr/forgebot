@@ -83,6 +83,11 @@ class BacktestResult:
     regime_pct_high:     float = 0.0    # % trades with score ≥ 3.0
     regime_pct_extreme:  float = 0.0    # % trades with score ≥ 3.5
 
+    # ── Stop selection quality ───────────────────────────────────────────
+    stop_type_counts:  dict  = field(default_factory=dict)  # {stop_type: count}
+    atr_fallback_pct:  float = 0.0    # % of trades using atr_fallback — >40% = regression
+    stop_pips_p50:     float = 0.0    # median initial stop distance in pips (all trades)
+
     # ── Profiling ────────────────────────────────────────────────────────
     api_calls:     int   = 0
     eval_calls:    int   = 0

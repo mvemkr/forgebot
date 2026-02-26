@@ -51,8 +51,8 @@ WINDOWS = {
         datetime(2024, 7, 15, tzinfo=timezone.utc),
         datetime(2024, 10, 31, tzinfo=timezone.utc),
     ),
-    "W2_Dec1-Feb28_2026": (
-        datetime(2025, 12, 1, tzinfo=timezone.utc),
+    "W2_Oct1_2025-Feb28_2026": (          # expanded: 150d, target N≥30 baseline
+        datetime(2025, 10, 1, tzinfo=timezone.utc),
         datetime(2026, 2, 28, tzinfo=timezone.utc),
     ),
 }
@@ -102,7 +102,7 @@ ARMS: dict[str, ArmDef] = {
         doji_filter    = True,
         wd_protrend_htf     = True,    # W+D must agree; 4H may be counter/mixed
         strict_protrend_htf = False,   # NOT requiring 4H (that was overconstrained)
-        dynamic_pip_equity  = True,    # threshold = stop_pips × 3.0
+        # dynamic_pip_equity is now always-on (stop_pips × MIN_RR_EFFECTIVE)
         policy         = "alex_strict",
     ),
 }

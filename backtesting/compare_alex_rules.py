@@ -76,11 +76,11 @@ WINDOWS = {
         datetime(2024, 7, 15, tzinfo=timezone.utc),
         datetime(2024, 10, 31, tzinfo=timezone.utc),
     ),
-    # W2: extended to Dec–Feb to get 20+ trades (Jan alone is 8 — too small).
-    # Cache covers through Feb 25 2026; keep end at Feb 25 to avoid OANDA refetch.
-    "W2_Dec2025-Feb2026": (
-        datetime(2025, 12,  1, tzinfo=timezone.utc),
-        datetime(2026,  2, 25, tzinfo=timezone.utc),
+    # W2: Oct 1 2025 → Feb 28 2026 (150d) — target N≥30 for statistical reliability.
+    # Cache covers through Feb 25; last 3 days use runout data (minimal impact).
+    "W2_Oct2025-Feb2026": (
+        datetime(2025, 10,  1, tzinfo=timezone.utc),
+        datetime(2026,  2, 28, tzinfo=timezone.utc),
     ),
 }
 

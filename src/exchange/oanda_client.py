@@ -322,6 +322,20 @@ class OandaClient:
             {"units": "ALL"}
         )
 
+    def modify_stop_loss(self, trade_id: str, new_stop: float, dry_run: bool = True) -> Dict:
+        """
+        Move stop loss to any price (Trail Arm C, Stage-1 lock, Stage-2 ratchet).
+        Caller is responsible for ensuring the new stop is tighter than current.
+        """
+        decimals = 5
+        if dry_run:
+            logger.info(f"[DRY RUN] Modifying SL to {new_stop:.{decimals}f} for trade {trade_id}")
+            return {"dry_run": True}
+        return self._put(
+            f"/v3/accounts/{self.account_id}/trades/{trade_id}/orders",
+            {"stopLoss": {"price": str(round(new_stop, decimals)), "timeInForce": "GTC"}}
+        )
+
     def move_stop_to_breakeven(self, trade_id: str, entry_price: float, dry_run: bool = True) -> Dict:
         """
         Move stop loss to entry price (breakeven).

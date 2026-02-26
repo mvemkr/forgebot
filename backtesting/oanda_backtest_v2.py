@@ -1424,24 +1424,29 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             # sufficient quality gating without a pip equity floor.
             _is_cb_pattern = 'consolidation_breakout' in (
                 decision.pattern.pattern_type if decision.pattern else '')
-            if not _is_theme_pair and not _is_cb_pattern and pe < _sc.MIN_PIP_EQUITY:
-                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "low_pip_equity",
-                        f"Pip equity {pe:.0f}p < min {_sc.MIN_PIP_EQUITY:.0f}p — "
-                        f"setup too small to consume a slot")
-                continue
-
-            # Dynamic pip equity gate (STRICT_PROTREND):
-            # Threshold = stop_pips × MIN_RR — ensures the setup's reward potential
-            # in pips equals at least the required R multiple of the actual risk.
-            # This is a higher bar than the fixed 100p floor when stops are wide.
-            if dynamic_pip_equity and not _is_theme_pair and not _is_cb_pattern:
-                _stop_pips_entry = getattr(decision, "initial_stop_pips", 0.0) or 0.0
-                _dyn_pe_thresh   = _stop_pips_entry * _sc.MIN_RR
-                if _stop_pips_entry > 0 and pe < _dyn_pe_thresh:
+            # Dynamic pip equity gate (always-on, replaces fixed 100p floor).
+            # Threshold = stop_pips × MIN_RR_EFFECTIVE:
+            #   pro-trend (W+D+4H agree)   → stop_pips × MIN_RR_STANDARD   (2.5R)
+            #   non-protrend / mixed / ?   → stop_pips × MIN_RR_COUNTERTREND (3.0R)
+            # Ensures reward potential in pips ≥ required R multiple of actual risk.
+            # Falls back to 10p absolute minimum if stop_pips unavailable.
+            if not _is_theme_pair and not _is_cb_pattern:
+                _stop_pips_pe = getattr(decision, "initial_stop_pips", 0.0) or 0.0
+                if _stop_pips_pe > 0:
+                    _htf_pe = alex_policy.htf_aligned(
+                        decision.direction or "",
+                        decision.trend_weekly, decision.trend_daily, decision.trend_4h,
+                    )
+                    _rr_pe    = (_sc.MIN_RR_STANDARD
+                                 if _htf_pe is True else _sc.MIN_RR_COUNTERTREND)
+                    _pe_min   = _stop_pips_pe * _rr_pe
+                else:
+                    _pe_min   = _sc.MIN_PIP_EQUITY   # fallback: no stop data (rare)
+                if pe < _pe_min:
                     _dyn_pip_eq_blocks += 1
                     log_gap(ts_utc, pair, "ENTER", "BLOCKED", "DYN_PIP_EQUITY",
-                            f"Pip equity {pe:.0f}p < stop({_stop_pips_entry:.0f}p) "
-                            f"× MIN_RR({_sc.MIN_RR:.1f}) = {_dyn_pe_thresh:.0f}p threshold")
+                            f"Pip equity {pe:.0f}p < stop({_stop_pips_pe:.0f}p)"
+                            f" × {_rr_pe:.1f}R = {_pe_min:.0f}p min")
                     continue
 
             # Re-check eligibility — earlier entries this bar may have changed
@@ -1837,18 +1842,31 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             pct = count / len(trades) * 100 if trades else 0
             print(f"    {sig_type:<30} {count:>3}  ({pct:.0f}%)")
 
-    # Stop type distribution
-    _stop_types = Counter(pos.get("stop_type", "unknown") for pos in trades)
+    # Stop type distribution — tracks structural vs atr_fallback usage
+    _stop_types    = Counter(pos.get("stop_type", "unknown") for pos in trades)
+    _st_total      = sum(_stop_types.values())
+    _atr_fb_count  = _stop_types.get("atr_fallback", 0)
+    _atr_fb_pct    = _atr_fb_count / _st_total * 100 if _st_total else 0.0
+    _sp_vals       = sorted(t.get("initial_stop_pips", 0) for t in trades
+                            if t.get("initial_stop_pips", 0) > 0)
+    _sp_p50        = _sp_vals[len(_sp_vals) // 2] if _sp_vals else 0.0
+    _sp_p90        = _sp_vals[int(len(_sp_vals) * 0.9)] if _sp_vals else 0.0
+
+    _FLAG_ATR = "  ⚠ >40% atr_fallback — structural stop regression!" if _atr_fb_pct > 40 else ""
+    print(f"\n  ── Stop type distribution{_FLAG_ATR} ────────────────────────")
     if _stop_types:
-        print(f"\n  ── Stop type distribution ─────────────────────────────")
         for stype, cnt in _stop_types.most_common():
-            pct = cnt / len(trades) * 100
-            print(f"    {stype:<35} {cnt:>3}  ({pct:.0f}%)")
-        _sp_vals = [t.get("initial_stop_pips", 0) for t in trades if t.get("initial_stop_pips", 0) > 0]
+            pct = cnt / len(trades) * 100 if trades else 0
+            _sp_by_type = sorted(t.get("initial_stop_pips", 0) for t in trades
+                                 if t.get("stop_type") == stype and t.get("initial_stop_pips", 0) > 0)
+            _p50_t = _sp_by_type[len(_sp_by_type)//2] if _sp_by_type else 0
+            print(f"    {stype:<35} {cnt:>3}  ({pct:.0f}%)  p50={_p50_t:.0f}p")
         if _sp_vals:
-            _sp_vals.sort()
-            print(f"    Stop pips:  min={_sp_vals[0]:.0f}p  p50={_sp_vals[len(_sp_vals)//2]:.0f}p  "
-                  f"p90={_sp_vals[int(len(_sp_vals)*0.9)]:.0f}p  max={_sp_vals[-1]:.0f}p")
+            print(f"    Overall stop pips:  p50={_sp_p50:.0f}p  p90={_sp_p90:.0f}p  "
+                  f"min={_sp_vals[0]:.0f}p  max={_sp_vals[-1]:.0f}p")
+        print(f"    atr_fallback rate: {_atr_fb_pct:.0f}%{_FLAG_ATR}")
+    else:
+        print("    (no trades)")
 
     # ── Regime score distribution ─────────────────────────────────────────
     _rs_vals = [t.get("regime_score_at_entry", 0.0) for t in trades]
@@ -2244,6 +2262,10 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         dyn_pip_eq_blocks        = _dyn_pip_eq_blocks,
         wd_alignment_pct         = (_wd_aligned_entries / len(trades) * 100
                                     if trades else 0.0),
+        # ── Stop quality ──────────────────────────────────────────────
+        stop_type_counts         = dict(_stop_types),
+        atr_fallback_pct         = _atr_fb_pct,
+        stop_pips_p50            = _sp_p50,
         # ── Regime analytics ─────────────────────────────────────────
         regime_scores      = _regime_scores,
         regime_avg         = sum(_regime_scores) / len(_regime_scores) if _regime_scores else 0.0,

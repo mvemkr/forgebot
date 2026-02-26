@@ -1834,12 +1834,16 @@ class SetAndForgetStrategy:
     ):
         """Call this when a trade is actually opened."""
         self.open_positions[pair] = {
-            'entry':        entry_price,
-            'stop':         stop_loss,
-            'direction':    direction,
-            'pattern_type': pattern_type,   # stored so we can mark exhausted on close
-            'neckline_ref': neckline_ref,   # stored so we can mark exhausted on close
-            'risk_pct':     risk_pct or 0.0,  # stored for book exposure tracking
+            'entry':         entry_price,
+            'stop':          stop_loss,
+            'direction':     direction,
+            'pattern_type':  pattern_type,   # stored so we can mark exhausted on close
+            'neckline_ref':  neckline_ref,   # stored so we can mark exhausted on close
+            'risk_pct':      risk_pct or 0.0,  # stored for book exposure tracking
+            # Trail Arm C fields — used by position_monitor for two-stage ratchet
+            'initial_risk':  abs(entry_price - stop_loss),  # stop dist at entry (price)
+            'trail_max':     entry_price,    # running most-favourable price seen
+            'trail_locked':  False,          # True once Stage-1 lock fires (at 2R MFE)
         }
         logger.info(
             f"Position opened: {pair} {direction} at {entry_price:.5f} "
