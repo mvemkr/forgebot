@@ -479,7 +479,32 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  starting_bal: float = STARTING_BAL, notes: str = "",
                  trail_cfg: Optional[dict] = None,
                  preloaded_candle_data: Optional[dict] = None,
-                 use_cache: bool = True):
+                 use_cache: bool = True,
+                 quiet: bool = False):
+    """Run a single backtest simulation.
+
+    quiet=True suppresses all stdout (useful when called from compare scripts).
+    The return dict is always populated regardless of quiet mode.
+    """
+    import io, contextlib, sys as _sys
+    _orig_stdout = _sys.stdout
+    if quiet:
+        _sys.stdout = io.StringIO()
+    try:
+        return _run_backtest_body(
+            start_dt=start_dt, end_dt=end_dt, starting_bal=starting_bal,
+            notes=notes, trail_cfg=trail_cfg,
+            preloaded_candle_data=preloaded_candle_data, use_cache=use_cache,
+        )
+    finally:
+        _sys.stdout = _orig_stdout
+
+
+def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
+                       starting_bal: float = STARTING_BAL, notes: str = "",
+                       trail_cfg: Optional[dict] = None,
+                       preloaded_candle_data: Optional[dict] = None,
+                       use_cache: bool = True):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     # Extend data fetch so open positions can run to natural close after the entry window.
     # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
@@ -687,8 +712,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         strategies[pair] = s
 
     # ── Risk manager ──────────────────────────────────────────────────
+    # backtest=True: disable all disk I/O (never write regroup_state.json /
+    # kill_switch.log / trade_journal.jsonl — backtest must not corrupt live state)
     journal = TradeJournal()
-    risk    = ForexRiskManager(journal=journal)
+    risk    = ForexRiskManager(journal=journal, backtest=True)
 
     # ── State ─────────────────────────────────────────────────────────
     balance       = starting_bal

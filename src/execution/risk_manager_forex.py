@@ -86,8 +86,10 @@ class ForexRiskManager:
         journal: TradeJournal,
         # Legacy params kept for compatibility — now baked into class constants
         weekly_drawdown_limit_pct: float = 40.0,
+        backtest: bool = False,
     ):
         self.journal = journal
+        self._backtest = backtest          # when True: no disk reads/writes (backtest isolation)
         self._mode: BotMode = BotMode.ACTIVE
         self._regroup_reason: Optional[str] = None
         self._regroup_started: Optional[datetime] = None
@@ -95,10 +97,10 @@ class ForexRiskManager:
         self._paused_at: Optional[datetime] = None
         self._peak_balance: float = 0.0
 
-        KILL_SWITCH_LOG.parent.mkdir(parents=True, exist_ok=True)
-
-        # Restore regroup state if bot was restarted mid-cooldown
-        self._load_regroup_state()
+        if not backtest:
+            KILL_SWITCH_LOG.parent.mkdir(parents=True, exist_ok=True)
+            # Restore regroup state if bot was restarted mid-cooldown
+            self._load_regroup_state()
 
     # ── Mode ───────────────────────────────────────────────────────────
 
@@ -336,9 +338,10 @@ class ForexRiskManager:
             f"To extend cooldown: message 'extend cooldown X days'"
         )
         logger.critical(f"🟡 REGROUP: {reason}")
-        self._log_kill_switch(reason, f"Entering {self.COOLDOWN_DAYS}-day regroup. Balance: ${balance:,.2f}")
-        self.journal.log_kill_switch(reason, "Regroup mode entered", balance)
-        self._save_regroup_state()
+        if not self._backtest:   # backtest isolation — no live disk writes
+            self._log_kill_switch(reason, f"Entering {self.COOLDOWN_DAYS}-day regroup. Balance: ${balance:,.2f}")
+            self.journal.log_kill_switch(reason, "Regroup mode entered", balance)
+            self._save_regroup_state()
         return msg  # returned so orchestrator can send to Telegram
 
     def _exit_regroup(self, reason: str):
@@ -374,6 +377,8 @@ class ForexRiskManager:
     # ── State Persistence ──────────────────────────────────────────────
 
     def _save_regroup_state(self):
+        if self._backtest:
+            return   # backtest isolation — never write live regroup_state.json
         state = {
             "mode": self._mode.value,
             "regroup_reason": self._regroup_reason,
@@ -411,6 +416,8 @@ class ForexRiskManager:
             logger.warning(f"Could not load regroup state: {e}")
 
     def _log_kill_switch(self, reason: str, action: str):
+        if self._backtest:
+            return   # backtest isolation — never write live kill_switch.log
         ts = datetime.now(timezone.utc).isoformat()
         with open(KILL_SWITCH_LOG, "a") as f:
             f.write(f"[{ts}] {reason} | ACTION: {action}\n")

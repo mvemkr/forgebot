@@ -2,14 +2,15 @@
 """
 Controlled comparison: ENTRY_TRIGGER_MODE="engulf_only" vs "engulf_or_pin"
 
-Window  : Jul–Oct 2024 (Alex window)
-Arm     : C (2-stage trail — best performer)
+Window  : Jul 15 – Oct 31 2024 (Alex window, mid-month start per Mike spec)
+Arm     : C (2-stage trail — best performer in ab9)
 Spread  : ON
-Concurrency: 1 (parity rule — backtest must mirror live)
+Concurrency : 1 (BACKTEST must mirror LIVE — parity rule)
+MIN_RR  : 2.5 (from strategy_config)
+Whitelist   : logs/whitelist_backtest.json (Alex 7 pairs, enabled=true)
 
-NOTE: A previous run (Feb 26 AM) used BACKTEST concurrency=4, which
-contaminated the result (+15% vs -14.1%). That result is INVALID.
-This script asserts parity before running; aborts if concurrency ≠ 1.
+Parity assertions fire before any backtest runs.
+Outputs: clean summary table + per-trade list per mode.
 
 Usage:
     cd ~/trading-bot
@@ -24,23 +25,36 @@ sys.path.insert(0, "/home/forge/trading-bot")
 import src.strategy.forex.strategy_config as _sc
 from backtesting.oanda_backtest_v2 import run_backtest, TRAIL_ARMS
 
-# ── Parity assertion — abort if backtest concurrency ≠ live ──────────────────
-assert _sc.MAX_CONCURRENT_TRADES_BACKTEST == _sc.MAX_CONCURRENT_TRADES_LIVE, (
-    f"PARITY VIOLATION: MAX_CONCURRENT_TRADES_BACKTEST={_sc.MAX_CONCURRENT_TRADES_BACKTEST} "
-    f"≠ LIVE={_sc.MAX_CONCURRENT_TRADES_LIVE}. "
-    f"Fix strategy_config.py or use --max-trades CLI flag for explicit experiments."
-)
+# ── Parity assertions ────────────────────────────────────────────────────────
+def _assert_parity():
+    errors = []
+    if _sc.MAX_CONCURRENT_TRADES_BACKTEST != _sc.MAX_CONCURRENT_TRADES_LIVE:
+        errors.append(
+            f"  MAX_CONCURRENT_TRADES_BACKTEST={_sc.MAX_CONCURRENT_TRADES_BACKTEST} "
+            f"≠ LIVE={_sc.MAX_CONCURRENT_TRADES_LIVE}"
+        )
+    if getattr(_sc, "MIN_RR", None) != 2.5:
+        errors.append(
+            f"  MIN_RR={getattr(_sc,'MIN_RR','<missing>')} ≠ required 2.5"
+        )
+    if errors:
+        print("╔══ PARITY VIOLATION — aborting ══════════════════════════")
+        for e in errors: print(e)
+        print("╚══ Fix strategy_config.py before running comparison ════")
+        sys.exit(1)
+
+_assert_parity()
 print(f"✓ Parity OK: concurrent LIVE={_sc.MAX_CONCURRENT_TRADES_LIVE} "
-      f"BT={_sc.MAX_CONCURRENT_TRADES_BACKTEST}")
+      f"BT={_sc.MAX_CONCURRENT_TRADES_BACKTEST}  |  MIN_RR={_sc.MIN_RR}")
 
 ARM_KEY      = "C"   # 2-stage trail — best performer in ab9
-ALEX_START   = datetime(2024, 7,  1, tzinfo=timezone.utc)
+ALEX_START   = datetime(2024, 7, 15, tzinfo=timezone.utc)  # mid-month per Mike spec
 ALEX_END     = datetime(2024, 10, 31, tzinfo=timezone.utc)
 STARTING_BAL = 8_000.0
 
 MODES = [
     ("engulf_only",   "Engulf only  (production)"),
-    ("engulf_or_pin", "Engulf + pin (strict spec)"),
+    ("engulf_or_pin", "Engulf + pin (experiment)"),
 ]
 
 
@@ -56,9 +70,7 @@ results    = {}
 candle_cache = None  # share across runs — saves second OANDA fetch
 
 for mode, label in MODES:
-    print(f"\n{'─'*65}")
-    print(f"MODE: {label}")
-    print(f"{'─'*65}")
+    print(f"\n  Running: {label}  (arm {ARM_KEY})  …", end="", flush=True)
     _patch_trigger(mode)
 
     r = run_backtest(
@@ -68,13 +80,17 @@ for mode, label in MODES:
         notes=f"trigger_compare/{mode}/arm{ARM_KEY}/concurrent{_sc.MAX_CONCURRENT_TRADES_BACKTEST}",
         trail_cfg=TRAIL_ARMS[ARM_KEY],
         preloaded_candle_data=candle_cache,
+        quiet=True,         # suppress verbose output — comparison table printed below
     )
     if candle_cache is None:
         candle_cache = r.get("candle_data")
     results[mode] = r
+    n = len(r.get("trades", []))
+    print(f"  {n} trades  ret={r.get('ret_pct',0):+.1f}%")
 
 # Restore default
 _patch_trigger("engulf_only")
+
 
 # ── Build enriched summary per mode ───────────────────────────────────────
 def summarise(r: dict) -> dict:
@@ -86,16 +102,22 @@ def summarise(r: dict) -> dict:
     sc      = Counter(t.get("signal_type", "") for t in trades)
     n       = len(trades)
 
-    pin_types   = {"pin_bar_bearish", "pin_bar_bullish"}
+    pin_types    = {"pin_bar_bearish", "pin_bar_bullish"}
     engulf_types = {"bearish_engulfing", "bullish_engulfing"}
     n_pin    = sum(v for k, v in sc.items() if k in pin_types)
     n_engulf = sum(v for k, v in sc.items() if k in engulf_types)
     n_other  = n - n_pin - n_engulf
 
-    n_target  = ec.get("target_reached", 0) + ec.get("weekend_proximity", 0)
-    n_ratchet = ec.get("ratchet_stop_hit", 0)
-    n_sl      = ec.get("stop_hit", 0)
-    n_runout  = ec.get("runout_expired", 0)
+    # Exit counts + avg_r per exit type
+    def _exit_avg(reason):
+        ts = [t["r"] for t in trades if t.get("reason") == reason]
+        return (sum(ts)/len(ts) if ts else 0.0, len(ts))
+
+    n_target,  avg_r_target  = _exit_avg("target_reached")[1], _exit_avg("target_reached")[0]
+    n_ratchet, avg_r_ratchet = _exit_avg("ratchet_stop_hit")[1], _exit_avg("ratchet_stop_hit")[0]
+    n_sl,      avg_r_sl      = _exit_avg("stop_hit")[1], _exit_avg("stop_hit")[0]
+    n_runout,  avg_r_runout  = _exit_avg("runout_expired")[1], _exit_avg("runout_expired")[0]
+    n_weekend, avg_r_weekend = _exit_avg("weekend_proximity")[1], _exit_avg("weekend_proximity")[0]
 
     total_spread = sum(t.get("spread_cost", 0) for t in trades)
 
@@ -111,10 +133,11 @@ def summarise(r: dict) -> dict:
         "ret_pct":      r.get("ret_pct", 0),
         "max_dd":       r.get("max_dd", 0),
         "exec_rr_p50":  r.get("exec_rr_p50", 0),
-        "n_target":     n_target,
-        "n_ratchet":    n_ratchet,
-        "n_sl":         n_sl,
-        "n_runout":     n_runout,
+        "n_target":     n_target,   "avg_r_target":   avg_r_target,
+        "n_ratchet":    n_ratchet,  "avg_r_ratchet":  avg_r_ratchet,
+        "n_sl":         n_sl,       "avg_r_sl":       avg_r_sl,
+        "n_runout":     n_runout,   "avg_r_runout":   avg_r_runout,
+        "n_weekend":    n_weekend,  "avg_r_weekend":  avg_r_weekend,
         "n_pin":        n_pin,
         "n_engulf":     n_engulf,
         "n_other":      n_other,
@@ -124,58 +147,55 @@ def summarise(r: dict) -> dict:
 
 sums = {mode: summarise(results[mode]) for mode, _ in MODES}
 
-# ── Print table ───────────────────────────────────────────────────────────
-print(f"\n\n{'═'*68}")
-print(f"{'ENTRY TRIGGER MODE COMPARISON — Jul–Oct 2024 (Alex window)'}")
-print(f"{f'Arm {ARM_KEY}, Spread ON, concurrent=1, $8,000 start':>68}")
-print(f"{'═'*68}")
 
-col_w = 26
-val_w = 20
+# ── Per-trade list ─────────────────────────────────────────────────────────
+def _trade_table(r: dict, mode: str):
+    trades = r.get("trades", [])
+    label  = {"engulf_only": "ENGULF ONLY", "engulf_or_pin": "ENGULF + PIN"}[mode]
+    print(f"\n  ── Trade list: {label} ──────────────────────────────────────────")
+    print(f"  {'Pair':<10} {'Dir':<6} {'Entry':>10} {'Exit':>10} "
+          f"{'R':>6} {'Reason':<22} {'Signal':<25}")
+    print(f"  {'-'*95}")
+    for t in sorted(trades, key=lambda x: x.get("entry_ts", "")):
+        flag = "✓" if t["r"] > 0.10 else ("~" if t["r"] > -0.10 else "✗")
+        sig  = t.get("signal_type", "?")[:24]
+        print(f"  {t['pair']:<10} {t['direction']:<6} {t['entry']:>10.5f} {t['exit']:>10.5f} "
+              f"{t['r']:>+6.2f}R {t.get('reason','?'):<22} {sig:<25} {flag}")
+    print(f"  Total: {len(trades)} trades | "
+          f"Wins: {sum(1 for t in trades if t['r']>0.10)} | "
+          f"Losses: {sum(1 for t in trades if t['r']<-0.10)}")
+
+
+# ── Print comparison table ─────────────────────────────────────────────────
+print(f"\n\n{'═'*72}")
+print(f"ENTRY TRIGGER COMPARISON — Jul 15–Oct 31 2024 (Alex window)")
+print(f"{'Arm C  |  Spread ON  |  concurrent=1  |  MIN_RR=2.5  |  $8,000 start':>72}")
+print(f"{'═'*72}")
+
+col_w = 30
+val_w = 21
 hdr   = f"{'Metric':<{col_w}}" + "".join(f"{MODES[i][1]:>{val_w}}" for i in range(len(MODES)))
 print(hdr)
 print("─" * (col_w + val_w * len(MODES)))
 
-def pct(v): return f"{v*100:.1f}%"
-def r2(v):  return f"{v:+.2f}R"
-def r2u(v): return f"{v:.2f}R"
-def p1(v):  return f"{v:+.1f}%"
-def p1u(v): return f"{v:.1f}%"
-def n(v):   return str(int(v))
+def pct(v):    return f"{v*100:.1f}%"
+def r2(v):     return f"{v:+.2f}R"
+def r2u(v):    return f"{v:.2f}R"
+def p1(v):     return f"{v:+.1f}%"
+def p1u(v):    return f"{v:.1f}%"
+def n(v):      return str(int(v))
 def dollar(v): return f"${abs(v):,.0f}"
+def nr(cnt_k, avgr_k):
+    """Return a formatter that prints 'N (avg ±X.XXR)'."""
+    def _fmt(v, _s=None, _ck=cnt_k, _ak=avgr_k):
+        # v is ignored; called with sums[mode][cnt_k]
+        return None
+    return _fmt
 
-rows = [
-    ("Trades total",         "n_trades",    n),
-    ("Wins / Losses / Scratch","",          None),
-    ("  Wins",               "n_wins",      n),
-    ("  Losses",             "n_losses",    n),
-    ("  Scratches",          "n_scratch",   n),
-    ("Win rate",             "win_rate",    pct),
-    ("─── Returns ───",      "",            None),
-    ("Return",               "ret_pct",     p1),
-    ("Max drawdown",         "max_dd",      p1u),
-    ("Avg R (all)",          "avg_r",       r2),
-    ("Avg R (wins)",         "avg_r_win",   r2),
-    ("Avg R (losses)",       "avg_r_loss",  r2u),
-    ("Exec RR p50",          "exec_rr_p50", r2u),
-    ("─── Exits ───",        "",            None),
-    ("Target reached",       "n_target",    n),
-    ("Ratchet stop",         "n_ratchet",   n),
-    ("Stop hit",             "n_sl",        n),
-    ("Runout",               "n_runout",    n),
-    ("─── Entries ───",      "",            None),
-    ("Engulf entries",       "n_engulf",    n),
-    ("Pin bar entries",      "n_pin",       n),
-    ("Other/unknown",        "n_other",     n),
-    ("─── Cost ───",         "",            None),
-    ("Spread drag ($)",      "spread_drag", dollar),
-    ("KS blocks",            "ks_blocks",   n),
-]
-
-for label_str, key, fmt in rows:
-    if not key:
-        print(f"\n{label_str}")
-        continue
+def _row(label, key, fmt):
+    if key == "":
+        print(f"\n{label}")
+        return
     vals = []
     for mode, _ in MODES:
         s = sums[mode]
@@ -184,7 +204,47 @@ for label_str, key, fmt in rows:
             vals.append(fmt(v) if fmt and v != "—" else str(v))
         except Exception:
             vals.append(str(v))
-    print(f"{label_str:<{col_w}}" + "".join(f"{v:>{val_w}}" for v in vals))
+    print(f"{label:<{col_w}}" + "".join(f"{v:>{val_w}}" for v in vals))
+
+def _exit_row(label, cnt_key, avgr_key):
+    """Print exit row: 'N  avg ±X.XXR'"""
+    vals = []
+    for mode, _ in MODES:
+        s = sums[mode]
+        cnt  = s.get(cnt_key, 0)
+        avgr = s.get(avgr_key, 0.0)
+        if cnt:
+            vals.append(f"{cnt}  ({avgr:+.2f}R avg)")
+        else:
+            vals.append("0")
+    print(f"{label:<{col_w}}" + "".join(f"{v:>{val_w}}" for v in vals))
+
+_row("Trades total",             "n_trades",     n)
+print("")
+_row("Wins",                     "n_wins",        n)
+_row("Losses",                   "n_losses",      n)
+_row("Scratches",                "n_scratch",     n)
+_row("Win rate",                 "win_rate",      pct)
+print("\n── Returns ──────────────────────────────────────")
+_row("Return",                   "ret_pct",       p1)
+_row("Max drawdown",             "max_dd",        p1u)
+_row("Avg R (all)",              "avg_r",         r2)
+_row("Avg R (wins)",             "avg_r_win",     r2)
+_row("Avg R (losses)",           "avg_r_loss",    r2u)
+_row("Exec RR p50",              "exec_rr_p50",   r2u)
+print("\n── Exit reasons (count + avg R per bucket) ──────")
+_exit_row("  Target reached",    "n_target",   "avg_r_target")
+_exit_row("  Ratchet stop (win)","n_ratchet",  "avg_r_ratchet")
+_exit_row("  Stop hit (loss)",   "n_sl",       "avg_r_sl")
+_exit_row("  Weekend proximity", "n_weekend",  "avg_r_weekend")
+_exit_row("  Runout expired",    "n_runout",   "avg_r_runout")
+print("\n── Entry signals ─────────────────────────────────")
+_row("  Engulf entries",         "n_engulf",      n)
+_row("  Pin bar entries",        "n_pin",         n)
+_row("  Other/unknown",          "n_other",       n)
+print("\n── Cost / Risk controls ──────────────────────────")
+_row("  Spread drag ($)",        "spread_drag",   dollar)
+_row("  KS blocks",              "ks_blocks",     n)
 
 # ── Verdict ───────────────────────────────────────────────────────────────
 s0 = sums["engulf_only"]
@@ -195,7 +255,7 @@ d_wr   = (s1["win_rate"] - s0["win_rate"]) * 100
 d_tr   = s1["n_trades"] - s0["n_trades"]
 n_pin  = s1["n_pin"]
 
-print(f"\n{'═'*68}")
+print(f"\n{'═'*72}")
 print("VERDICT")
 print(f"  {'engulf_only':14}: {s0['ret_pct']:+.1f}% return  "
       f"{s0['max_dd']:.1f}% DD  "
@@ -207,11 +267,12 @@ print(f"  {'engulf_or_pin':14}: {s1['ret_pct']:+.1f}% return  "
       f"{s1['win_rate']*100:.1f}% WR  "
       f"({n_pin} pin entries)")
 print(f"\n  Return delta : {d_ret:+.1f}%  |  DD delta: {d_dd:+.1f}%  |  "
-      f"WR delta: {d_wr:+.1f}pp  |  +{d_tr} extra trades")
+      f"WR delta: {d_wr:+.1f}pp  |  "
+      f"{'+' if d_tr >= 0 else ''}{d_tr} extra trades")
 
-if   d_ret > 5  and d_dd < 5:
-    verdict = "✅ Pin bars add edge — consider enabling for research runs"
-elif d_ret > 0  and d_dd < 3:
+if   d_ret > 10 and d_dd < 5:
+    verdict = "✅ Pin bars add meaningful edge — consider enabling for research runs"
+elif d_ret > 5  and d_dd < 3:
     verdict = "↗ Marginal improvement — not enough to override engulf-only default"
 elif d_ret < -3:
     verdict = "❌ Pin bars hurt — keep engulf_only"
@@ -223,4 +284,8 @@ else:
     verdict = "⚠ Mixed — more data needed before changing default"
 
 print(f"  Recommendation: {verdict}")
-print(f"{'═'*68}\n")
+print(f"{'═'*72}\n")
+
+# ── Per-trade lists ────────────────────────────────────────────────────────
+for mode, _ in MODES:
+    _trade_table(results[mode], mode)
