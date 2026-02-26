@@ -70,9 +70,24 @@ ATR_MIN_MULTIPLIER: float = 0.15
 ATR_LOOKBACK: int = 14
 
 # ── Concurrency limits ─────────────────────────────────────────────────────
-# Maximum simultaneous open positions (non-theme trades).
-# Macro theme stacking bypasses this — 4 JPY shorts = 1 theme = allowed.
-MAX_CONCURRENT_TRADES: int = 4   # Alex runs 4+ simultaneous set-and-forget positions
+# Two independent caps — live and backtest must NOT share a single value:
+#
+#   MAX_CONCURRENT_TRADES_LIVE     — used by orchestrator + risk_manager (real account).
+#     Default = 1: one at-risk position at a time. Conservative for live trading.
+#     Alex himself runs multiple, but his position sizing and account size ($500K+)
+#     handle the correlation risk. At $4K–$30K we keep it simple: finish one trade,
+#     then open the next. Change only when track record justifies it.
+#
+#   MAX_CONCURRENT_TRADES_BACKTEST — used by backtester only.
+#     Default = 4: matches Alex's actual multi-position behaviour for research.
+#     Running Alex's 13-week window with cap=1 would exclude his Week 7-8 JPY theme
+#     trades entirely — misrepresenting his real strategy and inflating our miss count.
+#
+# Macro theme stacking (JPY, CHF carry theme) always bypasses this cap — covered
+# separately by STACK_MAX in currency_strength.py.
+MAX_CONCURRENT_TRADES_LIVE:     int = 1   # live — one position at a time
+MAX_CONCURRENT_TRADES_BACKTEST: int = 4   # backtest — matches Alex's multi-pos behaviour
+MAX_CONCURRENT_TRADES:          int = MAX_CONCURRENT_TRADES_LIVE  # alias (live default)
 
 # ── Alex's confirmed watchlist (extracted from first video screenshot) ─────────
 # Only evaluate pairs on this list. Anything else is outside Alex's universe.
@@ -109,19 +124,29 @@ ALLOWED_PAIRS: frozenset = frozenset({
 # No exceptions for high-confidence setups — the whole point is simplicity.
 BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = False
 
-# ── Entry signal quality ────────────────────────────────────────────────────
-# Alex's rule: "No engulfing candle = no trade." Every video.
-# ENGULFING_ONLY=True: only bearish_engulfing / bullish_engulfing trigger entry.
-# ENGULFING_ONLY=False: also allows pin bars that meet PIN_BAR_* spec below.
+# ── Entry trigger mode ─────────────────────────────────────────────────────
+# Controls which 1H candlestick pattern is accepted as an entry trigger.
 #
-# Why False now: Alex uses pin rejections on retests, especially at clean round
-# levels. Keeping engulf-only biases the sample by undertrading retests where
-# price wicks through the level and snaps back — a very common Alex entry.
-# The pin bar spec below is intentionally tight to avoid opening the floodgates.
-ENGULFING_ONLY: bool = True    # Alex's #1 rule: no engulfing candle = no trade
+#   "engulf_only"   — only bearish/bullish engulfing closes.
+#                     Alex's stated rule in every video: "No engulfing candle =
+#                     no trade." Confirmed as the #1 filter that separates his
+#                     real trades from near-misses. Production default.
+#
+#   "engulf_or_pin" — also allows tight pin bars meeting the strict spec below.
+#                     Use for research runs to measure whether pin-bar retest
+#                     rejections add independent edge, not as a prod default.
+#                     Backtest tag: "pin_bars_allowed"
+#
+# To compare: run backtester with ENTRY_TRIGGER_MODE overridden per arm.
+# Never change this to "engulf_or_pin" in production without data supporting it.
+ENTRY_TRIGGER_MODE: str = "engulf_only"   # "engulf_only" | "engulf_or_pin"
+
+# Backward-compatible derived flag — all existing call sites work unchanged.
+# Do not set ENGULFING_ONLY directly; change ENTRY_TRIGGER_MODE instead.
+ENGULFING_ONLY: bool = (ENTRY_TRIGGER_MODE == "engulf_only")
 
 # ── Pin bar entry spec ─────────────────────────────────────────────────────
-# Only active when ENGULFING_ONLY=False.
+# Only active when ENTRY_TRIGGER_MODE == "engulf_or_pin".
 # Tight spec prevents noise pin bars from triggering entries:
 #   1. Rejection wick must be ≥ PIN_BAR_MIN_WICK_BODY_RATIO × body size
 #   2. Close must be in the outer PIN_BAR_CLOSE_OUTER_PCT of candle range
@@ -589,8 +614,8 @@ def get_model_tags() -> list:
         tags.append("news_filter_on")
 
     # ── Entry signal ────────────────────────────────────────────────────────
-    tags.append("engulfing_only" if m.ENGULFING_ONLY else "pin_bars_allowed")
-    if not m.ENGULFING_ONLY:
+    tags.append("engulfing_only" if m.ENTRY_TRIGGER_MODE == "engulf_only" else "pin_bars_allowed")
+    if m.ENTRY_TRIGGER_MODE == "engulf_or_pin":
         tags.append(f"pin_wick_{m.PIN_BAR_MIN_WICK_BODY_RATIO:.1f}x")
 
     # ── Zone touch gate ──────────────────────────────────────────────────────
@@ -642,6 +667,6 @@ def get_model_tags() -> list:
     tags.append(f"atr_max_{int(m.ATR_STOP_MULTIPLIER)}")
     tags.append(f"conf_{int(m.MIN_CONFIDENCE * 100)}")
     tags.append(f"rr_{m.MIN_RR:.1f}")
-    tags.append(f"max_concurrent_{m.MAX_CONCURRENT_TRADES}")
+    tags.append(f"max_concurrent_{m.MAX_CONCURRENT_TRADES_BACKTEST}")
 
     return tags

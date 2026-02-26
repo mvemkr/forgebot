@@ -1233,7 +1233,8 @@ function dashboard() {
           'last_scan_ts','last_decision_ts','last_state_write_ts','engine_sha',
           'peak_source','session_allowed','session_reason','next_session','next_session_mins',
           'whitelist_live_enabled','whitelist_live_pairs','whitelist_live_updated_at',
-          'whitelist_backtest_enabled','whitelist_backtest_pairs','whitelist_backtest_updated_at'];
+          'whitelist_backtest_enabled','whitelist_backtest_pairs','whitelist_backtest_updated_at',
+          'entry_trigger_mode','max_concurrent_live','max_concurrent_backtest'];
         this.state = { ...(status.heartbeat || {}) };
         for (const k of _topFields) {
           if (status[k] !== undefined) this.state[k] = status[k];
@@ -1457,6 +1458,11 @@ function dashboard() {
   <span x-show="state.last_decision_ts">last decision: <span x-text="state.last_decision_ts ? timeAgo(state.last_decision_ts) : '—'"></span></span>
   <span x-show="state.last_state_write_ts">state written: <span x-text="state.last_state_write_ts ? timeAgo(state.last_state_write_ts) : '—'"></span></span>
   <span x-text="'server: ' + (state.server_time ? new Date(state.server_time).toLocaleTimeString() : '—')"></span>
+  <span x-show="state.entry_trigger_mode"
+        :class="state.entry_trigger_mode === 'engulf_only' ? '' : 'text-warning'"
+        x-text="'trigger: ' + (state.entry_trigger_mode || '—')"></span>
+  <span x-show="state.max_concurrent_live !== undefined"
+        x-text="'concurrent: live=' + state.max_concurrent_live + ' bt=' + state.max_concurrent_backtest"></span>
 </div>
 </body>
 </html>

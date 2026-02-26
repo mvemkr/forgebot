@@ -115,10 +115,10 @@ class EntrySignalDetector:
                     notes=f"Bullish engulfing at {current['close']:.5f}",
                 ))
 
-            # Pin bar — controlled by ENGULFING_ONLY config flag.
-            # When ENGULFING_ONLY=False, pin bars are valid IF they meet the
-            # tight spec in _pin_bar() (wick ≥ 2× body, close in outer 30%).
-            if not _cfg.ENGULFING_ONLY:
+            # Pin bar — active only when ENTRY_TRIGGER_MODE == "engulf_or_pin".
+            # Tight spec in _pin_bar() prevents noise: wick ≥ 2× body, close
+            # in outer 30% of range in trade direction.
+            if _cfg.ENTRY_TRIGGER_MODE == "engulf_or_pin":
                 pb = self._pin_bar(current, direction="")
                 if pb:
                     signals.append(pb)
@@ -136,14 +136,14 @@ class EntrySignalDetector:
         Returns (found, signal_or_None, reason_code).
 
         reason_code when False:
-          NO_ENGULF       — engulfing tried, not found (ENGULFING_ONLY=True)
-          NO_ENGULF|NO_PIN — both tried, neither found (ENGULFING_ONLY=False)
+          NO_ENGULF       — engulfing tried, not found (ENTRY_TRIGGER_MODE="engulf_only")
+          NO_ENGULF|NO_PIN — both tried, neither found (ENTRY_TRIGGER_MODE="engulf_or_pin")
           NO_TRIGGER      — signal found but wrong direction or below strength threshold
         """
         if len(df) < 3:
             return False, None, "NO_TRIGGER"
 
-        tried_pin   = not _cfg.ENGULFING_ONLY
+        tried_pin   = (_cfg.ENTRY_TRIGGER_MODE == "engulf_or_pin")
         found_engulf = False
         found_pin    = False
         best: Optional[EntrySignal] = None
@@ -177,7 +177,7 @@ class EntrySignalDetector:
                     if best is None or sig.strength > best.strength:
                         best = sig
 
-            # ── Pin bar (only when ENGULFING_ONLY=False) ───────────────
+            # ── Pin bar (only when ENTRY_TRIGGER_MODE="engulf_or_pin") ──
             if tried_pin:
                 pb = self._pin_bar(current, direction)
                 if pb:

@@ -12,6 +12,11 @@ from flask import Flask, render_template, jsonify, request
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from src.exchange.oanda_client import OandaClient
 from src.execution.trade_journal import TradeJournal
+from src.strategy.forex.strategy_config import (
+    MAX_CONCURRENT_TRADES_LIVE,
+    MAX_CONCURRENT_TRADES_BACKTEST,
+    ENTRY_TRIGGER_MODE,
+)
 
 LOG_DIR        = Path.home() / "trading-bot" / "logs"
 HEARTBEAT_FILE = LOG_DIR / "forex_orchestrator.heartbeat"
@@ -299,6 +304,10 @@ def api_status():
         **{f"whitelist_backtest_{k}": v
            for k, v in _load_whitelist_state("backtest").items()
            if k in ("enabled", "pairs", "updated_at")},
+        # strategy config — surfaced so UI can show active mode without reading files
+        "entry_trigger_mode":           ENTRY_TRIGGER_MODE,
+        "max_concurrent_live":          MAX_CONCURRENT_TRADES_LIVE,
+        "max_concurrent_backtest":      MAX_CONCURRENT_TRADES_BACKTEST,
     })
 
 def _write_control_audit(command: str, reason: str):

@@ -63,7 +63,7 @@ from src.strategy.forex.strategy_config import (
     ATR_STOP_MULTIPLIER,
     ATR_MIN_MULTIPLIER,
     ATR_LOOKBACK,
-    MAX_CONCURRENT_TRADES,
+    MAX_CONCURRENT_TRADES_BACKTEST,
     LONDON_SESSION_START_UTC,
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
@@ -646,7 +646,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             macro_theme is not None
             and pair in [p for p, _ in macro_theme.suggested_trades]
         )
-        max_concurrent = STACK_MAX if _is_theme else _sc.MAX_CONCURRENT_TRADES
+        max_concurrent = STACK_MAX if _is_theme else _sc.MAX_CONCURRENT_TRADES_BACKTEST
 
         # Layer 1: max concurrent
         if _is_theme:
@@ -658,7 +658,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                 if open_pos[p].get("macro_theme") is None
                 and not open_pos[p].get("be_moved", False)
             )
-            if non_theme_count >= _sc.MAX_CONCURRENT_TRADES:
+            if non_theme_count >= _sc.MAX_CONCURRENT_TRADES_BACKTEST:
                 return False, "max_concurrent"
 
         # Layer 2: same-pair block
@@ -1604,10 +1604,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             "ATR_STOP_MULTIPLIER":               _sc.ATR_STOP_MULTIPLIER,
             "MIN_CONFIDENCE":                    _sc.MIN_CONFIDENCE,
             "MIN_RR":                            _sc.MIN_RR,
-            "MAX_CONCURRENT_TRADES":             _sc.MAX_CONCURRENT_TRADES,
+            "MAX_CONCURRENT_TRADES_BACKTEST":    _sc.MAX_CONCURRENT_TRADES_BACKTEST,
+            "MAX_CONCURRENT_TRADES_LIVE":        _sc.MAX_CONCURRENT_TRADES_LIVE,
             "BLOCK_ENTRY_WHILE_WINNER_RUNNING":  _sc.BLOCK_ENTRY_WHILE_WINNER_RUNNING,
             "WINNER_THRESHOLD_R":                _sc.WINNER_THRESHOLD_R,
-            "ENGULFING_ONLY":                    _sc.ENGULFING_ONLY,
+            "ENTRY_TRIGGER_MODE":                _sc.ENTRY_TRIGGER_MODE,
             "LEVEL_ALLOW_FINE_INCREMENT":        _sc.LEVEL_ALLOW_FINE_INCREMENT,
             "STRUCTURAL_LEVEL_MIN_SCORE":        _sc.STRUCTURAL_LEVEL_MIN_SCORE,
             "ALLOW_BREAK_RETEST":                _sc.ALLOW_BREAK_RETEST,

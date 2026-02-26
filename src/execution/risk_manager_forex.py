@@ -23,7 +23,7 @@ Kill switch (40% DD threshold — agreed 2026-02-21):
 
 Dual-trade rules (agreed 2026-02-21 after Monte Carlo analysis):
   MAX_BOOK_EXPOSURE = 35% — total capital at risk across all open positions
-  MAX_CONCURRENT_TRADES = 2
+  MAX_CONCURRENT_TRADES_LIVE = 1   (one at-risk position at a time; change in strategy_config.py)
   MIN_SECOND_TRADE_PCT = 5% — don't open second trade if budget < 5%
   Currency overlap rule: no two open positions may share a currency
     (e.g. GBP/USD + EUR/USD both expose USD — blocked)
@@ -37,6 +37,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Tuple
 
 from .trade_journal import TradeJournal
+from ..strategy.forex.strategy_config import MAX_CONCURRENT_TRADES_LIVE
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class ForexRiskManager:
 
     # Dual-trade book limits (Monte Carlo validated 2026-02-21)
     MAX_BOOK_EXPOSURE    = 35.0   # % — max total risk across all open positions
-    MAX_CONCURRENT_TRADES = 4     # hard cap on simultaneous at-risk positions (Alex runs 4+)
+    MAX_CONCURRENT_TRADES = MAX_CONCURRENT_TRADES_LIVE  # from strategy_config — live cap only
     MIN_SECOND_TRADE_PCT  = 5.0   # % — skip 2nd trade if budget below this
 
     def __init__(
