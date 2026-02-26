@@ -1250,8 +1250,10 @@ class SetAndForgetStrategy:
             _h1_c = df_1h['close'].values
             _tr   = np.maximum(
                 _h1_h[-14:] - _h1_l[-14:],
-                np.abs(_h1_h[-14:] - _h1_c[-15:-1]),
-                np.abs(_h1_l[-14:] - _h1_c[-15:-1]),
+                np.maximum(
+                    np.abs(_h1_h[-14:] - _h1_c[-15:-1]),
+                    np.abs(_h1_l[-14:] - _h1_c[-15:-1]),
+                ),
             )
             _atr_1h = float(np.mean(_tr)) if len(_tr) > 0 else None
 
