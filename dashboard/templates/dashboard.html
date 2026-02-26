@@ -153,6 +153,29 @@
   </span>
 </div>
 
+<!-- No active setups -->
+<div x-show="!state.paused && botOnline && state.session_allowed && state.dd_flag !== 'DD_KILLSWITCH' && noActiveSetups && confluenceLoaded"
+     class="alert rounded-none py-2 bg-base-300/50 border-y border-base-300">
+  <i class="ph ph-binoculars text-base-content/40 text-xl"></i>
+  <span class="text-base-content/60">
+    👁 <strong>NO SETUPS</strong> — Scanning
+    <span x-text="confluence.length"></span> pairs.
+    No patterns at key levels yet. Checking again next scan.
+  </span>
+</div>
+
+<!-- Waiting for entry trigger (pattern found, no signal yet) -->
+<div x-show="!state.paused && botOnline && state.session_allowed && state.dd_flag !== 'DD_KILLSWITCH' && waitingForTrigger && !noActiveSetups"
+     class="alert rounded-none py-2 bg-base-300/30 border-y border-base-300">
+  <i class="ph ph-hourglass-medium text-warning/60 text-xl"></i>
+  <span class="text-base-content/60">
+    ⏳ <strong>WAITING FOR TRIGGER</strong> —
+    <span x-text="confluence.filter(c => c.decision==='WAIT' && c.pattern).length"></span>
+    pattern(s) at key level(s).
+    Watching for engulfing candle to confirm entry.
+  </span>
+</div>
+
 <!-- ── TAB NAV ────────────────────────────────────────────── -->
 <div class="px-6 pt-4 border-b border-base-300 bg-base-200 flex gap-1">
   <button @click="activeTab='live'"
@@ -524,10 +547,12 @@
           <template x-for="(d, i) in recentDecisions" :key="i">
             <div class="flex gap-3 items-start text-sm">
               <div class="w-2 h-2 rounded-full mt-1.5 flex-shrink-0" :class="{
-                'bg-success': d.event==='TRADE_ENTERED'||d.event==='BREAKEVEN_MOVED',
-                'bg-error': d.event==='STOP_HIT'||d.event==='KILL_SWITCH',
-                'bg-warning': d.event==='EXIT_SIGNAL'||d.event==='SETUP_DETECTED',
-                'bg-base-content/20': d.event==='BLOCKED'
+                'bg-success':          d.event==='TRADE_ENTERED'||d.event==='BREAKEVEN_MOVED',
+                'bg-error':            d.event==='STOP_HIT'||d.event==='KILL_SWITCH',
+                'bg-warning':          d.event==='EXIT_SIGNAL'||d.event==='SETUP_DETECTED',
+                'bg-info/60':          d.event==='SCAN_HEARTBEAT',
+                'bg-primary/60':       d.event==='WHITELIST_UPDATE',
+                'bg-base-content/20':  d.event==='BLOCKED'||d.event==='SCAN_COMPLETE'||d.event==='CONTROL_PAUSE'||d.event==='CONTROL_RESUME'
               }"></div>
               <div class="flex-1 min-w-0">
                 <div class="flex gap-2">
@@ -982,6 +1007,20 @@ function dashboard() {
     confluenceSort: 'decision',
     confluenceLoaded: false,
 
+    // ── Why-not-trading computed helpers ───────────────────────────────
+    get noActiveSetups() {
+      // True when no pair has a pattern forming (all BLOCKED, NO_TRADE, or WAIT with no pattern)
+      return this.confluenceLoaded &&
+             this.confluence.filter(c => c.pattern && c.decision !== 'BLOCKED').length === 0;
+    },
+    get waitingForTrigger() {
+      // True when at least one pair has a pattern but no entry signal yet
+      return this.confluenceLoaded &&
+             this.confluence.some(c =>
+               c.decision === 'WAIT' && c.pattern && c.checks && !c.checks.entry_signal
+             );
+    },
+
     get sortedConfluence() {
       const arr = [...this.confluence];
       if (this.confluenceSort === 'confidence') {
@@ -1152,9 +1191,11 @@ function dashboard() {
     fmt(n) { return (n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
 
     evtLabel(e) {
-      return { TRADE_ENTERED:'IN TRADE', SETUP_DETECTED:'SETUP', EXIT_SIGNAL:'⚠️ EXIT',
-               BREAKEVEN_MOVED:'BREAKEVEN', BLOCKED:'BLOCKED', STOP_HIT:'STOP HIT',
-               KILL_SWITCH:'🛑 HALTED', SCAN_COMPLETE:'SCAN DONE' }[e] || e;
+      return { TRADE_ENTERED:'🎯 ENTERED', SETUP_DETECTED:'SETUP', EXIT_SIGNAL:'⚠️ EXIT',
+               BREAKEVEN_MOVED:'BE MOVED', BLOCKED:'BLOCKED', STOP_HIT:'STOP HIT',
+               KILL_SWITCH:'🛑 HALTED', SCAN_COMPLETE:'SCAN DONE',
+               SCAN_HEARTBEAT:'📡 SCAN', WHITELIST_UPDATE:'🔒 WHITELIST',
+               CONTROL_PAUSE:'⏸ PAUSED', CONTROL_RESUME:'▶ RESUMED' }[e] || e;
     },
 
     trendColor(t) {

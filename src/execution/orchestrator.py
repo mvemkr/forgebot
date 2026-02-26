@@ -64,6 +64,7 @@ logger = logging.getLogger("orchestrator")
 HEARTBEAT_FILE  = LOG_DIR / "forex_orchestrator.heartbeat"
 CONTROL_FILE    = LOG_DIR / "bot_control.json"   # Mike → Forge → bot command relay
 WHITELIST_FILE  = LOG_DIR / "whitelist.json"      # pair whitelist (persistent, UI-managed)
+DECISIONS_FILE  = LOG_DIR / "decision_log.jsonl"  # audit + decision feed for dashboard
 
 WATCHLIST = [
     "USD/JPY", "GBP/CHF", "USD/CHF", "USD/CAD", "GBP/JPY",
@@ -470,6 +471,9 @@ class ForexOrchestrator:
                 )
             except Exception as e:
                 logger.error(f"{pair}: Evaluation error: {e}")
+
+        # Always log one entry per scan cycle so the dashboard Decision Feed is alive
+        self._write_scan_heartbeat()
 
     def _detect_macro_theme(self):
         """
@@ -967,6 +971,55 @@ class ForexOrchestrator:
         return now.day == 1 and now.hour == 9
 
     # ── Control File ──────────────────────────────────────────────────
+
+    def _write_scan_heartbeat(self) -> None:
+        """
+        Write a SCAN_HEARTBEAT entry to decision_log.jsonl after each hourly scan.
+        This keeps the dashboard Decision Feed alive even when no trades are entering.
+
+        Summarises: pairs scanned, decision breakdown, top WAIT setups.
+        """
+        import json as _json
+        try:
+            cs    = self._confluence_state   # populated by _capture_confluence
+            total = len(cs)
+            if total == 0:
+                return
+
+            wait_pairs    = [(p, v) for p, v in cs.items() if v.get("decision") == "WAIT"]
+            enter_pairs   = [p for p, v in cs.items() if v.get("decision") == "ENTER"]
+            blocked_pairs = [p for p, v in cs.items() if v.get("decision") == "BLOCKED"]
+
+            # Top WAIT setups: those with a pattern, sorted by confidence desc
+            top_wait = sorted(
+                [(p, v) for p, v in wait_pairs if v.get("pattern")],
+                key=lambda x: x[1].get("confidence", 0), reverse=True,
+            )[:3]
+            top_wait_notes = [
+                f"{p} {v.get('pattern','?')} {v.get('confidence',0):.0%}"
+                for p, v in top_wait
+            ]
+
+            entry = {
+                "ts":           datetime.now(timezone.utc).isoformat(),
+                "event":        "SCAN_HEARTBEAT",
+                "pair":         "ALL",
+                "pairs_scanned": total,
+                "wait_count":   len(wait_pairs),
+                "enter_count":  len(enter_pairs),
+                "blocked_count": len(blocked_pairs),
+                "top_watching": top_wait_notes,
+                "notes":        (
+                    f"ENTER: {enter_pairs[0]}" if enter_pairs
+                    else (f"WAIT: {top_wait_notes[0]}" if top_wait_notes
+                          else f"No setups — scanning {total} pairs")
+                ),
+            }
+            DECISIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(DECISIONS_FILE, "a") as f:
+                f.write(_json.dumps(entry) + "\n")
+        except Exception as e:
+            logger.warning(f"Could not write scan heartbeat: {e}")
 
     def _load_whitelist(self) -> tuple[bool, set]:
         """
