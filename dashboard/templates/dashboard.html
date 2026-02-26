@@ -765,12 +765,13 @@
         <thead>
           <tr class="text-base-content/50">
             <th>#</th>
-            <th>Date</th>
+            <th>Entry UTC</th>
+            <th>Exit UTC</th>
             <th>Pair</th>
             <th>Dir</th>
             <th>Pattern</th>
-            <th class="text-right">Entry</th>
-            <th class="text-right">Exit</th>
+            <th class="text-right">Entry px</th>
+            <th class="text-right">Exit px</th>
             <th class="text-right">Pips</th>
             <th class="text-right">R</th>
             <th class="text-right">P&L</th>
@@ -783,7 +784,10 @@
           <template x-for="(t, i) in latestTrades()" :key="t.pair+t.entry_ts">
             <tr :class="t.pnl > 0 ? 'hover:bg-success/5' : t.pnl < 0 ? 'hover:bg-error/5' : 'hover:bg-base-300/20'">
               <td class="text-base-content/30 text-xs" x-text="i+1"></td>
-              <td class="font-mono text-xs text-base-content/60" x-text="t.entry_ts?.slice(0,10)"></td>
+              <td class="font-mono text-xs text-base-content/70 whitespace-nowrap"
+                  x-text="tradeDt(t.entry_ts)"></td>
+              <td class="font-mono text-xs text-base-content/40 whitespace-nowrap"
+                  x-text="tradeDt(t.exit_ts)"></td>
               <td class="font-mono font-bold text-sm" x-text="t.pair"></td>
               <td>
                 <span class="badge badge-xs"
@@ -817,7 +821,7 @@
         </tbody>
         <tfoot x-show="btResults[0]">
           <tr class="border-t-2 border-base-300 font-bold">
-            <td colspan="9" class="text-right text-xs text-base-content/50">TOTAL</td>
+            <td colspan="10" class="text-right text-xs text-base-content/50">TOTAL</td>
             <td class="font-mono text-sm text-right"
                 :class="(btResults[0]?.results?.net_pnl||0)>=0?'text-success':'text-error'"
                 x-text="((btResults[0]?.results?.net_pnl||0)>=0?'+$':'−$')+Math.abs(btResults[0]?.results?.net_pnl||0).toFixed(0)"></td>
@@ -890,13 +894,17 @@
           <div x-show="btExpanded===run._id" class="px-5 pb-4 bg-base-300/20">
             <table class="table table-xs mt-2">
               <thead><tr>
-                <th></th><th>Pair</th><th>Dir</th><th>Pattern</th>
-                <th>Entry</th><th>Exit</th><th>R</th><th>P&L</th><th>Reason</th>
+                <th></th><th>Entry UTC</th><th>Exit UTC</th><th>Pair</th><th>Dir</th><th>Pattern</th>
+                <th>Entry px</th><th>Exit px</th><th>R</th><th>P&L</th><th>Reason</th>
               </tr></thead>
               <tbody>
                 <template x-for="t in (run.trades||[])" :key="t.pair+t.entry_ts">
                   <tr>
                     <td x-text="t.pnl>=0?'✅':'❌'"></td>
+                    <td class="font-mono text-xs text-base-content/70 whitespace-nowrap"
+                        x-text="tradeDt(t.entry_ts)"></td>
+                    <td class="font-mono text-xs text-base-content/40 whitespace-nowrap"
+                        x-text="tradeDt(t.exit_ts)"></td>
                     <td class="font-mono font-bold" x-text="t.pair"></td>
                     <td>
                       <span class="badge badge-xs"
@@ -1331,7 +1339,7 @@ function dashboard() {
       return new Date(ts).toLocaleDateString();
     },
     shortDt(ts) {
-      // "Feb 26 08:14" — compact run timestamp for backtest history rows
+      // "Feb 26 08:14" — compact run timestamp for backtest history rows (local time)
       if (!ts) return '—';
       const d = new Date(ts);
       const mon = d.toLocaleDateString('en-US', {month:'short'});
@@ -1339,6 +1347,19 @@ function dashboard() {
       const hh  = String(d.getHours()).padStart(2,'0');
       const mm  = String(d.getMinutes()).padStart(2,'0');
       return `${mon} ${day} ${hh}:${mm}`;
+    },
+    tradeDt(ts) {
+      // "2024-07-02 09:00" — backtest trade timestamp in UTC so it matches
+      // TradingView / OANDA chart candles directly (OANDA uses UTC).
+      // Always shows full date so trades from different years are unambiguous.
+      if (!ts) return '—';
+      const d = new Date(ts);
+      const y   = d.getUTCFullYear();
+      const mo  = String(d.getUTCMonth()+1).padStart(2,'0');
+      const day = String(d.getUTCDate()).padStart(2,'0');
+      const hh  = String(d.getUTCHours()).padStart(2,'0');
+      const mm  = String(d.getUTCMinutes()).padStart(2,'0');
+      return `${y}-${mo}-${day} ${hh}:${mm}`;
     },
 
     // ── Latest run trade list helpers ──────────────────────────────
