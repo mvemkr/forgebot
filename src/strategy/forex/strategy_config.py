@@ -340,6 +340,43 @@ STREAK_L2_CAP:    float = 6.0   # cap at 6% after 2 consecutive losses
 STREAK_L3_LOSSES: int   = 3     # streak length for L3 brake
 STREAK_L3_CAP:    float = 3.0   # cap at 3% after 3+ consecutive losses
 
+# ── Spread model (backtester only) ───────────────────────────────────────
+# Models bid/ask spread cost as a round-turn deduction from each trade's P&L.
+# The backtester uses mid-price candles; real OANDA orders fill at ask (longs)
+# or bid (shorts).  Round-turn cost = spread_pips on entry + spread_pips on exit
+# = 2 × half_spread.  For v1 we apply the full round-turn as a P&L deduction
+# at close (conservative and simple).
+#
+# Spreads in pips (typical OANDA practice account values):
+#   Majors (EUR/USD, GBP/USD, USD/JPY, USD/CHF, USD/CAD):  ~1.0–2.0 pips
+#   JPY crosses (GBP/JPY, EUR/JPY):                         ~2.5–4.0 pips
+#   Other crosses (GBP/CHF, EUR/CHF, etc.):                 ~3.0–5.0 pips
+SPREAD_MODEL_ENABLED: bool = True
+
+# Per-pair round-trip spread in pips.  Missing pairs fall back to SPREAD_DEFAULT_PIPS.
+SPREAD_PIPS: dict = {
+    "EUR/USD": 1.0,
+    "GBP/USD": 1.5,
+    "USD/JPY": 1.2,
+    "USD/CHF": 2.0,
+    "USD/CAD": 2.0,
+    "GBP/JPY": 3.0,
+    "EUR/JPY": 2.5,
+    "GBP/CHF": 4.5,
+    "EUR/CHF": 3.5,
+    "AUD/USD": 1.5,
+    "NZD/USD": 2.0,
+    "AUD/JPY": 3.0,
+    "EUR/AUD": 3.5,
+    "EUR/CAD": 3.0,
+    "GBP/AUD": 5.0,
+    "GBP/CAD": 5.0,
+    "NZD/JPY": 3.5,
+    "AUD/CAD": 3.5,
+    "AUD/NZD": 3.0,
+}
+SPREAD_DEFAULT_PIPS: float = 3.0   # fallback for unlisted pairs
+
 # ── One-way ratchet trailing stop ─────────────────────────────────────────
 # Option B: replaces hard breakeven lock at 1:1.
 # When price moves TRAIL_ACTIVATE_R in our favour, the stop trails

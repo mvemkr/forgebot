@@ -508,6 +508,24 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         risk_usd = bal * rpct / 100
         return int(risk_usd / dist)
 
+    def _spread_deduction(pair: str, units: int) -> float:
+        """
+        Round-trip spread cost in dollars for one trade.
+
+        Formula: spread_pips × pip_mult × units
+          LONG:  buy at ask, sell at bid → pay spread on entry + spread on exit
+          SHORT: sell at bid, buy at ask → same cost
+          v1 simplification: apply full round-turn as a P&L deduction at close.
+
+        Returns 0.0 when SPREAD_MODEL_ENABLED is False.
+        """
+        if not _sc.SPREAD_MODEL_ENABLED:
+            return 0.0
+        pair_key  = pair.replace("_", "/")
+        spread_p  = _sc.SPREAD_PIPS.get(pair_key, _sc.SPREAD_DEFAULT_PIPS)
+        pip_mult  = 0.01 if "JPY" in pair else 0.0001
+        return spread_p * pip_mult * units
+
     def _daily_atr(pair) -> Optional[float]:
         """14-day ATR for the pair (in price terms, not pips)."""
         df_d = candle_data[pair].get("d")
@@ -802,17 +820,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                     close_price  = target if not is_late_week else close
                     delta        = ((entry - close_price) if direction == "short"
                                     else (close_price - entry))
-                    pnl = delta * units
+                    spread_cost  = _spread_deduction(pair, units)
+                    pnl = delta * units - spread_cost
                     balance += pnl
                     peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
                     close_reason = ("weekend_proximity" if is_late_week
                                     else "target_reached")
-                    risk_r = delta / risk_dist if risk_dist else 0
+                    risk_r = (pnl / pos.get("entry_risk_dollars", 1)
+                              if pos.get("entry_risk_dollars") else delta / risk_dist if risk_dist else 0)
                     consecutive_losses = 0   # target/weekend win resets streak
                     trades.append({
                         "pair":        pair,   "direction": direction,
                         "entry":       entry,  "exit":      close_price,
                         "pnl":         round(pnl, 2),
+                        "spread_cost": round(spread_cost, 2),
                         "r":           risk_r,
                         "reason":      close_reason,
                         "entry_ts":    pos["entry_ts"].isoformat(),
@@ -857,10 +878,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             max_hold = bars_held >= MAX_HOLD_BARS
 
             if stopped or max_hold:
-                exit_p   = stop if stopped else close
-                delta    = (exit_p - entry) if direction == "long" else (entry - exit_p)
-                pnl      = delta * units
-                balance += pnl
+                exit_p      = stop if stopped else close
+                delta       = (exit_p - entry) if direction == "long" else (entry - exit_p)
+                spread_cost = _spread_deduction(pair, units)
+                pnl         = delta * units - spread_cost
+                balance    += pnl
                 peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
                 if stopped and pos.get("ratchet_moved"):
                     reason = "ratchet_stop_hit"
@@ -868,7 +890,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                     reason = "stop_hit"
                 else:
                     reason = "max_hold"
-                risk_r   = delta / risk_dist if risk_dist else 0
+                risk_r = (pnl / pos.get("entry_risk_dollars", 1)
+                          if pos.get("entry_risk_dollars") else delta / risk_dist if risk_dist else 0)
 
                 # ── Streak tracking ───────────────────────────────────
                 if risk_r < -0.10:   # definite loss
@@ -880,6 +903,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                     "pair": pair, "direction": direction,
                     "entry": entry, "exit": exit_p,
                     "pnl": pnl, "r": risk_r, "reason": reason,
+                    "spread_cost": round(spread_cost, 2),
                     "entry_ts": pos["entry_ts"].isoformat(),
                     "exit_ts": ts_utc.isoformat(),
                     "bars_held": bars_held,
@@ -1230,15 +1254,19 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         stop    = pos["stop_loss"]
         direction = pos["direction"]
         units   = pos["units"]
-        delta   = (close_p - entry) if direction == "long" else (entry - close_p)
-        pnl     = delta * units
-        r       = delta / abs(entry - stop) if abs(entry - stop) else 0
-        balance += pnl
+        delta       = (close_p - entry) if direction == "long" else (entry - close_p)
+        spread_cost = _spread_deduction(pair, units)
+        pnl         = delta * units - spread_cost
+        r = (pnl / pos.get("entry_risk_dollars", 1)
+             if pos.get("entry_risk_dollars") else
+             delta / abs(entry - stop) if abs(entry - stop) else 0)
+        balance    += pnl
         peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
         trades.append({
             "pair": pair, "direction": direction,
             "entry": entry, "exit": close_p,
             "pnl": pnl, "r": r, "reason": "runout_expired",
+            "spread_cost": round(spread_cost, 2),
             "signal_type":  pos.get("signal_type", "unknown"),
             "planned_rr":   pos.get("planned_rr", 0.0),
             "stop_type":    pos.get("stop_type", "unknown"),
@@ -1362,6 +1390,22 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             print(f"    Stop pips:  min={_sp_vals[0]:.0f}p  p50={_sp_vals[len(_sp_vals)//2]:.0f}p  "
                   f"p90={_sp_vals[int(len(_sp_vals)*0.9)]:.0f}p  max={_sp_vals[-1]:.0f}p")
 
+    # ── Spread model summary ──────────────────────────────────────────────
+    import src.strategy.forex.strategy_config as _sc_ref
+    if _sc_ref.SPREAD_MODEL_ENABLED and trades:
+        _total_spread  = sum(t.get("spread_cost", 0.0) for t in trades)
+        _avg_spread    = _total_spread / len(trades)
+        _spread_pct_pnl = (_total_spread / abs(net_pnl) * 100) if net_pnl != 0 else 0
+        print(f"\n  ── Spread model (bid/ask round-trip) ──────────────────")
+        print(f"    Total spread drag:  ${_total_spread:>+9,.2f}  ({_spread_pct_pnl:.1f}% of gross P&L)")
+        print(f"    Avg per trade:      ${_avg_spread:>+9,.2f}")
+        _spread_by_pair = {}
+        for t in trades:
+            p = t["pair"]
+            _spread_by_pair[p] = _spread_by_pair.get(p, 0.0) + t.get("spread_cost", 0.0)
+        for _p, _sc_val in sorted(_spread_by_pair.items(), key=lambda x: -x[1]):
+            print(f"    {_p:<12}  ${_sc_val:>+7,.2f}")
+
     print(f"\n  ── Risk controls summary ──────────────────────────────")
     # Dollar loss range
     _losses_dollar = sorted([t["pnl"] for t in trades if t["pnl"] < 0])
@@ -1405,9 +1449,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
         print(f"\n  ── 1R audit (stop_hit trades) ──────────────────────────")
         _overruns = []
         for t in _sh_trades:
-            expected = t["entry_risk_dollars"]
-            actual   = abs(t["pnl"])
-            overrun  = actual - expected
+            expected    = t["entry_risk_dollars"]
+            actual      = abs(t["pnl"])
+            # Spread is a legitimate cost on top of 1R — subtract it before checking
+            _sc_cost    = t.get("spread_cost", 0.0)
+            overrun     = actual - expected - _sc_cost   # residual after spread
             overrun_pct = overrun / expected * 100 if expected else 0
             _overruns.append((overrun_pct, t))
         _max_op, _max_ot = max(_overruns, key=lambda x: abs(x[0]))
