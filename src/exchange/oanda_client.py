@@ -90,6 +90,47 @@ class OandaClient:
             "Content-Type":  "application/json",
         }
 
+    # ── Factory: LIVE_PAPER / demo pricing feed ───────────────────────────
+
+    @classmethod
+    def for_paper_mode(cls) -> "OandaClient":
+        """
+        Build an OandaClient using OANDA_DEMO_* credentials for LIVE_PAPER mode.
+
+        The client provides live pricing and open-trade sync only.
+        Order placement is blocked at the TradeExecutor level (dry_run=True),
+        but using a demo account here gives an extra safety layer.
+
+        OANDA_DEMO_ENV normalization:
+          'LIVE_PAPER' or 'paper' or '' or None → 'practice'
+          'practice'                             → 'practice'
+          'live'                                 → 'live'  (unusual but respected)
+        """
+        raw_env = os.getenv("OANDA_DEMO_ENV", "practice") or "practice"
+        # Normalize human-readable values to what OandaClient understands
+        _env_map = {
+            "live_paper": "practice",
+            "paper":      "practice",
+            "practice":   "practice",
+            "live":       "live",
+        }
+        oanda_env = _env_map.get(raw_env.lower(), "practice")
+
+        api_key    = os.getenv("OANDA_DEMO_API_KEY")
+        account_id = os.getenv("OANDA_DEMO_ACCOUNT_ID")
+
+        if not api_key:
+            raise ValueError(
+                "OANDA_DEMO_API_KEY not set in .env — required for LIVE_PAPER pricing feed. "
+                "Add it or set ACCOUNT_MODE=LIVE_REAL."
+            )
+        if not account_id:
+            raise ValueError(
+                "OANDA_DEMO_ACCOUNT_ID not set in .env — required for LIVE_PAPER pricing feed."
+            )
+
+        return cls(env=oanda_env, account_id=account_id, api_key=api_key)
+
     def _get(self, path: str, params: dict = None) -> dict:
         resp = requests.get(
             f"{self.base}{path}", headers=self.headers,

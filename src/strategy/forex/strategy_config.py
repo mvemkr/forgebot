@@ -29,6 +29,7 @@ Or load a named profile:
 apply_levers(overrides) patches module globals at runtime so that
 set_and_forget.py (which imports this module by reference) sees the changes.
 """
+import os
 import sys as _sys
 
 # ── Signal quality gates ───────────────────────────────────────────────────
@@ -293,6 +294,17 @@ NECKLINE_CLUSTER_PCT: float = 0.003
 # Used for risk sizing, kill-switch math, and P&L tracking.
 # Set this to the capital you intend to fund with.
 DRY_RUN_PAPER_BALANCE: float = 8_000.0
+
+# ── Account mode + paper equity ────────────────────────────────────────────
+# ACCOUNT_MODE: "LIVE_PAPER" | "LIVE_REAL"
+#   LIVE_PAPER  live pricing feed, simulated equity, no broker orders placed.
+#   LIVE_REAL   real OANDA orders; equity pulled from broker every tick.
+#
+# SIM_STARTING_EQUITY
+#   Seed balance for LIVE_PAPER on first run (when no paper_account.json exists).
+#   Ignored in LIVE_REAL.  Never used as a fallback for unknown broker equity.
+ACCOUNT_MODE:         str   = os.getenv("ACCOUNT_MODE",         "LIVE_PAPER")
+SIM_STARTING_EQUITY:  float = float(os.getenv("SIM_STARTING_EQUITY", "8000.0"))
 
 # ── Backtest candle cache ──────────────────────────────────────────────────
 # Version string baked into every per-pair/TF cache filename.

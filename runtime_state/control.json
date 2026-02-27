@@ -1,6 +1,6 @@
 {
-  "pause_new_entries": true,
-  "last_updated": "2026-02-27T15:19:03.914314+00:00",
+  "pause_new_entries": false,
+  "last_updated": "2026-02-27T15:40:00.628368+00:00",
   "updated_by": "forge",
-  "reason": "AccountMode refactor in progress \u2014 entries paused by Forge"
+  "reason": "AccountMode refactor complete \u2014 LIVE_PAPER mode safe to trade"
 }

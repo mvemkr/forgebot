@@ -88,6 +88,8 @@ from ..strategy.forex.strategy_config import (
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
     DRY_RUN_PAPER_BALANCE,
+    ACCOUNT_MODE,
+    SIM_STARTING_EQUITY,
     winner_rule_check,
 )
 from ..strategy.forex import alex_policy   # shared Alex small-account gate logic
@@ -113,16 +115,40 @@ class ForexOrchestrator:
         from .notifier import Notifier
         from .bot_state import BotState
 
-        self.dry_run  = dry_run
         self.BotMode  = BotMode
-        # ── Determine execution mode ───────────────────────────────────────────
-        # dry_run=False → LIVE_REAL (real OANDA orders, equity from broker)
-        # dry_run=True  → LIVE_PAPER (simulated equity, no real orders)
-        exec_mode     = AccountMode.LIVE_PAPER if dry_run else AccountMode.LIVE_REAL
-        mode_label    = exec_mode.value.upper().replace("_", " ")
+
+        # ── Determine execution mode (ACCOUNT_MODE env var is authoritative) ──
+        # ACCOUNT_MODE=LIVE_PAPER → simulated equity, no broker orders.
+        # ACCOUNT_MODE=LIVE_REAL  → real orders, equity from broker.
+        # The --live CLI flag / dry_run parameter is a secondary override:
+        #   if --live is passed in LIVE_PAPER config, we honour it but warn.
+        _cfg_mode = ACCOUNT_MODE.upper().strip()  # "LIVE_PAPER" or "LIVE_REAL"
+        if _cfg_mode == "LIVE_REAL" and dry_run:
+            # Config says real but caller passed dry_run=True — keep paper for safety
+            logger.warning(
+                "ACCOUNT_MODE=LIVE_REAL in config but dry_run=True passed to constructor. "
+                "Running as LIVE_PAPER (safety override). Pass --live to override."
+            )
+            _cfg_mode = "LIVE_PAPER"
+        elif _cfg_mode == "LIVE_PAPER" and not dry_run:
+            # Config says paper but --live was passed — respect --live
+            logger.warning(
+                "ACCOUNT_MODE=LIVE_PAPER in config but --live flag passed. "
+                "Running as LIVE_REAL (CLI override)."
+            )
+            _cfg_mode = "LIVE_REAL"
+
+        exec_mode  = AccountMode.LIVE_REAL if _cfg_mode == "LIVE_REAL" else AccountMode.LIVE_PAPER
+        # Derive dry_run from mode (TradeExecutor, PositionMonitor, dashboard all read this)
+        self.dry_run = (exec_mode == AccountMode.LIVE_PAPER)
+        mode_label   = exec_mode.value.upper().replace("_", " ")
         logger.info(f"Initializing ForexOrchestrator [{mode_label}]")
 
-        self.oanda    = OandaClient()
+        # ── OandaClient: demo credentials for LIVE_PAPER, real for LIVE_REAL ──
+        if exec_mode == AccountMode.LIVE_PAPER:
+            self.oanda = OandaClient.for_paper_mode()
+        else:
+            self.oanda = OandaClient()
         self.journal  = TradeJournal()
         self.notifier = Notifier()
         self.state    = BotState()
@@ -150,8 +176,13 @@ class ForexOrchestrator:
                 self.unrealized_pnl = summary.get("unrealized_pnl", 0.0)
             except Exception:
                 pass  # paper mode: broker summary is optional (used for position sync only)
-            self.account = AccountState.for_live_paper(DRY_RUN_PAPER_BALANCE)
-            logger.info(f"[LIVE PAPER] Paper equity: {self.account.equity_display}")
+            # SIM_STARTING_EQUITY seeds paper_account.json on first run only;
+            # subsequent restarts always load persisted equity from disk.
+            self.account = AccountState.for_live_paper(SIM_STARTING_EQUITY)
+            logger.info(
+                f"[LIVE PAPER] Paper equity: {self.account.equity_display} "
+                f"(SIM_STARTING_EQUITY={SIM_STARTING_EQUITY:,.0f})"
+            )
 
         # Backward-compat: self.account_balance mirrors account.equity (may be None)
         self.account_balance = self.account.equity
@@ -200,7 +231,7 @@ class ForexOrchestrator:
             if self.risk._peak_balance and self.risk._peak_balance > self.account.peak_equity:
                 self.account.peak_equity = self.risk._peak_balance
 
-        _sizing_balance   = self.account.safe_equity(DRY_RUN_PAPER_BALANCE)
+        _sizing_balance   = self.account.safe_equity(self._equity_fallback)
         initial_risk_pct  = self.risk.get_risk_pct(_sizing_balance)
 
         self.strategy = SetAndForgetStrategy(
@@ -374,7 +405,7 @@ class ForexOrchestrator:
         self.account_balance = self.account.equity
 
         # Propagate usable balance to strategy (use safe fallback if UNKNOWN)
-        _eff_bal = self.account.safe_equity(self.risk._peak_balance or DRY_RUN_PAPER_BALANCE)
+        _eff_bal = self.account.safe_equity(self._equity_fallback)
         self.strategy.update_balance(_eff_bal)
         self.strategy.risk_pct = self.risk.get_effective_risk_pct(_eff_bal)
 
@@ -1062,7 +1093,7 @@ class ForexOrchestrator:
         except Exception:
             weekly_pnl = trades_week = wins_week = losses_week = 0
 
-        _std_bal    = self.account.safe_equity(self.risk._peak_balance or DRY_RUN_PAPER_BALANCE)
+        _std_bal    = self.account.safe_equity(self._equity_fallback)
         risk_status = self.risk.status(_std_bal, consecutive_losses=self._consecutive_losses, dry_run=self.dry_run)
 
         self.notifier.send_standings(
@@ -1296,7 +1327,7 @@ class ForexOrchestrator:
             self._refresh_consecutive_losses()
             # Use safe equity so risk.status() always gets a float, even when
             # broker equity is UNKNOWN.  Display layer will show UNKNOWN separately.
-            _safe_bal    = self.account.safe_equity(self.risk._peak_balance or DRY_RUN_PAPER_BALANCE)
+            _safe_bal    = self.account.safe_equity(self._equity_fallback)
             risk_status  = self.risk.status(
                 _safe_bal,
                 consecutive_losses=self._consecutive_losses,
@@ -1354,6 +1385,17 @@ class ForexOrchestrator:
 
     # ── Heartbeat ─────────────────────────────────────────────────────
 
+    @property
+    def _equity_fallback(self) -> float:
+        """
+        Best available equity estimate when account.equity is None (LIVE_REAL broker failure).
+        Preference order:
+          1. risk._peak_balance  — last known peak (most accurate recent value)
+          2. SIM_STARTING_EQUITY — configured starting balance (never 0 or a random constant)
+        In LIVE_PAPER mode, account.equity is always set so this is never reached.
+        """
+        return self.risk._peak_balance or SIM_STARTING_EQUITY
+
     def _session_status(self) -> dict:
         """Current session block status + minutes to next valid entry window."""
         try:
@@ -1372,7 +1414,7 @@ class ForexOrchestrator:
 
     def _write_heartbeat(self, status: str = "ok"):
         try:
-            _hb_bal       = self.account.safe_equity(self.risk._peak_balance or DRY_RUN_PAPER_BALANCE)
+            _hb_bal       = self.account.safe_equity(self._equity_fallback)
             risk_status   = self.risk.status(
                 _hb_bal,
                 consecutive_losses=self._consecutive_losses,
