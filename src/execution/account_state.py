@@ -525,7 +525,9 @@ class AccountState:
                 f"AccountState (paper): no saved file — "
                 f"bootstrapping at ${default_balance:,.2f}"
             )
-            inst.save_paper()   # persist the starting balance immediately
+        # Always re-save after load/bootstrap so the file reflects the current
+        # schema (upgrades old files that predate week_id/week_pnl/week_trades).
+        inst.save_paper()
         return inst
 
     @classmethod
