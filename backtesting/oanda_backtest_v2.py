@@ -375,6 +375,42 @@ TRAIL_ARMS: Dict[str, dict] = {
         "TRAIL_LOCK_R":        0.5,
         "TRAIL_STAGE2_R":      3.0,
         "TRAIL_STAGE2_DIST_R": 1.0,
+        "STALL_EXIT_BARS":     None,   # no stall exit
+        "STALL_EXIT_MFE_R":    None,
+    },
+    # ── Tuning variants (Step 3 of 6K% path) ────────────────────────────────
+    # C1: earlier lock (1.8R, +0.3R), same stage-2 → smaller initial lock gain,
+    #     but activates sooner → less exposure during early adverse moves.
+    "C1": {
+        "label":               "Arm C1 — lock +0.3R at 1.8R, trail 1.0R after 3R",
+        "TRAIL_ACTIVATE_R":    1.8,
+        "TRAIL_LOCK_R":        0.3,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 1.0,
+        "STALL_EXIT_BARS":     None,
+        "STALL_EXIT_MFE_R":    None,
+    },
+    # C2: same lock point, tighter trailing distance → stops closer, smaller
+    #     wins but less retracement to exit → lower MaxDD expected.
+    "C2": {
+        "label":               "Arm C2 — lock +0.5R at 2R, trail 0.8R after 3R",
+        "TRAIL_ACTIVATE_R":    2.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 0.8,
+        "STALL_EXIT_BARS":     None,
+        "STALL_EXIT_MFE_R":    None,
+    },
+    # C3: same as C + stall exit — if MFE hasn't reached 0.5R after 5 bars,
+    #     close at market to free capital for better setups.
+    "C3": {
+        "label":               "Arm C3 — lock +0.5R at 2R, trail 1.0R + stall-exit 5b/0.5R",
+        "TRAIL_ACTIVATE_R":    2.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 1.0,
+        "STALL_EXIT_BARS":     5,      # bars after entry to check
+        "STALL_EXIT_MFE_R":    0.5,    # if MFE < 0.5R at that point → close
     },
 }
 _DEFAULT_ARM = "A"   # used when trail_cfg=None
@@ -1164,6 +1200,60 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             pos["mfe_r"] = max(pos.get("mfe_r", 0.0), _fav)
             pos["mae_r"] = min(pos.get("mae_r", 0.0), -abs(_adv))
 
+            # ── Stall exit (Arm C3) ───────────────────────────────────
+            # If trail config specifies STALL_EXIT_BARS, check at exactly that
+            # bar-count whether MFE has reached the minimum threshold.
+            # Purpose: free capital from stagnant trades early.
+            _stall_bars = _tcfg.get("STALL_EXIT_BARS")
+            if _stall_bars and bars_held == _stall_bars:
+                _stall_mfe_r   = _tcfg.get("STALL_EXIT_MFE_R", 0.5)
+                _cur_mfe       = pos.get("mfe_r", 0.0)
+                if _cur_mfe < _stall_mfe_r and not pos.get("trail_locked"):
+                    exit_p      = close
+                    delta       = (exit_p - entry) if direction == "long" else (entry - exit_p)
+                    spread_cost = _spread_deduction(pair, units)
+                    pnl         = delta * units - spread_cost
+                    balance    += pnl
+                    peak_balance = max(peak_balance, balance)
+                    risk_r = (pnl / pos.get("entry_risk_dollars", 1)
+                              if pos.get("entry_risk_dollars") else
+                              delta / risk_dist if risk_dist else 0)
+                    if risk_r < -0.10:
+                        consecutive_losses += 1
+                    else:
+                        consecutive_losses = 0
+                    trades.append({
+                        "pair": pair, "direction": direction,
+                        "entry": entry, "exit": exit_p,
+                        "pnl": pnl, "r": risk_r, "reason": "stall_exit",
+                        "spread_cost": round(spread_cost, 2),
+                        "entry_ts": pos["entry_ts"].isoformat(),
+                        "exit_ts": ts_utc.isoformat(),
+                        "bars_held": bars_held,
+                        "pattern": pos.get("pattern", "?"),
+                        "notes": pos.get("notes", ""),
+                        "macro_theme": pos.get("macro_theme"),
+                        "signal_type":  pos.get("signal_type", "unknown"),
+                        "planned_rr":   pos.get("planned_rr", 0.0),
+                        "stop_type":    pos.get("stop_type", "unknown"),
+                        "initial_stop_pips": pos.get("initial_stop_pips", 0),
+                        "mfe_r": _cur_mfe, "mae_r": pos.get("mae_r", 0.0),
+                        "dd_flag": pos.get("dd_flag", ""),
+                        "streak_at_entry":    pos.get("streak_at_entry", 0),
+                        "entry_equity":       pos.get("entry_equity", 0),
+                        "final_risk_pct":     pos.get("final_risk_pct", 0),
+                        "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
+                        "target_1": pos.get("target_price"),
+                        "regime_score_at_entry": pos.get("regime_score", 0.0),
+                    })
+                    print(f"  ⏹ {ts_utc.strftime('%Y-%m-%d')} "
+                          f"| STALL {pair} {direction.upper()} "
+                          f"@ {exit_p:.5f}  {'+' if risk_r>=0 else ''}{risk_r:.1f}R  "
+                          f"(MFE={_cur_mfe:.2f}R < {_stall_mfe_r}R at bar {_stall_bars})")
+                    strategies[pair].close_position(pair, exit_p)
+                    del open_pos[pair]
+                    continue
+
             # Stop hit?
             stopped = (direction == "long"  and low  <= stop) or \
                       (direction == "short" and high >= stop)
@@ -1829,7 +1919,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         print("    (no trades — all entries blocked by active gates)")
     print(f"\n  ── Exit reason counts ────────────────────────────────────")
     _reason_order = ["target_reached", "weekend_proximity",
-                     "ratchet_stop_hit", "stop_hit", "max_hold", "runout_expired"]
+                     "ratchet_stop_hit", "stop_hit", "stall_exit", "max_hold", "runout_expired"]
     _all_reasons  = set(_exit_counts.keys())
     _sorted_reasons = ([r for r in _reason_order if r in _all_reasons] +
                        sorted(_all_reasons - set(_reason_order)))
