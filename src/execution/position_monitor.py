@@ -131,7 +131,11 @@ class PositionMonitor:
                         from .account_state import AccountMode
                         if self.account.mode == AccountMode.LIVE_PAPER:
                             # Paper mode: apply PnL to simulated equity
-                            self.account.apply_pnl(realized_pnl)
+                            self.account.apply_pnl(
+                                realized_pnl,
+                                pair=pair,
+                                exit_reason="stop_hit",
+                            )
                             balance_after = self.account.safe_equity()
                         else:
                             # LIVE_REAL: fetch actual broker balance

@@ -971,6 +971,15 @@ class ForexOrchestrator:
             result = self.executor.execute(decision, self.account_balance)
 
             if result.get("status") in ("filled", "pending", "dry_run"):
+                # ── Paper journal: log entry event ──────────────────────────
+                if self.account.mode == AccountMode.LIVE_PAPER:
+                    self.account.log_entry_event(
+                        pair        = pair,
+                        direction   = decision.direction or "?",
+                        entry_price = decision.entry_price or 0,
+                        stop_loss   = decision.stop_price  or 0,
+                        risk_dollars= result.get("risk_amount", 0),
+                    )
                 # Send trade notification — extra detail if overnight
                 self.notifier.send_trade_entry(
                     pair=pair,
