@@ -529,7 +529,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  policy_tag: str = "",
                  strict_protrend_htf: bool = False,
                  dynamic_pip_equity: bool = False,
-                 wd_protrend_htf: bool = False):
+                 wd_protrend_htf: bool = False,
+                 flat_risk_pct: Optional[float] = None):
     """Run a single backtest simulation.
 
     quiet=True suppresses all stdout (useful when called from compare scripts).
@@ -563,6 +564,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             strict_protrend_htf=strict_protrend_htf,
             dynamic_pip_equity=dynamic_pip_equity,
             wd_protrend_htf=wd_protrend_htf,
+            flat_risk_pct=flat_risk_pct,
         )
     finally:
         _sys.stdout = _orig_stdout
@@ -579,7 +581,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                        policy_tag: str = "",
                        strict_protrend_htf: bool = False,
                        dynamic_pip_equity: bool = False,
-                       wd_protrend_htf: bool = False):
+                       wd_protrend_htf: bool = False,
+                       flat_risk_pct: Optional[float] = None):
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     # Extend data fetch so open positions can run to natural close after the entry window.
     # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
@@ -818,15 +821,17 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _time_block_counts:     dict = {}  # {reason_code: count} — Sunday/Thu/Fri blocks
 
     def _risk_pct(bal):
-        """DD-aware risk: applies graduated caps when equity is below peak."""
-        pct, _dd_flag = risk.get_risk_pct_with_dd(
-            bal, peak_equity=peak_balance, consecutive_losses=consecutive_losses)
+        """DD-aware risk. When flat_risk_pct is set, overrides tiers (killswitch still applies)."""
+        pct, _dd_flag = _risk_pct_with_flag(bal)
         return pct
 
     def _risk_pct_with_flag(bal):
-        """Returns (pct, dd_flag) — use for per-trade diagnostics."""
-        return risk.get_risk_pct_with_dd(
+        """Returns (pct, dd_flag). flat_risk_pct overrides tier pct; killswitch wins."""
+        pct, dd_flag = risk.get_risk_pct_with_dd(
             bal, peak_equity=peak_balance, consecutive_losses=consecutive_losses)
+        if flat_risk_pct is not None and dd_flag != "DD_KILLSWITCH":
+            pct = flat_risk_pct   # grid test: flat rate, no tier ramp
+        return pct, dd_flag
 
     def _calc_units(pair, bal, rpct, entry, stop):
         pip    = 0.01 if "JPY" in pair else 0.0001
@@ -2221,7 +2226,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         # inside get_model_tags guarantees this).
         "model_tags":   _sc.get_model_tags(trail_arm=trail_arm_key or "?",
                                            pairs_hash=_pairs_hash)
-                        + ([f"policy={policy_tag}"] if policy_tag else []),
+                        + ([f"policy={policy_tag}"]       if policy_tag else [])
+                        + ([f"risk={flat_risk_pct:.0f}pct"] if flat_risk_pct else []),
         "trail_arm":    trail_arm_key or "?",
         "pairs":        _active_pairs,
         "pairs_hash":   _pairs_hash,

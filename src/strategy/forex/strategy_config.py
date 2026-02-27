@@ -63,7 +63,12 @@ MIN_RR: float = 2.5   # minimum exec R:R — select_target() rejects any candida
 # log their reason codes for funnel reporting.
 SMALL_ACCOUNT_THRESHOLD:  float = 25_000.0   # USD equity boundary
 MIN_RR_STANDARD:          float = 2.5        # pro-trend baseline (W+D+4H all agree)
-MIN_RR_COUNTERTREND:      float = 3.0        # non-protrend / mixed HTF alignment
+# ── PROD CONFIG LOCKED: Arm D (2026-02-26) ──────────────────────────────────
+# Dynamic 3.0R non-protrend gate removed — net negative in W1 (kills +5.80R
+# winner, doubles DD 13→30%). Both pro-trend and non-protrend use flat 2.5R.
+# select_target() already guarantees exec_rr ≥ MIN_RR before entry; this alias
+# being equal to MIN_RR makes check_dynamic_min_rr() a no-op gate (always pass).
+MIN_RR_COUNTERTREND:      float = MIN_RR     # Arm D: flat 2.5R — no protrend penalty
 MIN_RR_SMALL_ACCOUNT:     float = MIN_RR_COUNTERTREND  # legacy alias — kept for compat
 
 # Weekly punch-card behaviour — Alex: "pretend you only have 2 trades per month"
