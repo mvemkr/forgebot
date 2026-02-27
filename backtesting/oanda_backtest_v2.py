@@ -503,13 +503,17 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                    Auto-detected from trail_cfg if omitted.
     """
     import io, sys as _sys
-    # Auto-detect arm key from trail_cfg if not provided
+    # Resolve arm key ↔ trail_cfg (bidirectional)
     if not trail_arm_key and trail_cfg:
+        # Auto-detect key from explicit cfg dict
         for _k, _v in TRAIL_ARMS.items():
             if all(trail_cfg.get(f) == _v.get(f)
                    for f in ("TRAIL_ACTIVATE_R", "TRAIL_LOCK_R", "TRAIL_STAGE2_R")):
                 trail_arm_key = _k
                 break
+    if trail_arm_key in TRAIL_ARMS and not trail_cfg:
+        # Resolve cfg from key so callers can pass just trail_arm_key="C"
+        trail_cfg = TRAIL_ARMS[trail_arm_key]
     _orig_stdout = _sys.stdout
     if quiet:
         _sys.stdout = io.StringIO()
@@ -546,7 +550,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     RUNOUT_DAYS = 180
     runout_dt  = (end_dt + pd.Timedelta(days=RUNOUT_DAYS)).replace(tzinfo=timezone.utc) if end_dt else None
 
-    _tcfg  = trail_cfg or TRAIL_ARMS[_DEFAULT_ARM]
+    # Resolve trail config: explicit cfg > key lookup > default arm
+    _tcfg  = trail_cfg or (TRAIL_ARMS[trail_arm_key] if trail_arm_key in TRAIL_ARMS else TRAIL_ARMS[_DEFAULT_ARM])
     _tlabel = _tcfg.get("label", "")
 
     print(f"\n{'='*65}")
