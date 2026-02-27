@@ -1,82 +1,247 @@
 #!/usr/bin/env python3
 """
-W2 Diagnostic: Pro-Trend-Only vs Baseline
-==========================================
-Goal: Determine whether W2 (Oct 2025–Feb 2026) weakness is a market regime
-issue (expected — counter-trend setups just didn't materialise) or an engine/
-backtest bug (unexpected — something is broken in bias computation or alignment).
+W2 Diagnostic: Pro-Trend-Only vs Baseline  (strict parity enforced)
+====================================================================
+Runs two backtests on the W2 window (Oct 1 2025 – Feb 28 2026).
+The ONLY difference between Run 1 and Run 2 is PROTREND_ONLY.
 
-Runs TWO backtests on the same W2 window sharing cached candle data:
-  Run 1 — BASELINE       (PROTREND_ONLY = False, Alex's full style)
-  Run 2 — PROTREND_ONLY  (wd_protrend_htf=True, W+D must agree, 4H exempt)
-
-All other config is IDENTICAL: trail Arm C, hysteresis tiers, engulf_only,
-time rules ON, weekly cap ON, doji gate ON, concurrency=1.
-
-Interpretation:
-  If PROTREND_ONLY → fewer trades + higher AvgR + lower MaxDD + better return
-    → W2 weakness is a REGIME ISSUE — protrend gate is correct LOW-mode behaviour.
-  If PROTREND_ONLY → 0 trades or worse
-    → Investigate bias computation or timeframe alignment before applying gate.
+Hard constraints (aborts if violated):
+  • Same commit SHA
+  • Same pairs (hash 89a6ef)
+  • Same trail arm (must be C)
+  • Same MIN_RR (2.5)
+  • Same risk tiers, weekly cap, time rules, doji filter, concurrency
 
 Usage:
     cd ~/trading-bot
-    venv/bin/python backtesting/w2_protrend_diagnostic.py
+    venv/bin/python backtesting/w2_protrend_diagnostic.py          # arm C (default)
     venv/bin/python backtesting/w2_protrend_diagnostic.py --arm C
-    venv/bin/python backtesting/w2_protrend_diagnostic.py --quiet  # no per-trade noise
+    venv/bin/python backtesting/w2_protrend_diagnostic.py --quiet  # suppress per-bar noise
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
+import subprocess
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backtesting.oanda_backtest_v2 import run_backtest  # noqa: E402
+from backtesting.oanda_backtest_v2 import (  # noqa: E402
+    WATCHLIST,
+    _resample_weekly,
+    run_backtest,
+)
+from src.strategy.forex import strategy_config as _sc  # noqa: E402
+from src.strategy.forex.pattern_detector import PatternDetector  # noqa: E402
 
-# ── Window constants ──────────────────────────────────────────────────────────
+# ── Window ────────────────────────────────────────────────────────────────────
 W2_START = datetime(2025, 10, 1,  tzinfo=timezone.utc)
 W2_END   = datetime(2026, 2, 28,  tzinfo=timezone.utc)
 W2_WEEKS = (W2_END - W2_START).days / 7   # ≈ 21.3 weeks
 
-COL_W = 36   # width of each data column in comparison table
+# ── Required arm ─────────────────────────────────────────────────────────────
+REQUIRED_ARM = "C"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Parity snapshot + enforcement
+# =============================================================================
 
-def _capture_run(quiet: bool, **kwargs):
-    """
-    Run run_backtest(**kwargs).  Returns (stdout_text, result).
-    If quiet=True the per-bar noise is swallowed; the comparison table is always
-    printed by the script itself so nothing is lost.
-    """
-    old = sys.stdout
-    buf = io.StringIO()
-    if quiet:
-        sys.stdout = buf
+def _git_sha() -> str:
     try:
-        result = run_backtest(**kwargs)
-    finally:
-        sys.stdout = old
-    return buf.getvalue(), result
+        return subprocess.check_output(
+            ["git", "-C", str(Path(__file__).parent.parent),
+             "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
 
+
+def _pairs_hash(pairs: list[str]) -> str:
+    return hashlib.md5(",".join(sorted(pairs)).encode()).hexdigest()[:6]
+
+
+def _config_snapshot(arm: str, protrend_only: bool) -> dict:
+    """Capture every lever that must be identical between runs."""
+    m = _sc  # live module reference
+    return {
+        "sha":              _git_sha(),
+        "pairs":            sorted(WATCHLIST),
+        "pairs_hash":       _pairs_hash(WATCHLIST),
+        "arm":              arm,
+        "min_rr":           m.MIN_RR,
+        "min_rr_ct":        m.MIN_RR_COUNTERTREND,
+        "risk_tiers":       str(getattr(m, "RISK_TIERS", "n/a")),
+        "protrend_only":    protrend_only,               # ← intentionally varies
+        "concurrency_bt":   m.MAX_CONCURRENT_TRADES_BACKTEST,
+        "concurrency_live": m.MAX_CONCURRENT_TRADES_LIVE,
+        "trigger_mode":     m.ENTRY_TRIGGER_MODE,
+        "wk_cap_small":     m.MAX_TRADES_PER_WEEK_SMALL,
+        "wk_cap_std":       m.MAX_TRADES_PER_WEEK_STANDARD,
+        "no_sun":           m.NO_SUNDAY_TRADES_ENABLED,
+        "no_thu_fri":       m.NO_THU_FRI_TRADES_ENABLED,
+        "doji_gate":        m.INDECISION_FILTER_ENABLED,
+        "atr_stop_mult":    m.ATR_STOP_MULTIPLIER,
+        "atr_min_mult":     m.ATR_MIN_MULTIPLIER,
+        "spread_model":     m.SPREAD_MODEL_ENABLED,
+        "min_confidence":   m.MIN_CONFIDENCE,
+    }
+
+
+def _print_snapshot(snap: dict, label: str):
+    W = 64
+    print(f"┌─ Config snapshot: {label} {'─'*(W - len(label))}┐")
+    print(f"│  SHA            : {snap['sha']:<46}│")
+    print(f"│  Pairs hash     : {snap['pairs_hash']:<46}│")
+    print(f"│  Arm            : {snap['arm']:<46}│")
+    print(f"│  MIN_RR         : {snap['min_rr']:<46}│")
+    print(f"│  MIN_RR_CT      : {snap['min_rr_ct']:<46}│")
+    print(f"│  PROTREND_ONLY  : {str(snap['protrend_only']):<46}│")
+    print(f"│  Concurrency BT : {snap['concurrency_bt']:<46}│")
+    print(f"│  Trigger mode   : {snap['trigger_mode']:<46}│")
+    print(f"│  Wk cap (sm/std): {snap['wk_cap_small']}/{snap['wk_cap_std']:<44}│")
+    print(f"│  Time rules     : sun={snap['no_sun']}  thu_fri={snap['no_thu_fri']:<31}│")
+    print(f"│  Doji gate      : {snap['doji_gate']:<46}│")
+    print(f"│  Spread model   : {snap['spread_model']:<46}│")
+    print(f"│  Candle cache   : ON (preloaded on run 2)             {'':>10}│")
+    print(f"└{'─'*(W+2)}┘")
+
+
+def _check_parity(s1: dict, s2: dict) -> list[str]:
+    """Return list of unexpected differences (everything except protrend_only)."""
+    skip = {"protrend_only"}
+    diffs = []
+    for k in s1:
+        if k in skip:
+            continue
+        if s1[k] != s2[k]:
+            diffs.append(f"  {k}: run1={s1[k]!r}  run2={s2[k]!r}")
+    return diffs
+
+
+# =============================================================================
+# W==D calendar agreement
+# =============================================================================
+
+def _wd_calendar_agreement_pct(candle_data: dict, start_dt: datetime, end_dt: datetime) -> Optional[float]:
+    """
+    % of daily bars in [start_dt, end_dt] where weekly trend == daily trend.
+    Uses the first pair alphabetically as representative.
+    Trend detection mirrors set_and_forget.py: detect_trend(df_daily) for D,
+    detect_trend(df_weekly) for W — both use the real D/W DataFrames.
+    Returns None if candle data is unavailable.
+    """
+    rep_pair = sorted(candle_data.keys())[0]
+    pdata    = candle_data[rep_pair]
+    df_d_raw = pdata.get("d")
+    if df_d_raw is None or df_d_raw.empty:
+        return None
+
+    # Strip tz so comparisons work
+    start_naive = pd.Timestamp(start_dt).replace(tzinfo=None)
+    end_naive   = pd.Timestamp(end_dt).replace(tzinfo=None)
+
+    # Full daily history (we need past data to compute trend at each point)
+    df_d_full = df_d_raw.copy()
+
+    # Resample full daily history to weekly once
+    df_w_full = _resample_weekly(df_d_full)
+
+    detector = PatternDetector(rep_pair)
+
+    total = 0
+    agree = 0
+
+    # Walk daily bars inside the window
+    d_indices = df_d_full.index[(df_d_full.index >= start_naive) &
+                                 (df_d_full.index <  end_naive)]
+
+    for ts in d_indices:
+        i_d = df_d_full.index.get_loc(ts)
+        if i_d < 50:
+            continue  # need history for trend
+
+        # Daily trend: last 50 daily bars
+        d_slice = df_d_full.iloc[max(0, i_d - 50): i_d + 1]
+        # Weekly trend: last 26 weekly bars (≈ 6 months of weeks)
+        w_up_to = df_w_full[df_w_full.index <= ts]
+        if len(w_up_to) < 10:
+            continue
+        w_slice = w_up_to.iloc[-26:]
+
+        try:
+            d_trend = detector.detect_trend(d_slice)
+            w_trend = detector.detect_trend(w_slice)
+        except Exception:
+            continue
+
+        total += 1
+
+        # "Agree" = both directional and same direction
+        d_bull = d_trend.value in ("bullish", "strong_bullish")
+        d_bear = d_trend.value in ("bearish", "strong_bearish")
+        w_bull = w_trend.value in ("bullish", "strong_bullish")
+        w_bear = w_trend.value in ("bearish", "strong_bearish")
+
+        if (d_bull and w_bull) or (d_bear and w_bear):
+            agree += 1
+
+    return (agree / total * 100) if total else None
+
+
+# =============================================================================
+# Stats helpers
+# =============================================================================
 
 def _wls(trades):
-    """(wins, losses, scratches) from trade list.  Scratch = |r| <= 0.05R."""
     w = sum(1 for t in trades if t["r"] >  0.05)
     l = sum(1 for t in trades if t["r"] < -0.05)
     s = len(trades) - w - l
     return w, l, s
 
 
+def _r_pctiles(trades):
+    """Realized R p50/p75/p90 from closed trades (may include scratches)."""
+    rs = sorted(t["r"] for t in trades)
+    if not rs:
+        return None, None, None
+    n = len(rs)
+    p50 = rs[int(n * 0.50)]
+    p75 = rs[int(n * 0.75)]
+    p90 = rs[min(int(n * 0.90), n - 1)]
+    return p50, p75, p90
+
+
+def _planned_rr_pctiles(trades):
+    """Planned exec_rr p50/p75/p90 (what the bot thought RR was at entry)."""
+    rrs = sorted(t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0)
+    if not rrs:
+        return None, None, None
+    n = len(rrs)
+    p50 = rrs[int(n * 0.50)]
+    p75 = rrs[int(n * 0.75)]
+    p90 = rrs[min(int(n * 0.90), n - 1)]
+    return p50, p75, p90
+
+
+def _rr_min_blocks(gap_log) -> int:
+    return sum(
+        1 for g in gap_log
+        if g.get("gap_type", "") in ("MIN_RR_ALIGN", "exec_rr_min")
+    )
+
+
 def _entry_hour_hist(trades) -> dict:
-    """UTC entry hour → trade count, sorted."""
     counts: Counter = Counter()
     for t in trades:
         ts = t.get("entry_ts", "")
@@ -88,76 +253,75 @@ def _entry_hour_hist(trades) -> dict:
     return dict(sorted(counts.items()))
 
 
-def _rr_min_blocks(gap_log) -> int:
-    """Count entries blocked by the MIN_RR_ALIGN gate (exec_rr_min shortfall)."""
-    return sum(
-        1 for g in gap_log
-        if g.get("gap_type", "") in ("MIN_RR_ALIGN", "exec_rr_min")
-        or "exec_rr_min" in str(g.get("failed_filters", ""))
-    )
+# =============================================================================
+# Capture helper
+# =============================================================================
+
+def _capture_run(quiet: bool, **kwargs):
+    old = sys.stdout
+    buf = io.StringIO()
+    if quiet:
+        sys.stdout = buf
+    try:
+        result = run_backtest(**kwargs)
+    finally:
+        sys.stdout = old
+    return buf.getvalue(), result
 
 
-def _hist_str(hist: dict) -> str:
-    if not hist:
-        return "—"
-    return "  ".join(f"{h:02d}h:{c}" for h, c in sorted(hist.items()))
-
-
-def _stop_dist(stop_type_counts: dict) -> str:
-    if not stop_type_counts:
-        return "—"
-    total = sum(stop_type_counts.values())
-    parts = []
-    for k in ("structure", "neckline_retest_swing", "shoulder_anchor",
-              "retest_swing", "structural_anchor", "atr_fallback", "unknown"):
-        n = stop_type_counts.get(k, 0)
-        if n:
-            parts.append(f"{k}:{n} ({n/total*100:.0f}%)")
-    # catch-all for any unexpected keys
-    shown = set(("structure", "neckline_retest_swing", "shoulder_anchor",
-                 "retest_swing", "structural_anchor", "atr_fallback", "unknown"))
-    for k, n in stop_type_counts.items():
-        if k not in shown and n:
-            parts.append(f"{k}:{n} ({n/total*100:.0f}%)")
-    return "  ".join(parts) if parts else "—"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Table printer
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
-def _hdr(label: str, b_val: str, p_val: str):
-    print(f"  {'─'*28}  {'─'*COL_W}  {'─'*COL_W}")
-    print(f"  {label:<28}  {b_val:<{COL_W}}  {p_val}")
+COL = 30
 
-
-def _row(label: str, b_val, p_val, bold_diff: bool = False):
-    bv = str(b_val)
-    pv = str(p_val)
-    if bold_diff and bv != pv:
-        pv = f"► {pv}"   # highlight changes in right column
-    print(f"  {label:<28}  {bv:<{COL_W}}  {pv}")
+def _row(label: str, v1, v2, mark_diff: bool = True):
+    s1, s2 = str(v1), str(v2)
+    arrow = "►" if (mark_diff and s1 != s2) else " "
+    print(f"  {label:<32}  {s1:<{COL}}  {arrow} {s2}")
 
 
 def _sep():
-    print(f"  {'─'*28}  {'─'*COL_W}  {'─'*COL_W}")
+    print(f"  {'─'*32}  {'─'*COL}  {'─'*COL}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def _section(title: str):
+    _sep()
+    print(f"  {title}")
+
+
+# =============================================================================
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def run_diagnostic(arm: str = "C", quiet_runs: bool = False):
+
+    if arm != REQUIRED_ARM:
+        print(f"  ❌ ABORT: arm must be {REQUIRED_ARM}, got '{arm}'")
+        sys.exit(1)
+
     print(f"\n{'═'*72}")
-    print(f"  W2 PROTREND DIAGNOSTIC")
-    print(f"  Window : Oct 1 2025 → Feb 28 2026  ({W2_WEEKS:.1f} weeks)")
-    print(f"  Arm    : {arm}  |  Pairs: Alex 7 (89a6ef)  |  Trigger: engulf_only")
-    print(f"  Gate   : time=ON  weekly-cap=ON  doji=ON  concurrency=1")
+    print(f"  W2 PROTREND DIAGNOSTIC  (strict parity)")
+    print(f"  Window  : Oct 1 2025 → Feb 28 2026  ({W2_WEEKS:.1f} weeks)")
+    print(f"  Arm     : {arm}  |  Required: {REQUIRED_ARM}")
+    print(f"  Pairs   : Alex 7  |  Trigger: engulf_only")
+    print(f"  Candle  : shared between runs (0 extra API calls on run 2)")
     print(f"{'═'*72}\n")
+
+    # ── Snapshot BEFORE each run ──────────────────────────────────────────────
+    snap1 = _config_snapshot(arm=arm, protrend_only=False)
+    print("  [Pre-run 1 config snapshot]")
+    _print_snapshot(snap1, "RUN 1 — BASELINE")
+    print()
+
+    # ── Arm must be C ─────────────────────────────────────────────────────────
+    if snap1["arm"] != REQUIRED_ARM:
+        print(f"  ❌ ABORT: arm is '{snap1['arm']}', must be '{REQUIRED_ARM}'")
+        sys.exit(1)
 
     # ── RUN 1: Baseline ───────────────────────────────────────────────────────
     print(f"{'━'*72}")
-    print(f"  RUN 1 — BASELINE  (PROTREND_ONLY = False, Alex full style)")
+    print(f"  RUN 1 — BASELINE  (PROTREND_ONLY = False)")
     print(f"{'━'*72}\n")
     out1, r1 = _capture_run(
         quiet=quiet_runs,
@@ -166,17 +330,31 @@ def run_diagnostic(arm: str = "C", quiet_runs: bool = False):
         trail_arm_key=arm,
         use_cache=True,
         wd_protrend_htf=False,
-        notes="W2-diagnostic-baseline",
+        notes=f"W2-diag-baseline-arm{arm}",
     )
     if quiet_runs:
-        print(out1)   # replay captured output
-
+        print(out1)
     if r1 is None:
-        print("  ❌ Run 1 failed — cannot continue.")
-        return None, None
+        print("  ❌ Run 1 failed — aborting.")
+        sys.exit(1)
 
-    # ── RUN 2: Protrend-only  (share candle data — no extra API calls) ────────
-    print(f"\n{'━'*72}")
+    # ── Snapshot BEFORE run 2 ─────────────────────────────────────────────────
+    snap2 = _config_snapshot(arm=arm, protrend_only=True)
+    print("\n  [Pre-run 2 config snapshot]")
+    _print_snapshot(snap2, "RUN 2 — PROTREND_ONLY")
+    print()
+
+    # ── PARITY CHECK ─────────────────────────────────────────────────────────
+    diffs = _check_parity(snap1, snap2)
+    if diffs:
+        print(f"  ❌ PARITY VIOLATION — config drifted between runs (aborting):")
+        for d in diffs:
+            print(d)
+        sys.exit(1)
+    print(f"  ✅ Parity OK — only PROTREND_ONLY differs between runs\n")
+
+    # ── RUN 2: Protrend-only (shared candles) ─────────────────────────────────
+    print(f"{'━'*72}")
     print(f"  RUN 2 — PROTREND_ONLY  (W+D must agree, 4H exempt)")
     print(f"{'━'*72}\n")
     out2, r2 = _capture_run(
@@ -186,150 +364,171 @@ def run_diagnostic(arm: str = "C", quiet_runs: bool = False):
         trail_arm_key=arm,
         use_cache=True,
         wd_protrend_htf=True,
-        preloaded_candle_data=r1.candle_data,   # ← shared, 0 extra API calls
-        notes="W2-diagnostic-protrend-only",
+        preloaded_candle_data=r1.candle_data,
+        notes=f"W2-diag-protrend-arm{arm}",
     )
     if quiet_runs:
         print(out2)
-
     if r2 is None:
-        print("  ❌ Run 2 failed — cannot continue.")
-        return r1, None
+        print("  ❌ Run 2 failed — aborting.")
+        sys.exit(1)
 
     # ── Derived stats ─────────────────────────────────────────────────────────
-    w1, l1, s1 = _wls(r1.trades)
-    w2, l2, s2 = _wls(r2.trades)
-    h1 = _entry_hour_hist(r1.trades)
-    h2 = _entry_hour_hist(r2.trades)
+    w1, l1, s1_ = _wls(r1.trades)
+    w2, l2, s2_ = _wls(r2.trades)
+
+    rp50_1, rp75_1, rp90_1 = _r_pctiles(r1.trades)
+    rp50_2, rp75_2, rp90_2 = _r_pctiles(r2.trades)
+
+    pp50_1, pp75_1, pp90_1 = _planned_rr_pctiles(r1.trades)
+    pp50_2, pp75_2, pp90_2 = _planned_rr_pctiles(r2.trades)
+
     rr1 = _rr_min_blocks(r1.gap_log)
     rr2 = _rr_min_blocks(r2.gap_log)
 
-    trades_pw1 = r1.n_trades / W2_WEEKS if W2_WEEKS else 0
-    trades_pw2 = r2.n_trades / W2_WEEKS if W2_WEEKS else 0
+    h1 = _entry_hour_hist(r1.trades)
+    h2 = _entry_hour_hist(r2.trades)
+
+    def _fmt_pct(v):
+        return f"{v:.0f}%" if v is not None else "—"
+
+    def _fmt_r(v):
+        return f"{v:+.2f}R" if v is not None else "—"
+
+    # ── WD calendar agreement ─────────────────────────────────────────────────
+    print(f"\n  [Computing WD calendar agreement from candle data — may take ~10s]")
+    wd_cal_pct = _wd_calendar_agreement_pct(r1.candle_data, W2_START, W2_END)
 
     # ── COMPARISON TABLE ──────────────────────────────────────────────────────
     print(f"\n{'═'*72}")
-    print(f"  COMPARISON TABLE — W2 Oct 2025 → Feb 2026")
+    print(f"  REQUIRED METRICS TABLE — W2 Oct 2025 → Feb 2026")
+    print(f"  Commit: {snap1['sha']}  |  Pairs: {snap1['pairs_hash']}  |  Arm: {arm}")
+    print(f"  MIN_RR: {snap1['min_rr']}  |  Concurrency: {snap1['concurrency_bt']}  |  Risk tiers: hysteresis")
     print(f"{'═'*72}")
-    print(f"  {'Metric':<28}  {'BASELINE (protrend=OFF)':<{COL_W}}  PROTREND_ONLY (W+D gate)")
+    _sep()
+    print(f"  {'Metric':<32}  {'BASELINE (protrend=OFF)':<{COL}}    PROTREND_ONLY (W+D gate)")
     _sep()
 
-    # Performance
-    _hdr("── Performance", "", "")
-    _row("Trades",            r1.n_trades,                  r2.n_trades,          bold_diff=True)
-    _row("W / L / S",         f"{w1}W / {l1}L / {s1}S",   f"{w2}W / {l2}L / {s2}S", bold_diff=True)
-    _row("Win rate",           f"{r1.win_rate*100:.0f}%",   f"{r2.win_rate*100:.0f}%", bold_diff=True)
-    _row("Avg R",              f"{r1.avg_r:+.2f}R",         f"{r2.avg_r:+.2f}R",  bold_diff=True)
-    _row("Best R",             f"{r1.best_r:+.2f}R",        f"{r2.best_r:+.2f}R", bold_diff=True)
-    _row("Worst R",            f"{r1.worst_r:+.2f}R",       f"{r2.worst_r:+.2f}R",bold_diff=True)
-    _row("Max DD",             f"{r1.max_dd_pct:.1f}%",     f"{r2.max_dd_pct:.1f}%", bold_diff=True)
-    _row("Return %",           f"{r1.return_pct:+.1f}%",    f"{r2.return_pct:+.1f}%", bold_diff=True)
-    _row("Trades / week",      f"{trades_pw1:.2f}",          f"{trades_pw2:.2f}",  bold_diff=True)
-    _row("WD alignment %",     f"{r1.wd_alignment_pct:.0f}%",f"{r2.wd_alignment_pct:.0f}%")
+    _section("── Core performance")
+    _row("Mode",         "PROTREND_ONLY=False",     "PROTREND_ONLY=True")
+    _row("Trades",       r1.n_trades,               r2.n_trades)
+    _row("W / L / S",    f"{w1}W/{l1}L/{s1_}S",    f"{w2}W/{l2}L/{s2_}S")
+    _row("AvgR",         _fmt_r(r1.avg_r),          _fmt_r(r2.avg_r))
+    _row("BestR",        _fmt_r(r1.best_r),         _fmt_r(r2.best_r))
+    _row("WorstR",       _fmt_r(r1.worst_r),        _fmt_r(r2.worst_r))
+    _row("MaxDD",        f"{r1.max_dd_pct:.1f}%",   f"{r2.max_dd_pct:.1f}%")
+    _row("Return%",      f"{r1.return_pct:+.1f}%",  f"{r2.return_pct:+.1f}%")
+    _row("Trades/week",  f"{r1.n_trades/W2_WEEKS:.2f}", f"{r2.n_trades/W2_WEEKS:.2f}")
 
-    # Stop quality
-    _hdr("── Stop distribution", "", "")
-    _row("atr_fallback %",     f"{r1.atr_fallback_pct:.0f}%", f"{r2.atr_fallback_pct:.0f}%", bold_diff=True)
-    _row("Stop pips p50",      f"{r1.stop_pips_p50:.0f}p",  f"{r2.stop_pips_p50:.0f}p")
-    for stype in ("structure", "neckline_retest_swing", "shoulder_anchor",
-                  "retest_swing", "structural_anchor", "atr_fallback", "unknown"):
-        n1 = r1.stop_type_counts.get(stype, 0)
-        n2 = r2.stop_type_counts.get(stype, 0)
-        if n1 or n2:
-            _row(f"  {stype[:26]}", n1, n2, bold_diff=True)
+    _section("── Gate counters")
+    _row("wd_htf_blocks",       r1.wd_htf_blocks,           r2.wd_htf_blocks)
+    _row("time_blocks",         r1.time_blocks,              r2.time_blocks)
+    _row("weekly_cap_blocks",   r1.weekly_limit_blocks,      r2.weekly_limit_blocks)
+    _row("rr_min_blocks",       rr1,                         rr2)
 
-    # Gate counters
-    _hdr("── Gate counters", "", "")
-    _row("WD_HTF blocks",      r1.wd_htf_blocks,     r2.wd_htf_blocks,     bold_diff=True)
-    _row("Time blocks",        r1.time_blocks,        r2.time_blocks)
-    _row("Weekly cap blocks",  r1.weekly_limit_blocks,r2.weekly_limit_blocks)
-    _row("RR_min blocks",      rr1,                   rr2,                  bold_diff=True)
-    _row("Countertrend blocks",r1.countertrend_htf_blocks, r2.countertrend_htf_blocks, bold_diff=True)
+    _section("── Additional diagnostics")
+    _row("% entered trades W==D",
+         _fmt_pct(r1.wd_alignment_pct),
+         _fmt_pct(r2.wd_alignment_pct))
+    _row("% calendar time W==D (D bars)",
+         _fmt_pct(wd_cal_pct),
+         "(same window — shared)")
+    _row("atr_fallback %",
+         _fmt_pct(r1.atr_fallback_pct),
+         _fmt_pct(r2.atr_fallback_pct))
+    _row("Stop pips p50",
+         f"{r1.stop_pips_p50:.0f}p",
+         f"{r2.stop_pips_p50:.0f}p" if r2.trades else "—")
 
-    # Entry hour histogram
+    _section("── Realized R distribution (closed trades)")
+    _row("R p50",  _fmt_r(rp50_1),  _fmt_r(rp50_2))
+    _row("R p75",  _fmt_r(rp75_1),  _fmt_r(rp75_2))
+    _row("R p90",  _fmt_r(rp90_1),  _fmt_r(rp90_2))
+
+    _section("── Planned exec RR distribution (at entry)")
+    _row("Planned RR p50",  f"{pp50_1:.2f}R" if pp50_1 else "—",  f"{pp50_2:.2f}R" if pp50_2 else "—")
+    _row("Planned RR p75",  f"{pp75_1:.2f}R" if pp75_1 else "—",  f"{pp75_2:.2f}R" if pp75_2 else "—")
+    _row("Planned RR p90",  f"{pp90_1:.2f}R" if pp90_1 else "—",  f"{pp90_2:.2f}R" if pp90_2 else "—")
+
+    _section("── Entry hour distribution (UTC)")
+    print(f"  {'BASELINE':<32}  {' '.join(f'{h:02d}h:{c}' for h,c in h1.items()) or '—'}")
+    print(f"  {'PROTREND':<32}  {' '.join(f'{h:02d}h:{c}' for h,c in h2.items()) or '—'}")
     _sep()
-    print(f"  {'Entry hour (UTC)':<28}  {_hist_str(h1)}")
-    print(f"  {'':28}  {'PROTREND ↓':}")
-    print(f"  {'':28}  {_hist_str(h2)}")
 
     # ── INTERPRETATION ────────────────────────────────────────────────────────
-    _sep()
-    print(f"\n  INTERPRETATION")
-    print(f"  {'─'*68}")
+    print(f"\n{'═'*72}")
+    print(f"  INTERPRETATION")
+    print(f"{'═'*72}")
 
-    criteria = {
-        "fewer_trades":  r2.n_trades < r1.n_trades,
-        "higher_avg_r":  r2.avg_r    > r1.avg_r,
-        "lower_max_dd":  r2.max_dd_pct < r1.max_dd_pct,
-        "better_return": r2.return_pct > r1.return_pct,
-    }
-    labels = {
-        "fewer_trades":  f"Fewer trades ({r1.n_trades} → {r2.n_trades})",
-        "higher_avg_r":  f"Higher AvgR ({r1.avg_r:+.2f} → {r2.avg_r:+.2f})",
-        "lower_max_dd":  f"Lower MaxDD ({r1.max_dd_pct:.1f}% → {r2.max_dd_pct:.1f}%)",
-        "better_return": f"Better return ({r1.return_pct:+.1f}% → {r2.return_pct:+.1f}%)",
-    }
-    for key, passed in criteria.items():
+    n_ok = 0
+    checks = [
+        ("fewer_trades",  r2.n_trades < r1.n_trades,
+         f"Fewer trades: {r1.n_trades} → {r2.n_trades}"),
+        ("higher_avg_r",  r2.avg_r > r1.avg_r,
+         f"AvgR: {r1.avg_r:+.2f} → {r2.avg_r:+.2f}"),
+        ("lower_max_dd",  r2.max_dd_pct < r1.max_dd_pct,
+         f"MaxDD: {r1.max_dd_pct:.1f}% → {r2.max_dd_pct:.1f}%"),
+        ("better_return", r2.return_pct > r1.return_pct,
+         f"Return: {r1.return_pct:+.1f}% → {r2.return_pct:+.1f}%"),
+    ]
+    for _, passed, desc in checks:
         mark = "✅" if passed else "❌"
-        print(f"  {mark} {labels[key]}")
+        print(f"  {mark} {desc}")
+        if passed:
+            n_ok += 1
 
-    passing = sum(criteria.values())
     print()
-
     if r2.n_trades == 0:
-        verdict = (
-            "⛔ PROTREND_ONLY produced 0 trades.\n"
-            "     Bias computation is likely broken or trend data missing for 2025–2026.\n"
-            "     Investigate PatternDetector.detect_trend() on H4/D/W for this window\n"
-            "     before applying any gate."
-        )
-    elif passing >= 3:
-        verdict = (
-            f"✅ VERDICT ({passing}/4 criteria met): W2 weakness is a REGIME ISSUE.\n"
-            f"     Pro-trend-only is the correct LOW-mode entry gate — apply it.\n"
-            f"     Counter-trend setups in W2 lacked edge; restricting to W+D aligned\n"
-            f"     trades reduces noise and improves quality."
-        )
-    elif passing == 2:
-        verdict = (
-            f"⚠️  AMBIGUOUS ({passing}/4 criteria met): mixed signal.\n"
-            f"     Possible partial regime + partial bug.\n"
-            f"     Inspect per-trade breakdown for W2 counter-trend losses before deciding."
-        )
+        print("  ⛔ 0 trades in protrend run — bias computation broken or data missing.")
+        print("     Investigate PatternDetector.detect_trend() for W2 daily/weekly data.")
+    elif n_ok >= 3:
+        print(f"  ✅ VERDICT ({n_ok}/4): W2 weakness is a REGIME ISSUE.")
+        print("     Pro-trend-only is the correct LOW-mode entry gate.")
+    elif n_ok == 2:
+        print(f"  ⚠️  AMBIGUOUS ({n_ok}/4): inspect per-trade breakdown before deciding.")
+        if wd_cal_pct is not None:
+            if wd_cal_pct < 40:
+                print(f"     Calendar W==D = {wd_cal_pct:.0f}% — market was genuinely mixed → regime likely.")
+            else:
+                print(f"     Calendar W==D = {wd_cal_pct:.0f}% — market mostly aligned → possible bias bug.")
     else:
-        verdict = (
-            f"❌ VERDICT ({passing}/4 criteria met): likely ENGINE/BACKTEST BUG.\n"
-            f"     W+D gate made things worse — the bias signal may be inverted or\n"
-            f"     timeframe alignment is off for the 2025–2026 data.\n"
-            f"     Do NOT apply PROTREND_ONLY until alignment code is audited."
-        )
+        print(f"  ❌ VERDICT ({n_ok}/4): likely ENGINE BUG — gate made things worse.")
+        print("     Audit trend detection for 2025–2026 before applying gate.")
 
-    for line in verdict.split("\n"):
-        print(f"  {line}")
+    if wd_cal_pct is not None:
+        print(f"\n  WD calendar insight: W and D trend agreed on {wd_cal_pct:.0f}% of daily bars.")
+        if wd_cal_pct < 35:
+            print("  → Market spent most of W2 in MIXED/COUNTER-TREND regime.")
+            print("    Only 17% of bot entries were W+D aligned — consistent with this.")
+            print("    PROTREND_ONLY doesn't help here: too few aligned setups existed.")
+        elif wd_cal_pct >= 55:
+            print("  → Market had MOSTLY ALIGNED W+D conditions in W2.")
+            print("    17% WD alignment at entry may indicate a bias detection bug.")
+        else:
+            print("  → Market had MIXED conditions in W2 — genuine regime uncertainty.")
 
-    print(f"\n{'═'*72}\n")
+    print(f"\n{'═'*72}")
+    print("  STOP — do not implement any change until results are interpreted.\n")
+
     return r1, r2
 
 
+# =============================================================================
+# Entry point
+# =============================================================================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="W2 Pro-Trend-Only vs Baseline Diagnostic",
+        description="W2 Pro-Trend Diagnostic (strict parity enforced)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
     )
     parser.add_argument(
-        "--arm", default="C",
-        help="Trail arm A|B|C (default: C — production Arm C)",
+        "--arm", default=REQUIRED_ARM,
+        help=f"Trail arm (must be {REQUIRED_ARM})",
     )
     parser.add_argument(
         "--quiet", action="store_true", default=False,
-        help="Suppress verbose per-trade output from each run "
-             "(comparison table always printed)",
+        help="Suppress per-bar backtest output (comparison table always printed)",
     )
     args = parser.parse_args()
-
-    _arm = args.arm.strip().upper()
-    if _arm not in ("A", "B", "C"):
-        parser.error(f"--arm must be A, B, or C — got '{args.arm}'")
-
-    run_diagnostic(arm=_arm, quiet_runs=args.quiet)
+    run_diagnostic(arm=args.arm.strip().upper(), quiet_runs=args.quiet)
