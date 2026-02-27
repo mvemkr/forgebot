@@ -74,6 +74,22 @@ class ForexRiskManager:
         (float("inf"),   25.0),
     ]
 
+    # Tier hysteresis bands — prevent boundary thrash when equity oscillates
+    # near a tier crossing (e.g. $8K start crosses $8K on first win → 15% tier
+    # → next loss now 15% instead of 6% → inflated DD and return volatility).
+    #
+    # Format: one tuple per inter-tier boundary, same order as RISK_TIERS gaps:
+    #   (promote_above, demote_below)
+    #   promote: equity must reach this to move UP to the next tier
+    #   demote:  equity must fall below this to move DOWN to the prior tier
+    #
+    # Boundaries: $8K, $15K, $30K
+    TIER_BANDS = [
+        (9_500,   7_500),    # 6% ↔ 15%:  promote ≥$9.5K, demote <$7.5K
+        (16_500,  13_500),   # 15% ↔ 20%: promote ≥$16.5K, demote <$13.5K
+        (33_000,  27_000),   # 20% ↔ 25%: promote ≥$33K,   demote <$27K
+    ]
+
     # Kill switch: 40% drawdown from 7-day rolling peak triggers regroup
     DRAWDOWN_THRESHOLD_PCT = 40.0
     DRAWDOWN_WINDOW_DAYS   = 7
@@ -99,6 +115,7 @@ class ForexRiskManager:
         self._regroup_ends: Optional[datetime] = None
         self._paused_at: Optional[datetime] = None
         self._peak_balance: float = 0.0
+        self._tier_idx: int = -1           # -1 = unset; initialised on first get_risk_pct call
 
         if not backtest:
             KILL_SWITCH_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -131,12 +148,56 @@ class ForexRiskManager:
     # ── Risk Scaling ───────────────────────────────────────────────────
 
     def get_risk_pct(self, account_balance: float) -> float:
-        """Base tier risk — no drawdown adjustment. Use get_risk_pct_with_dd for live trading."""
-        for max_bal, risk_pct in self.RISK_TIERS:
-            if account_balance < max_bal:
-                logger.debug(f"Risk tier: {risk_pct}% (balance ${account_balance:,.0f})")
-                return risk_pct
-        return 25.0  # fallback
+        """
+        Base tier risk with hysteresis — no drawdown adjustment.
+        Use get_risk_pct_with_dd for live trading.
+
+        Hysteresis prevents boundary thrash: once in a tier, equity must cross
+        TIER_BANDS promote/demote thresholds (not the raw RISK_TIERS boundary)
+        before the tier changes.  On first call, tier is set from raw RISK_TIERS
+        with no hysteresis (cold-start bootstrap).
+        """
+        tiers = self.RISK_TIERS
+        bands = self.TIER_BANDS
+        n     = len(tiers)
+
+        # Cold-start: initialise using promote thresholds so a $8K account
+        # starts at tier 0 (6%), not tier 1 (15%).  Without this, raw "<"
+        # comparison puts $8K exactly in the 15% tier (8K < 8K = False).
+        if self._tier_idx < 0:
+            self._tier_idx = 0
+            for i, (promote_above, _) in enumerate(bands):
+                if account_balance >= promote_above:
+                    self._tier_idx = i + 1
+                else:
+                    break
+
+        idx = self._tier_idx
+
+        # Try to promote (move to a higher-risk tier)
+        while idx < n - 1:
+            promote_above, _ = bands[idx]
+            if account_balance >= promote_above:
+                idx += 1
+            else:
+                break
+
+        # Try to demote (move to a lower-risk tier)
+        while idx > 0:
+            _, demote_below = bands[idx - 1]
+            if account_balance < demote_below:
+                idx -= 1
+            else:
+                break
+
+        self._tier_idx = idx
+        _, risk_pct = tiers[idx]
+        logger.debug(
+            f"Risk tier {idx} ({risk_pct}%) — balance ${account_balance:,.0f}  "
+            f"[hysteresis bands: {bands[idx-1] if idx > 0 else 'n/a'} / "
+            f"{bands[idx] if idx < len(bands) else 'n/a'}]"
+        )
+        return risk_pct
 
     def get_risk_pct_with_dd(
         self,
