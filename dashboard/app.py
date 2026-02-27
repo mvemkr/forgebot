@@ -354,10 +354,12 @@ def api_status():
         "broker_fetch_failures":        bot_stats.get("account_broker_fetch_failures", 0),
     })
 
+_SENTINEL = object()   # used as default sentinel in _write_control_state
+
 def _load_control_state() -> dict:
     """Read runtime_state/control.json; return safe default if missing/corrupt."""
-    default = {"pause_new_entries": False, "last_updated": None,
-               "updated_by": "system", "reason": ""}
+    default = {"pause_new_entries": False, "risk_mode": None,
+               "last_updated": None, "updated_by": "system", "reason": ""}
     if not RUNTIME_CONTROL_FILE.exists():
         return default
     try:
@@ -366,11 +368,23 @@ def _load_control_state() -> dict:
         return default
 
 
-def _write_control_state(pause: bool, reason: str, updated_by: str = "dashboard") -> dict:
-    """Write runtime_state/control.json atomically; return new state."""
+def _write_control_state(pause: bool, reason: str, updated_by: str = "dashboard",
+                          risk_mode: str | None = _SENTINEL) -> dict:
+    """Write runtime_state/control.json atomically; return new state.
+    risk_mode=_SENTINEL (default) preserves existing risk_mode from disk.
+    risk_mode=None clears the pin (AUTO).  risk_mode="HIGH" pins the mode.
+    """
     import os, tempfile
+    # Preserve existing risk_mode unless explicitly passed
+    existing = _load_control_state()
+    if risk_mode is _SENTINEL:
+        risk_mode = existing.get("risk_mode")   # type: ignore[assignment]
+    _VALID_RISK_MODES = {"LOW", "MEDIUM", "HIGH", "EXTREME"}
+    if risk_mode not in _VALID_RISK_MODES:
+        risk_mode = None
     state = {
         "pause_new_entries": pause,
+        "risk_mode":         risk_mode,
         "last_updated":      datetime.now(timezone.utc).isoformat(),
         "updated_by":        updated_by,
         "reason":            reason,
@@ -467,17 +481,64 @@ def api_resume_entries():
 def api_control_state():
     """Return current persistent control state (pause_new_entries, risk_mode, etc.)."""
     ctrl = _load_control_state()
-    # Merge in risk_mode from bot_state if available
+    # Merge in live risk_mode data from bot_state
     try:
         bot_state = load_bot_state()
         bot_stats = bot_state.get("stats", {})
-        ctrl["risk_mode"]          = bot_stats.get("risk_mode")
-        ctrl["risk_mode_mult"]     = bot_stats.get("risk_mode_mult")
-        ctrl["regime_weekly_caps"] = bot_stats.get("regime_weekly_caps")
-        ctrl["regime_score"]       = bot_stats.get("regime_score")
+        ctrl["risk_mode_effective"] = bot_stats.get("risk_mode")
+        ctrl["risk_mode_source"]    = bot_stats.get("risk_mode_source", "AUTO")
+        ctrl["risk_mode_mult"]      = bot_stats.get("risk_mode_mult")
+        ctrl["effective_risk_pct"]  = bot_stats.get("effective_risk_pct")
+        ctrl["regime_weekly_caps"]  = bot_stats.get("regime_weekly_caps")
+        ctrl["regime_score"]        = bot_stats.get("regime_score")
     except Exception:
         pass
     return jsonify(ctrl)
+
+
+@app.route("/api/set_risk_mode", methods=["POST"])
+def api_set_risk_mode():
+    """
+    Pin or clear the risk mode.
+
+    Body: {"mode": "LOW"|"MEDIUM"|"HIGH"|"EXTREME"|null}
+      null / missing → clear pin → AUTO (dynamic computation)
+
+    The orchestrator reads control.json on every cycle and calls
+    risk.set_regime_mode() with the pinned value (or dynamic value if null).
+    """
+    _VALID = {"LOW", "MEDIUM", "HIGH", "EXTREME"}
+    data   = request.get_json() or {}
+    mode   = data.get("mode")   # None = clear pin
+
+    if mode is not None and mode not in _VALID:
+        return jsonify({
+            "status": "error",
+            "error":  f"Invalid mode {mode!r}. Valid: {sorted(_VALID)} or null for AUTO"
+        }), 400
+
+    try:
+        existing = _load_control_state()
+        import os, tempfile
+        state = {
+            "pause_new_entries": existing.get("pause_new_entries", False),
+            "risk_mode":         mode,   # None clears pin
+            "last_updated":      datetime.now(timezone.utc).isoformat(),
+            "updated_by":        "dashboard",
+            "reason":            existing.get("reason", ""),
+        }
+        RUNTIME_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=RUNTIME_STATE_DIR, suffix=".tmp", prefix="control_")
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, RUNTIME_CONTROL_FILE)
+
+        label = mode if mode else "AUTO (dynamic)"
+        _write_control_audit("set_risk_mode", f"risk_mode={label}")
+        return jsonify({"status": "ok", "risk_mode": mode,
+                        "label": label, "last_updated": state["last_updated"]})
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
 
 
 def _whitelist_file(scope: str) -> Path:

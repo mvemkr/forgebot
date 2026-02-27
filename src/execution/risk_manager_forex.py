@@ -285,6 +285,19 @@ class ForexRiskManager:
         mode_mult  = self.regime_risk_multiplier()
         premult    = self.regime_adjusted_risk_pct(base)
 
+        # ── Mode-specific cap overrides ────────────────────────────────────
+        # When a regime mode is active, its DD and streak caps override the
+        # global constants (LOW tightens, HIGH/EXTREME loosen).
+        # Signal logic, stops, targets, and gates are NEVER touched here.
+        if self._regime_mode:
+            from src.strategy.forex.regime_score import RISK_MODE_PARAMS as _RMP
+            _mp = _RMP.get(self._regime_mode, {})
+            if _mp:
+                DD_L1_CAP    = _mp.get("dd_l1_cap",    DD_L1_CAP)
+                DD_L2_CAP    = _mp.get("dd_l2_cap",    DD_L2_CAP)
+                STREAK_L2_CAP = _mp.get("streak_l2_cap", STREAK_L2_CAP)
+                STREAK_L3_CAP = _mp.get("streak_l3_cap", STREAK_L3_CAP)
+
         if not DD_CIRCUIT_BREAKER_ENABLED:
             return RiskSizingResult(
                 base_pct=base, mode=mode_str, mode_mult=mode_mult,
@@ -317,18 +330,19 @@ class ForexRiskManager:
         streak_cap_pct = 99.0
         reasons: list  = []
 
-        # ── 2. DD graduated caps ───────────────────────────────────────
+        # ── 2. DD graduated caps (mode-specific when regime mode active) ─
+        # Flag string uses actual cap value: "DD_CAP_6" (no mode), "DD_CAP_10" (HIGH), etc.
         if dd >= DD_L2_PCT / 100:
             dd_cap_pct = DD_L2_CAP
             if final_pct > DD_L2_CAP:
                 final_pct = DD_L2_CAP
-                dd_flag   = "DD_CAP_6"
+                dd_flag   = f"DD_CAP_{int(DD_L2_CAP)}"
                 reasons.append(dd_flag)
         elif dd >= DD_L1_PCT / 100:
             dd_cap_pct = DD_L1_CAP
             if final_pct > DD_L1_CAP:
                 final_pct = DD_L1_CAP
-                dd_flag   = "DD_CAP_10"
+                dd_flag   = f"DD_CAP_{int(DD_L1_CAP)}"
                 reasons.append(dd_flag)
 
         # ── 3. Loss-streak brake ───────────────────────────────────────

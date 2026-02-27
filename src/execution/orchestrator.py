@@ -635,10 +635,25 @@ class ForexOrchestrator:
                     loss_streak   = self._consecutive_losses,
                 )
                 self._last_regime_score.update(_rms.to_dict())
-                self.risk.set_regime_mode(_rms.mode.value)
+
+                # ── Risk-mode source: control.json pin wins over dynamic ──
+                # If the dashboard / API has pinned a specific mode, use it.
+                # Otherwise, use the dynamically computed mode from score.
+                _pinned_mode = self.control.risk_mode   # None = AUTO
+                _effective_mode = _pinned_mode if _pinned_mode else _rms.mode.value
+                _mode_source    = "PINNED" if _pinned_mode else "AUTO"
+                self.risk.set_regime_mode(_effective_mode)
+
+                # Enrich last_regime_score with effective mode + source
+                self._last_regime_score["risk_mode"]        = _effective_mode
+                self._last_regime_score["risk_mode_source"] = _mode_source
+                self._last_regime_score["risk_mode_pinned"] = _pinned_mode
+
+                from src.strategy.forex.regime_score import RISK_MODE_PARAMS as _RMP
+                _mult = _RMP.get(_effective_mode, {}).get("risk_mult", 1.0)
                 logger.info(
-                    f"📊 RiskMode: {_rms.mode.value}  score={_rms.score}/4  "
-                    f"mult={_rms.params['risk_mult']}×  "
+                    f"📊 RiskMode: {_effective_mode} [{_mode_source}]  "
+                    f"score={_rms.score}/4  mult={_mult}×  "
                     f"wd={_rms.wd_aligned} vol={_rms.atr_expanding} "
                     f"edge={_rms.edge_positive} streak={_rms.streak_clear}"
                 )
@@ -669,6 +684,34 @@ class ForexOrchestrator:
         except Exception as e:
             logger.warning(f"Macro theme detection failed: {e}")
             return None
+
+    def _set_block_reason(
+        self,
+        pair: str,
+        stage: str,
+        reason: str,
+        reason_code: str = "",
+    ) -> None:
+        """
+        Patch the confluence state entry for *pair* with a block reason.
+        Called after every gate check that blocks an ENTER signal so the dashboard
+        shows WHY the pair is blocked, not just "BLOCKED".
+
+        Parameters
+        ----------
+        stage : str
+            One of: WAIT | PAUSED | BLOCKED | SESSION | WEEKLY | RR | CONF | HTF | DOJI
+        reason : str
+            Human-readable explanation for the dashboard.
+        reason_code : str
+            Machine-readable code for the UI badge (e.g. "WEEKLY_TRADE_LIMIT").
+        """
+        entry = self._confluence_state.get(pair)
+        if entry is None:
+            return
+        entry["block_stage"]   = stage
+        entry["block_reason"]  = reason
+        entry["block_code"]    = reason_code or stage
 
     def _capture_confluence(self, pair: str, decision, macro_theme) -> None:
         """
@@ -828,42 +871,48 @@ class ForexOrchestrator:
                     f"⚠ {pair}: ENTER signal BLOCKED — confidence {decision.confidence:.0%} "
                     f"< {MIN_CONFIDENCE:.0%} threshold. Waiting for stronger setup."
                 )
+                self._set_block_reason(
+                    pair, "CONF",
+                    f"Conf {decision.confidence:.0%} < {MIN_CONFIDENCE:.0%} required",
+                    "CONFIDENCE",
+                )
                 return
 
             # ── Global pause gate ─────────────────────────────────────────
-            # pause_new_entries=True: scanning continues, open positions are
-            # managed normally, but no NEW entries are opened.
-            # Set via dashboard toggle → runtime_state/control.json.
             if self.control.pause_new_entries:
                 logger.info(
                     f"⏸  {pair}: ENTER BLOCKED — PAUSE_BLOCK "
                     f"(pause_new_entries=True, reason={self.control.reason!r})"
                 )
+                self._set_block_reason(
+                    pair, "PAUSED",
+                    f"Entries paused: {self.control.reason or 'manual hold'}",
+                    "PAUSE_BLOCK",
+                )
                 return
 
             # ── Macro theme direction gate ────────────────────────────────
-            # PARITY: identical logic to backtester (oanda_backtest_v2.py).
-            # If a macro theme is active and this pair is one of its suggested
-            # trades, block entries whose direction CONTRADICTS the theme.
-            # E.g. USD_strong theme → EUR/USD SHORT is fine, EUR/USD LONG is blocked.
-            # Controlled by REQUIRE_THEME_GATE lever in strategy_config.py.
             if _sc.REQUIRE_THEME_GATE and macro_theme:
                 _theme_dir_map = dict(macro_theme.suggested_trades)
                 _theme_dir     = _theme_dir_map.get(pair)
                 if _theme_dir and _theme_dir != decision.direction:
+                    _theme_name = f"{macro_theme.currency}_{macro_theme.direction}"
                     logger.info(
                         f"⚠ {pair}: ENTER BLOCKED — theme direction conflict. "
-                        f"Theme={macro_theme.currency}_{macro_theme.direction} "
-                        f"wants {_theme_dir}, pattern wants {decision.direction}."
+                        f"Theme={_theme_name} wants {_theme_dir}, "
+                        f"pattern wants {decision.direction}."
+                    )
+                    self._set_block_reason(
+                        pair, "BLOCKED",
+                        f"Theme {_theme_name} wants {_theme_dir}, "
+                        f"signal wants {decision.direction}",
+                        "THEME_CONFLICT",
                     )
                     return
 
             # ── Alex small-account gates (live parity via alex_policy) ──
-            # Parity note: backtester calls the same functions from
-            # src/strategy/forex/alex_policy.py — single source of truth.
 
             # Gate 1: Alignment-based MIN_RR
-            # Pro-trend (W+D+4H all agree) → 2.5 R; non-protrend/mixed → 3.0 R
             _htf_aligned_flag = alex_policy.htf_aligned(
                 decision.direction or "",
                 decision.trend_weekly,
@@ -877,6 +926,11 @@ class ForexOrchestrator:
             )
             if _rr_blk:
                 logger.info(f"⚠ {pair}: ENTER BLOCKED — {_rr_rsn}")
+                self._set_block_reason(
+                    pair, "BLOCKED",
+                    _rr_rsn,
+                    "RR_MIN",
+                )
                 return
 
             # Gate 2: Weekly trade punch-card
@@ -886,6 +940,11 @@ class ForexOrchestrator:
             )
             if _wk_blk:
                 logger.info(f"⚠ {pair}: ENTER BLOCKED — {_wk_rsn}")
+                self._set_block_reason(
+                    pair, "WEEKLY",
+                    _wk_rsn,
+                    "WEEKLY_TRADE_LIMIT",
+                )
                 return
 
             # ── Winner rule: don't compete with your winner ───────────────
@@ -921,15 +980,19 @@ class ForexOrchestrator:
             )
             if win_blocked:
                 logger.info(f"⚠ {pair}: ENTER BLOCKED — {win_reason}")
+                self._set_block_reason(pair, "BLOCKED", win_reason, "WINNER_RUNNING")
                 return
 
             # ── Session gate — only auto-execute during London session ────
-            # Outside London: log the signal so Mike can act manually, but
-            # don't auto-execute. Alex always enters London session (1-3 AM ET).
             if not overnight:
                 logger.info(
                     f"⏰ {pair}: ENTER signal in non-London session — "
                     f"logging for review, not auto-executing. (conf={decision.confidence:.0%})"
+                )
+                self._set_block_reason(
+                    pair, "SESSION",
+                    "Outside London session (3–8 AM ET) — signal logged, not auto-executed",
+                    "TIME_BLOCK",
                 )
                 self.notifier.send(
                     f"⏰ <b>{pair} signal (non-London)</b> — {decision.direction} @ "
@@ -939,9 +1002,7 @@ class ForexOrchestrator:
                 )
                 return
 
-            # ── ATR stop check (matches backtester _stop_ok logic) ────────
-            # Stop must be ≤ ATR_STOP_MULTIPLIER × ATR (rejects ancient levels)
-            # Stop must be ≥ ATR_MIN_MULTIPLIER × ATR (rejects micro-stop noise)
+            # ── ATR stop check ────────────────────────────────────────────
             if decision.entry_price and decision.stop_loss and len(df_d) >= ATR_LOOKBACK + 1:
                 import numpy as np
                 recent   = df_d.tail(ATR_LOOKBACK + 1)
@@ -953,18 +1014,18 @@ class ForexOrchestrator:
                 dist     = abs(decision.entry_price - decision.stop_loss)
                 pip      = 0.01 if "JPY" in pair else 0.0001
                 if dist > atr * ATR_STOP_MULTIPLIER:
-                    logger.info(
-                        f"⚠ {pair}: ENTER BLOCKED — stop too wide: "
-                        f"{dist/pip:.0f}p > max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p "
-                        f"({ATR_STOP_MULTIPLIER:.0f}×ATR)"
-                    )
+                    _msg = (f"Stop too wide: {dist/pip:.0f}p > "
+                            f"max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p "
+                            f"({ATR_STOP_MULTIPLIER:.0f}×ATR)")
+                    logger.info(f"⚠ {pair}: ENTER BLOCKED — {_msg}")
+                    self._set_block_reason(pair, "BLOCKED", _msg, "STOP_WIDE")
                     return
                 if dist < atr * ATR_MIN_MULTIPLIER:
-                    logger.info(
-                        f"⚠ {pair}: ENTER BLOCKED — stop too tight: "
-                        f"{dist/pip:.0f}p < min {atr*ATR_MIN_MULTIPLIER/pip:.0f}p "
-                        f"({ATR_MIN_MULTIPLIER:.2f}×ATR) — micro-stop, daily noise will hit it"
-                    )
+                    _msg = (f"Stop too tight: {dist/pip:.0f}p < "
+                            f"min {atr*ATR_MIN_MULTIPLIER/pip:.0f}p "
+                            f"({ATR_MIN_MULTIPLIER:.2f}×ATR) — micro-stop")
+                    logger.info(f"⚠ {pair}: ENTER BLOCKED — {_msg}")
+                    self._set_block_reason(pair, "BLOCKED", _msg, "STOP_TIGHT")
                     return
 
             logger.info(f"🎯 {pair}: ENTER signal! overnight={overnight} conf={decision.confidence:.0%}")
@@ -992,6 +1053,7 @@ class ForexOrchestrator:
                     key_level=decision.nearest_level.price if decision.nearest_level else 0,
                     overnight=overnight,
                     dry_run=self.dry_run,
+                    account_mode=self.account.mode.value,   # "live_paper" | "live_real"
                 )
 
         elif decision.confidence >= 0.60:
@@ -1105,13 +1167,26 @@ class ForexOrchestrator:
         """
         Send a regular standings update — 6H cadence.
         Mike always knows where things stand, even after overnight trades.
+
+        Weekly PnL source:
+          LIVE_PAPER → AccountState.week_pnl  (resets on ISO-week boundary,
+                        updated only on trade exits — closed system, no broker)
+          LIVE_REAL  → journal.get_current_week_stats() PnL (broker-sourced)
         """
         try:
-            week_stats   = self.journal.get_stats()
-            weekly_pnl   = sum(self.journal.get_weekly_pnl().values()) if self.journal.get_weekly_pnl() else 0.0
-            trades_week  = week_stats.get("trades_this_week", 0)
-            wins_week    = week_stats.get("wins_this_week", 0)
-            losses_week  = week_stats.get("losses_this_week", 0)
+            wk = self.journal.get_current_week_stats()
+            trades_week  = wk["trades_this_week"]
+            wins_week    = wk["wins_this_week"]
+            losses_week  = wk["losses_this_week"]
+
+            if self.account.mode == AccountMode.LIVE_PAPER:
+                # AccountState is the closed-system source of truth for paper equity.
+                # week_pnl resets on ISO-week boundary and only changes on apply_pnl()
+                # (i.e., actual simulated trade exits) — never from broker data.
+                weekly_pnl = self.account.week_pnl
+            else:
+                # LIVE_REAL: sum closed-trade PnL from journal for this week
+                weekly_pnl = wk["pnl_this_week"]
         except Exception:
             weekly_pnl = trades_week = wins_week = losses_week = 0
 
@@ -1400,6 +1475,11 @@ class ForexOrchestrator:
                     # ── Regime mode (risk scaling) ────────────────────
                     "risk_mode":           self.risk.regime_mode,
                     "risk_mode_mult":      self.risk.regime_risk_multiplier(),
+                    "risk_mode_source":    (self._last_regime_score or {}).get("risk_mode_source", "AUTO"),
+                    "risk_mode_pinned":    self.control.risk_mode,
+                    "effective_risk_pct":  self.risk.get_effective_risk_pct(
+                                               self.account.safe_equity(self._equity_fallback)
+                                           ),
                     "regime_weekly_caps":  self.risk.regime_weekly_caps(),
                     # ── Account mode / equity source ──────────────────
                     **{f"account_{k}": v for k, v in self.account.to_dict().items()},

@@ -82,11 +82,19 @@ class BacktestResult:
     regime_avg:          float = 0.0
     regime_pct_high:     float = 0.0    # % trades with score ≥ 3.0
     regime_pct_extreme:  float = 0.0    # % trades with score ≥ 3.5
-    # ── Risk mode time distribution (% of trades in each mode) ──────────
-    risk_mode_pct_low:     float = 0.0   # % trades where RiskMode == LOW
-    risk_mode_pct_medium:  float = 0.0   # % trades where RiskMode == MEDIUM
-    risk_mode_pct_high:    float = 0.0   # % trades where RiskMode == HIGH
-    risk_mode_pct_extreme: float = 0.0   # % trades where RiskMode == EXTREME
+    # ── Risk mode: % of TRADES entered in each mode ─────────────────────
+    risk_mode_pct_low:     float = 0.0   # % trades entered while RiskMode == LOW
+    risk_mode_pct_medium:  float = 0.0   # % trades entered while RiskMode == MEDIUM
+    risk_mode_pct_high:    float = 0.0   # % trades entered while RiskMode == HIGH
+    risk_mode_pct_extreme: float = 0.0   # % trades entered while RiskMode == EXTREME
+
+    # ── Risk mode: % of CALENDAR TIME (H4 bars) in each mode ────────────
+    # Sampled at each H4 bar using compute_risk_mode(); gives market-condition
+    # distribution independent of when trades were actually entered.
+    time_in_mode_pct_low:     float = 0.0
+    time_in_mode_pct_medium:  float = 0.0
+    time_in_mode_pct_high:    float = 0.0
+    time_in_mode_pct_extreme: float = 0.0
 
     # ── Stop selection quality ───────────────────────────────────────────
     stop_type_counts:  dict  = field(default_factory=dict)  # {stop_type: count}

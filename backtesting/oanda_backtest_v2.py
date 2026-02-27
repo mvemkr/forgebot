@@ -46,7 +46,10 @@ _ET_TZ = pytz.timezone("America/New_York")   # for adaptive Thu/Fri gate
 from src.exchange.oanda_client import OandaClient, INSTRUMENT_MAP
 from src.strategy.forex.set_and_forget   import SetAndForgetStrategy, Decision
 from src.strategy.forex.news_filter      import NewsFilter
-from src.strategy.forex.regime_score     import compute_regime_score, RegimeScore
+from src.strategy.forex.regime_score     import (
+    compute_regime_score, RegimeScore,
+    compute_risk_mode, RISK_MODE_PARAMS,
+)
 from src.strategy.forex.targeting        import select_target, find_next_structure_level
 from src.execution.risk_manager_forex    import ForexRiskManager
 from src.execution.trade_journal         import TradeJournal
@@ -583,6 +586,10 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                        dynamic_pip_equity: bool = False,
                        wd_protrend_htf: bool = False,
                        flat_risk_pct: Optional[float] = None):
+    # PROTREND_ONLY config flag → wd_protrend_htf gate.
+    # Config wins when True; explicit True caller arg also wins.
+    if getattr(_sc, "PROTREND_ONLY", False) and not wd_protrend_htf:
+        wd_protrend_htf = True
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     # Extend data fetch so open positions can run to natural close after the entry window.
     # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
@@ -628,6 +635,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
           f"parity: {_parity_sym:<14}│")
     print(f"│  trigger mode    : {_sc.ENTRY_TRIGGER_MODE:<15}  "
           f"spread model : {'ON' if _sc.SPREAD_MODEL_ENABLED else 'OFF'}{'':>16}│")
+    _pt_label = "ON (W+D gate, 4H exempt)" if wd_protrend_htf else "OFF (full counter-trend)"
+    print(f"│  protrend_only   : {_pt_label:<43}│")
     if _exp_flag:
         print(f"│  ⚠  EXPERIMENTAL RUN — BT concurrency > 1, not comparable to live{'':>3}│")
     print(f"└{'─'*63}┘")
@@ -1187,6 +1196,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
                         "target_1":     target,
                         "regime_score_at_entry": pos.get("regime_score", 0.0),
+                        "risk_mode_at_entry": pos.get("risk_mode_at_entry", "MEDIUM"),
                     })
                     r_sign   = "+" if risk_r >= 0 else ""
                     pnl_sign = "+" if pnl >= 0 else ""
@@ -1250,6 +1260,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
                         "target_1": pos.get("target_price"),
                         "regime_score_at_entry": pos.get("regime_score", 0.0),
+                        "risk_mode_at_entry": pos.get("risk_mode_at_entry", "MEDIUM"),
                     })
                     print(f"  ⏹ {ts_utc.strftime('%Y-%m-%d')} "
                           f"| STALL {pair} {direction.upper()} "
@@ -1309,6 +1320,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     "final_risk_pct":     pos.get("final_risk_pct", 0),
                     "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
                     "regime_score_at_entry": pos.get("regime_score", 0.0),
+                        "risk_mode_at_entry": pos.get("risk_mode_at_entry", "MEDIUM"),
                 })
 
                 r_sign = "+" if risk_r >= 0 else ""
@@ -1561,6 +1573,27 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                             f"{elig_reason2}")
                 continue
 
+            # ── Risk mode: compute dynamically at each entry ─────────────
+            # Mirrors live orchestrator: score 4 components, map to LOW/MED/HIGH/EXTREME.
+            # Mode is applied to risk manager BEFORE sizing so DD/streak caps
+            # and the multiplier are mode-aware.
+            try:
+                _rms_entry = compute_risk_mode(
+                    trend_weekly  = (decision.trend_weekly.value
+                                     if hasattr(decision.trend_weekly, "value")
+                                     else str(decision.trend_weekly or "")),
+                    trend_daily   = (decision.trend_daily.value
+                                     if hasattr(decision.trend_daily, "value")
+                                     else str(decision.trend_daily or "")),
+                    df_h4         = hist_4h,
+                    recent_trades = trades,          # closed trades so far
+                    loss_streak   = consecutive_losses,
+                )
+                risk.set_regime_mode(_rms_entry.mode.value)
+            except Exception:
+                _rms_entry = None
+                risk.set_regime_mode(None)
+
             _base_rpct, _dd_flag = _risk_pct_with_flag(balance)
 
             # ── DD kill-switch: hard block at ≥ 40% DD ────────────────
@@ -1757,6 +1790,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                 "streak_at_entry": consecutive_losses,  # for per-trade risk audit
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
                 "regime_score": _rs.total,              # RegimeScore at entry
+                "risk_mode_at_entry": (_rms_entry.mode.value if _rms_entry else "MEDIUM"),  # RiskMode
                 "target_price": _target,
                 "target_type":  decision.exec_target_type,
                 "stop_type":    decision.stop_type,
@@ -1841,6 +1875,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             "macro_theme": pos.get("macro_theme"),
             "target_1": pos.get("target_price"),
             "regime_score_at_entry": pos.get("regime_score", 0.0),
+                        "risk_mode_at_entry": pos.get("risk_mode_at_entry", "MEDIUM"),
         })
 
     # ── Results ───────────────────────────────────────────────────────
@@ -1877,6 +1912,52 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     )
     # DD cap usage
     _dd_cap_trades = [t for t in trades if t.get("dd_flag")]
+
+    # ── Time-in-mode: H4 bar sampling (computed once, used in print + result) ─
+    # Samples compute_risk_mode() at every H4 bar in the window.
+    # Gives % of CALENDAR TIME in each mode — independent of entry frequency.
+    _tim_counts = Counter({"LOW": 0, "MEDIUM": 0, "HIGH": 0, "EXTREME": 0})
+    try:
+        from src.strategy.forex.pattern_detector import PatternDetector as _PD
+        _pd_inst  = _PD()
+        _rep_pair = next(iter(candle_data.keys()), None)
+        _rep_h4   = candle_data[_rep_pair].get("4h") if _rep_pair else None
+        if _rep_h4 is not None and len(_rep_h4) > 0:
+            _start_ts = pd.Timestamp(start_dt).replace(tzinfo=None)
+            _end_ts   = (pd.Timestamp(end_dt).replace(tzinfo=None)
+                         if end_dt else _rep_h4.index[-1])
+            _h4_window = _rep_h4[(_rep_h4.index >= _start_ts) &
+                                  (_rep_h4.index <  _end_ts)]
+            for _hi, (_h4_ts, _) in enumerate(_h4_window.iterrows()):
+                _h4_slice = _h4_window.iloc[max(0, _hi - 80): _hi + 1]
+                if len(_h4_slice) < 21:
+                    continue
+                try:
+                    _h4_trend_str = _pd_inst.detect_trend(_h4_slice).value
+                except Exception:
+                    _h4_trend_str = "neutral"
+                _h4_ts_str = str(_h4_ts)
+                _recent5   = [t for t in trades
+                              if (t.get("exit_ts") or "0") < _h4_ts_str][-5:]
+                try:
+                    _rms_h4 = compute_risk_mode(
+                        trend_weekly  = _h4_trend_str,
+                        trend_daily   = _h4_trend_str,
+                        df_h4         = _h4_slice,
+                        recent_trades = _recent5,
+                        loss_streak   = 0,
+                    )
+                    _tim_counts[_rms_h4.mode.value] += 1
+                except Exception:
+                    _tim_counts["MEDIUM"] += 1
+    except Exception:
+        pass   # time-in-mode is diagnostic — never crash the backtest
+
+    _tim_total       = sum(_tim_counts.values()) or 1
+    _tim_pct_low     = _tim_counts["LOW"]     / _tim_total * 100
+    _tim_pct_medium  = _tim_counts["MEDIUM"]  / _tim_total * 100
+    _tim_pct_high    = _tim_counts["HIGH"]    / _tim_total * 100
+    _tim_pct_extreme = _tim_counts["EXTREME"] / _tim_total * 100
 
     print(f"\n{'='*65}")
     print(f"RESULTS — v2 (Real Strategy Code)")
@@ -1991,6 +2072,40 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             _brs    = [t["r"] for t in trades if _lo <= t.get("regime_score_at_entry", 0) < _hi]
             _avg_r  = sum(_brs) / len(_brs) if _brs else 0
             print(f"    {_band:<18}  {_cnt:>2} trades  avg R={_avg_r:+.2f}")
+
+    # ── Risk mode distribution ────────────────────────────────────────────
+    _rm_at_entry = [t.get("risk_mode_at_entry", "MEDIUM") for t in trades]
+    if _rm_at_entry:
+        # Build time-in-mode from local Counter for display
+        _local_tim = Counter({"LOW": 0, "MEDIUM": 0, "HIGH": 0, "EXTREME": 0})
+        _local_tim.update(_tim_counts)   # already computed above
+        _local_tim_total = sum(_local_tim.values()) or 1
+
+        print(f"\n  ── Risk Mode distribution ───────────────────────────────")
+        print(f"    {'Mode':<10}  {'N':>4}  {'%entries':>9}  {'%h4time':>8}  "
+              f"{'AvgR':>6}  {'BestR':>6}  config")
+        print(f"    {'─'*10}  {'─'*4}  {'─'*9}  {'─'*8}  {'─'*6}  {'─'*6}  {'─'*30}")
+        for _rm in ["LOW", "MEDIUM", "HIGH", "EXTREME"]:
+            _rm_trades = [t for t in trades if t.get("risk_mode_at_entry") == _rm]
+            _h4_pct    = _local_tim[_rm] / _local_tim_total * 100
+            _mult      = RISK_MODE_PARAMS.get(_rm, {}).get("risk_mult", 1.0)
+            _wk_cap    = RISK_MODE_PARAMS.get(_rm, {}).get("weekly_cap_std", 2)
+            _dd_l1     = RISK_MODE_PARAMS.get(_rm, {}).get("dd_l1_cap", 10)
+            _dd_l2     = RISK_MODE_PARAMS.get(_rm, {}).get("dd_l2_cap", 6)
+            if not _rm_trades and _h4_pct < 1:
+                continue
+            if _rm_trades:
+                _cnt  = len(_rm_trades)
+                _pct  = _cnt / len(trades) * 100
+                _avgr = sum(t["r"] for t in _rm_trades) / _cnt
+                _bestr= max(t["r"] for t in _rm_trades)
+                print(f"    {_rm:<10}  {_cnt:>4}  {_pct:>8.0f}%  {_h4_pct:>7.0f}%  "
+                      f"{_avgr:>+5.2f}R  {_bestr:>+5.2f}R  "
+                      f"mult={_mult}×  wk_cap={_wk_cap}  dd={_dd_l1}/{_dd_l2}%")
+            else:
+                print(f"    {_rm:<10}  {'—':>4}  {'—':>8}   {_h4_pct:>7.0f}%  "
+                      f"{'—':>6}  {'—':>6}  "
+                      f"mult={_mult}×  wk_cap={_wk_cap}  dd={_dd_l1}/{_dd_l2}%")
 
     # ── Spread model summary ──────────────────────────────────────────────
     import src.strategy.forex.strategy_config as _sc_ref
@@ -2332,6 +2447,16 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _rrs    = sorted([t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0])
 
     _regime_scores = [t.get("regime_score_at_entry", 0.0) for t in trades]
+
+    # ── Risk mode distribution (% of TRADES entered in each mode) ────────
+    # _tim_counts / _tim_pct_* already computed above in the print section
+    _rm_vals = [t.get("risk_mode_at_entry", "MEDIUM") for t in trades]
+    _n = len(trades) or 1
+    _rm_pct_low     = sum(1 for m in _rm_vals if m == "LOW")     / _n * 100
+    _rm_pct_medium  = sum(1 for m in _rm_vals if m == "MEDIUM")  / _n * 100
+    _rm_pct_high    = sum(1 for m in _rm_vals if m == "HIGH")    / _n * 100
+    _rm_pct_extreme = sum(1 for m in _rm_vals if m == "EXTREME") / _n * 100
+
     return BacktestResult(
         # ── Core performance (canonical names) ───────────────────────
         return_pct     = (balance - starting_bal) / starting_bal * 100,
@@ -2374,6 +2499,16 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                               / len(_regime_scores) * 100 if _regime_scores else 0.0),
         regime_pct_extreme = (sum(1 for s in _regime_scores if s >= 3.5)
                               / len(_regime_scores) * 100 if _regime_scores else 0.0),
+        # ── Risk mode: % of trades in each mode ──────────────────────
+        risk_mode_pct_low     = _rm_pct_low,
+        risk_mode_pct_medium  = _rm_pct_medium,
+        risk_mode_pct_high    = _rm_pct_high,
+        risk_mode_pct_extreme = _rm_pct_extreme,
+        # ── Risk mode: % of calendar time in each mode ───────────────
+        time_in_mode_pct_low     = _tim_pct_low,
+        time_in_mode_pct_medium  = _tim_pct_medium,
+        time_in_mode_pct_high    = _tim_pct_high,
+        time_in_mode_pct_extreme = _tim_pct_extreme,
         # ── Profiling ────────────────────────────────────────────────
         api_calls     = _api_call_count,
         eval_calls    = _eval_calls,
@@ -2432,6 +2567,10 @@ Examples:
     parser.add_argument("--timing", action="store_true", default=False,
                         help="Print performance stats after each run: total bars, evaluate() calls, "
                              "avg ms per call, total runtime.")
+    parser.add_argument("--protrend-only", action="store_true", default=False,
+                        help="Gate entries: require Weekly AND Daily bias to agree with trade direction. "
+                             "4H is exempt (Alex enters during 4H retracements). "
+                             "Wires PROTREND_ONLY=True. Use for W2 regime vs bug diagnostic.")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -2525,11 +2664,13 @@ Examples:
         _arm_notes = f"{notes} [arm={_arm_key}]".strip()
 
         _t_run = time.perf_counter()
+        _protrend_flag = getattr(args, "protrend_only", False)
         result = run_backtest(
             start_dt=start, end_dt=end, starting_bal=args.balance,
             notes=_arm_notes, trail_cfg=_tcfg, trail_arm_key=_arm_key,
             preloaded_candle_data=_shared_candles,
             use_cache=_use_cache,
+            wd_protrend_htf=_protrend_flag,
         )
         _t_run_elapsed = time.perf_counter() - _t_run
 

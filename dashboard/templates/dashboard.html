@@ -129,16 +129,31 @@
         <i class="ph ph-play"></i> Resume Entries
       </button>
     </div>
-    <!-- Market State badge -->
-    <div class="badge badge-outline gap-1 font-mono text-xs"
-         :class="{
-           'badge-error':   state.risk_mode === 'EXTREME',
-           'badge-warning': state.risk_mode === 'HIGH',
-           'badge-info':    state.risk_mode === 'MEDIUM',
-           'badge-ghost':   state.risk_mode === 'LOW' || !state.risk_mode
-         }"
-         :title="'Market State: ' + (state.risk_mode || '—') + (state.risk_mode_mult ? ' (' + state.risk_mode_mult + '× risk)' : '')"
-         x-text="state.risk_mode ? ('MKT: ' + state.risk_mode) : 'MKT STATE—'">
+    <!-- Risk Mode badge + selector -->
+    <div class="dropdown dropdown-end" x-data="{ rmOpen: false }">
+      <div tabindex="0" role="button"
+           class="badge badge-outline gap-1 font-mono text-xs cursor-pointer select-none"
+           :class="{
+             'badge-error':   state.risk_mode === 'EXTREME',
+             'badge-warning': state.risk_mode === 'HIGH',
+             'badge-info':    state.risk_mode === 'MEDIUM',
+             'badge-ghost':   state.risk_mode === 'LOW' || !state.risk_mode
+           }"
+           :title="'Risk Mode: ' + (state.risk_mode || 'AUTO') + ' [' + (state.risk_mode_source||'AUTO') + '] ' + (state.risk_mode_mult ? state.risk_mode_mult+'×' : '') + (state.effective_risk_pct ? '  eff=' + state.effective_risk_pct.toFixed(1)+'%' : '')"
+           @click="rmOpen = !rmOpen">
+        <span x-text="state.risk_mode ? ('MKT: ' + state.risk_mode + (state.risk_mode_source==='PINNED' ? ' 📌' : '')) : 'MKT: AUTO'"></span>
+        <span x-show="state.effective_risk_pct" class="opacity-60"
+              x-text="state.effective_risk_pct ? ' '+state.effective_risk_pct.toFixed(1)+'%' : ''"></span>
+      </div>
+      <ul x-show="rmOpen" @click.outside="rmOpen=false"
+          class="dropdown-content menu bg-base-200 rounded-box z-50 w-44 p-1 shadow text-xs">
+        <li class="menu-title text-xs opacity-50">Pin Risk Mode</li>
+        <template x-for="m in ['AUTO','LOW','MEDIUM','HIGH','EXTREME']" :key="m">
+          <li><a :class="(m==='AUTO' ? !state.risk_mode_pinned : state.risk_mode_pinned===m) ? 'font-bold text-primary' : ''"
+                 @click="rmOpen=false; setRiskMode(m==='AUTO' ? null : m)"
+                 x-text="m + (m==='AUTO' ? ' (dynamic)' : '')"></a></li>
+        </template>
+      </ul>
     </div>
     <div class="countdown font-mono text-sm opacity-40 hidden lg:block">
       <span x-text="refreshIn + 's'"></span>
@@ -1380,6 +1395,24 @@ function dashboard() {
       } catch(e) { alert('Resume entries request failed: ' + e); }
     },
 
+    async setRiskMode(mode) {
+      // mode = "LOW"|"MEDIUM"|"HIGH"|"EXTREME"|null (null = AUTO/clear pin)
+      try {
+        const r = await fetch('/api/set_risk_mode', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({mode: mode})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.risk_mode_pinned = mode;
+          await this.refresh();
+        } else {
+          alert('Set risk mode failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Set risk mode request failed: ' + e); }
+    },
+
     async fetchNews() {
       try {
         const r = await fetch('/api/news');
@@ -1419,7 +1452,8 @@ function dashboard() {
           'equity_display','realized_session_pnl','broker_fetch_failures',
           'nav','unrealized_pnl',
           'pause_new_entries','reason','updated_by','last_updated',
-          'risk_mode','risk_mode_mult','regime_weekly_caps','regime_score'];
+          'risk_mode','risk_mode_source','risk_mode_pinned','risk_mode_mult',
+          'effective_risk_pct','regime_weekly_caps','regime_score'];
         this.state = { ...(status.heartbeat || {}) };
         for (const k of _topFields) {
           if (status[k] !== undefined) this.state[k] = status[k];

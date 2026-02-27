@@ -286,10 +286,42 @@ class RiskMode(Enum):
 # Example: base=6%, HIGH multiplier=1.5 → 9% risk.
 # Weekly cap: max trades per ISO week regardless of account size.
 RISK_MODE_PARAMS: dict[str, dict] = {
-    "LOW":     {"risk_mult": 0.5,  "weekly_cap_small": 1, "weekly_cap_std": 1},
-    "MEDIUM":  {"risk_mult": 1.0,  "weekly_cap_small": 1, "weekly_cap_std": 2},
-    "HIGH":    {"risk_mult": 1.5,  "weekly_cap_small": 2, "weekly_cap_std": 3},
-    "EXTREME": {"risk_mult": 2.0,  "weekly_cap_small": 3, "weekly_cap_std": 4},
+    # LOW — capital-preservation mode: half risk, tighter DD/streak caps
+    "LOW": {
+        "risk_mult":        0.5,
+        "weekly_cap_small": 1, "weekly_cap_std": 1,
+        "dd_l1_cap":        6.0,    # tighten DD_L1 10% → 6%
+        "dd_l2_cap":        3.0,    # tighten DD_L2 6% → 3%
+        "streak_l2_cap":    3.0,    # tighten streak-L2 6% → 3%
+        "streak_l3_cap":    1.5,    # tighten streak-L3 3% → 1.5%
+    },
+    # MEDIUM — baseline/normal: default constants unchanged
+    "MEDIUM": {
+        "risk_mult":        1.0,
+        "weekly_cap_small": 1, "weekly_cap_std": 2,
+        "dd_l1_cap":        10.0,   # baseline DD_L1
+        "dd_l2_cap":        6.0,    # baseline DD_L2
+        "streak_l2_cap":    6.0,    # baseline streak-L2
+        "streak_l3_cap":    3.0,    # baseline streak-L3
+    },
+    # HIGH — growth mode: 1.5× risk, looser DD/streak caps
+    "HIGH": {
+        "risk_mult":        1.5,
+        "weekly_cap_small": 2, "weekly_cap_std": 3,
+        "dd_l1_cap":        15.0,   # loosen DD_L1 10% → 15%
+        "dd_l2_cap":        10.0,   # loosen DD_L2 6% → 10%
+        "streak_l2_cap":    9.0,    # loosen streak-L2 6% → 9%
+        "streak_l3_cap":    6.0,    # loosen streak-L3 3% → 6%
+    },
+    # EXTREME — max-compounding mode: 2× risk, maximum caps
+    "EXTREME": {
+        "risk_mult":        2.0,
+        "weekly_cap_small": 3, "weekly_cap_std": 4,
+        "dd_l1_cap":        20.0,   # loosen DD_L1 10% → 20%
+        "dd_l2_cap":        15.0,   # loosen DD_L2 6% → 15%
+        "streak_l2_cap":    12.0,   # loosen streak-L2 6% → 12%
+        "streak_l3_cap":    9.0,    # loosen streak-L3 3% → 9%
+    },
 }
 
 ATR_RATIO_THRESH = 1.1    # H4 ATR expansion threshold

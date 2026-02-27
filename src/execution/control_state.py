@@ -43,8 +43,11 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DIR  = Path(__file__).resolve().parents[2] / "runtime_state"
 CONTROL_FILE  = _DEFAULT_DIR / "control.json"
 
+_VALID_RISK_MODES = {"LOW", "MEDIUM", "HIGH", "EXTREME"}
+
 _DEFAULT_STATE: dict = {
     "pause_new_entries": False,
+    "risk_mode":         None,   # None = AUTO (dynamic compute); or "LOW"|"MEDIUM"|"HIGH"|"EXTREME"
     "last_updated":      None,
     "updated_by":        "startup",
     "reason":            "",
@@ -76,6 +79,15 @@ class ControlState:
         return bool(self._state.get("pause_new_entries", False))
 
     @property
+    def risk_mode(self) -> Optional[str]:
+        """
+        Pinned risk mode: "LOW" | "MEDIUM" | "HIGH" | "EXTREME" | None.
+        None means AUTO — orchestrator computes dynamically from regime score.
+        """
+        raw = self._state.get("risk_mode")
+        return raw if raw in _VALID_RISK_MODES else None
+
+    @property
     def reason(self) -> str:
         return str(self._state.get("reason", ""))
 
@@ -90,6 +102,7 @@ class ControlState:
     def to_dict(self) -> dict:
         return {
             "pause_new_entries": self.pause_new_entries,
+            "risk_mode":         self.risk_mode,
             "last_updated":      self.last_updated,
             "updated_by":        self.updated_by,
             "reason":            self.reason,
@@ -111,6 +124,32 @@ class ControlState:
         self._update(pause_new_entries=False, reason=reason, updated_by=updated_by)
         logger.info(f"▶  pause_new_entries=False  by={updated_by}  reason={reason!r}")
 
+    def set_risk_mode(
+        self,
+        mode: Optional[str],
+        updated_by: str = "api",
+    ) -> None:
+        """
+        Pin the risk mode to a specific value, or set None to return to AUTO.
+
+        mode : "LOW" | "MEDIUM" | "HIGH" | "EXTREME" | None
+            None clears the pin and lets the orchestrator compute dynamically.
+        """
+        if self._is_backtest:
+            return
+        if mode is not None and mode not in _VALID_RISK_MODES:
+            logger.warning(
+                f"control_state.set_risk_mode: invalid mode {mode!r} — "
+                f"valid: {sorted(_VALID_RISK_MODES)} | None for AUTO"
+            )
+            return
+        self._state["risk_mode"] = mode
+        self._state["last_updated"] = datetime.now(timezone.utc).isoformat()
+        self._state["updated_by"]   = updated_by
+        self._persist()
+        label = mode if mode else "AUTO (dynamic)"
+        logger.info(f"🎛  risk_mode={label}  by={updated_by}")
+
     def reload(self) -> None:
         """Re-read control.json from disk (called each orchestrator cycle)."""
         if self._is_backtest:
@@ -128,8 +167,10 @@ class ControlState:
     # ── Internal ───────────────────────────────────────────────────────
 
     def _update(self, pause_new_entries: bool, reason: str, updated_by: str) -> None:
+        # Preserve risk_mode across pause/resume operations
         self._state = {
             "pause_new_entries": pause_new_entries,
+            "risk_mode":         self._state.get("risk_mode"),   # preserved
             "last_updated":      datetime.now(timezone.utc).isoformat(),
             "updated_by":        updated_by,
             "reason":            reason,

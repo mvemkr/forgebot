@@ -295,18 +295,28 @@ class TestRiskModeParity:
     # ── DD caps still apply after mode multiplier ─────────────────────────
 
     def test_dd_cap_applied_after_mode_mult(self):
-        """HIGH mode 9% → DD L1 cap 10% → no cap needed; but DD L2 cap 6% wins."""
-        from src.strategy.forex.strategy_config import DD_L2_PCT, DD_L2_CAP
+        """
+        HIGH mode: base=15% (tier-2 balance=$10K), mult=1.5× → premult=22.5%.
+        At 30% DD, HIGH-mode dd_l2_cap=10% fires → final_pct capped at 10%.
+        Flag = "DD_CAP_10" (dynamic, reflects actual cap value).
+        """
+        from src.strategy.forex.strategy_config import DD_L2_PCT
+        from src.strategy.forex.regime_score import RISK_MODE_PARAMS
         rm = self._rs(mode="HIGH")
-        # Induce ≥ L2 DD: peak=10K, balance=7K → 30% DD ≥ 25% (DD_L2_PCT)
+        # Use $10K balance (tier-2 = 15%); peak=$14,286 → 30% DD ≥ DD_L2_PCT
+        high_dd_l2_cap = RISK_MODE_PARAMS["HIGH"]["dd_l2_cap"]   # 10.0
         result = rm.compute_risk_sizing(
-            account_balance=7_000.0,
-            peak_equity=10_000.0,
+            account_balance=10_000.0,
+            peak_equity=14_286.0,    # 30% DD
             consecutive_losses=0,
         )
-        assert result.premult_pct == 9.0,  "premult should still be 9% (HIGH)"
-        assert result.final_pct   <= DD_L2_CAP, f"DD L2 cap should apply: {result.final_pct}"
-        assert "DD_CAP_6" in result.reasons
+        assert result.premult_pct == pytest.approx(22.5, abs=0.1), \
+            f"premult should be 22.5% (15% × 1.5×): got {result.premult_pct}"
+        assert result.final_pct   <= high_dd_l2_cap, \
+            f"DD L2 cap ({high_dd_l2_cap}%) should apply; got {result.final_pct}"
+        assert result.final_pct   == pytest.approx(high_dd_l2_cap, abs=0.01), \
+            f"final_pct should equal dd_l2_cap ({high_dd_l2_cap}%)"
+        assert f"DD_CAP_{int(high_dd_l2_cap)}" in result.reasons
 
     def test_killswitch_blocks_regardless_of_mode(self):
         """EXTREME mode cannot override kill-switch."""

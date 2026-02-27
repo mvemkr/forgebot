@@ -83,6 +83,13 @@ MAX_TRADES_PER_WEEK_STANDARD: int = 2   # equity ≥ SMALL_ACCOUNT_THRESHOLD
 # Default True here for measurement; production default may differ after backtests.
 REQUIRE_HTF_TREND_ALIGNMENT:  bool = True
 
+# Pro-trend-only entry gate (W2 diagnostic / LOW risk-mode behavior).
+# When True: require Weekly AND Daily bias to agree with trade direction.
+# 4H is exempt — Alex often enters during 4H retracements.
+# The existing HTF countertrend block (all W+D+4H oppose) remains active.
+# Default False (Alex's full counter-trend style is preserved).
+PROTREND_ONLY:  bool = False
+
 # Time-based session rules (Alex: "no Thu/Fri, not worth the spread")
 # NO_SUNDAY_TRADES: block all of Sunday (forex wick creation period)
 # NO_THU_FRI_TRADES: block Thu from 09:00 ET onward and all Friday
@@ -790,6 +797,8 @@ def get_model_tags(trail_arm: str = "", pairs_hash: str = "") -> list:
     if _rr_ct and _rr_ct != _rr_std:
         tags.append(f"rr_ct_{_rr_ct:.1f}_std_{_rr_std:.1f}")
     if getattr(m, "INDECISION_FILTER_ENABLED", False): tags.append("doji_gate")
+
+    if getattr(m, "PROTREND_ONLY", False): tags.append("protrend_only")
 
     # ── Pairs hash (injected by caller) ─────────────────────────────────────
     if pairs_hash:
