@@ -248,10 +248,24 @@ def api_status():
     tot_tr  = stats.get("trades", 0)   if isinstance(stats, dict) else 0
     tot_pnl = stats.get("total_pnl", 0) if isinstance(stats, dict) else 0
 
-    # Drawdown from peak — prefer live OANDA balance, fall back to saved
-    bal    = account.get("balance", 0) if isinstance(account, dict) else 0
-    bal    = bal or bot_state.get("account_balance", 0)
-    dd_pct = round((peak_bal - bal) / peak_bal * 100, 1) if peak_bal > 0 and bal < peak_bal else (drawdown_pct_saved or 0.0)
+    # ── Equity / NAV: AccountState is authoritative, broker dict is secondary ──
+    # For LIVE_PAPER the broker dict has $0 (unfunded demo account) — never use it.
+    # For LIVE_REAL with unknown equity the bot_state carries None explicitly.
+    account_mode_val = bot_stats.get("account_mode", merged_hb.get("account_mode", "live_paper"))
+    is_live_paper    = account_mode_val == "live_paper"
+
+    # Prefer bot_state equity (from AccountState); fall back to broker only for LIVE_REAL
+    bot_equity  = bot_stats.get("account_equity",   merged_hb.get("account_equity"))
+    broker_bal  = (account.get("balance") if isinstance(account, dict) and not is_live_paper else None)
+    bal         = bot_equity if bot_equity is not None else broker_bal   # None = UNKNOWN
+
+    # For drawdown we need a float; use safe fallback but mark UNKNOWN separately
+    bal_for_dd  = bal if bal is not None else 0.0
+    dd_pct      = round((peak_bal - bal_for_dd) / peak_bal * 100, 1) if peak_bal > 0 and bal_for_dd < peak_bal else (drawdown_pct_saved or 0.0)
+
+    # NAV: from bot_state (mode-aware, computed in orchestrator); never from broker for paper
+    nav_val        = bot_stats.get("nav", merged_hb.get("nav"))
+    unrealized_val = bot_stats.get("unrealized_pnl", merged_hb.get("unrealized_pnl", 0.0))
 
     # Confluence state: dict keyed by pair, sorted by decision priority
     raw_confluence = bot_state.get("confluence_state", {})
@@ -304,8 +318,9 @@ def api_status():
         "drawdown_pct":       dd_pct,
         "regroup_ends":       regroup_ends,
         "pattern_memory_count": pattern_ct,
-        "account_balance":    bal,
-        # performance
+        "account_balance":    bal,          # None = UNKNOWN (never 0 for live_paper)
+        "nav":                nav_val,      # None = UNKNOWN; equity+unrealized for paper
+        "unrealized_pnl":     unrealized_val,
         "win_rate":           round(wr * 100, 1),
         "total_trades":       tot_tr,
         "total_pnl":          tot_pnl,

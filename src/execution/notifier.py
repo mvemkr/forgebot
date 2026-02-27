@@ -146,7 +146,7 @@ class Notifier:
     def send_standings(
         self,
         account_balance:  float,
-        nav:              float,
+        nav,              # float | None — None shown as N/A (broker unknown)
         unrealized_pnl:   float,
         weekly_pnl:       float,
         peak_balance:     float,
@@ -197,7 +197,7 @@ class Notifier:
             f"<b>📊 Standings Update</b>\n\n"
             f"  Mode:      {mode_tag}{ends_tag}\n"
             f"  Balance:   <b>${account_balance:,.2f}</b>\n"
-            f"  NAV:       ${nav:,.2f}  (unrealized: ${unrealized_pnl:+,.2f})\n"
+            f"  NAV:       {('$'+f'{nav:,.2f}') if nav is not None else 'N/A'}  (unrealized: ${unrealized_pnl:+,.2f})\n"
             f"  This week: {weekly_tag}  |  {wins_this_week}W / {losses_this_week}L  "
             f"({trades_this_week} trade{'s' if trades_this_week != 1 else ''})\n"
             f"  Drawdown:  {dd_tag}\n"

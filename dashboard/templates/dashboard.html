@@ -311,8 +311,15 @@
       <div class="font-mono font-bold text-2xl mt-1"
            :class="state.equity_unknown ? 'text-error' : 'text-success'"
            x-text="state.equity_unknown ? '— UNKNOWN —' : ('$' + fmt(state.account_balance || acct.balance))">—</div>
-      <div class="stat-desc"
-           x-text="state.account_mode_label || (state.dry_run === false ? 'LIVE REAL' : 'LIVE PAPER')">—</div>
+      <div class="stat-desc flex flex-col gap-0.5">
+        <span x-text="state.account_mode_label || (state.dry_run === false ? 'LIVE REAL' : 'LIVE PAPER')"></span>
+        <!-- NAV line: equity + unrealized, or N/A if unknown -->
+        <span :class="state.nav === null || state.nav === undefined ? 'text-warning' : ''"
+              x-text="(state.nav !== null && state.nav !== undefined)
+                       ? ('NAV: $' + fmt(state.nav) + (state.unrealized_pnl ? ' (' + (state.unrealized_pnl >= 0 ? '+' : '') + '$' + Math.abs(state.unrealized_pnl||0).toFixed(2) + ' unrealized)' : ''))
+                       : 'NAV: N/A'">
+        </span>
+      </div>
     </div>
     <!-- Planned Risk vs Session PnL tile -->
     <div class="stat bg-base-200 rounded-2xl border border-base-300">
@@ -1410,6 +1417,7 @@ function dashboard() {
           'entry_trigger_mode','max_concurrent_live','max_concurrent_backtest',
           'account_mode','account_mode_label','equity_source','equity_unknown',
           'equity_display','realized_session_pnl','broker_fetch_failures',
+          'nav','unrealized_pnl',
           'pause_new_entries','reason','updated_by','last_updated',
           'risk_mode','risk_mode_mult','regime_weekly_caps','regime_score'];
         this.state = { ...(status.heartbeat || {}) };

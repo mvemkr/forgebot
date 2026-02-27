@@ -169,18 +169,23 @@ class ForexOrchestrator:
                 self.account = AccountState.for_live_real(None)   # equity = UNKNOWN
                 logger.warning("[LIVE REAL] Starting with equity UNKNOWN — entries blocked until broker responds")
         else:
-            # LIVE_PAPER: load persisted paper balance (or start fresh)
+            # LIVE_PAPER: load persisted paper balance (or start fresh).
+            # Broker summary is still fetched for open-trade sync, but we NEVER
+            # use broker nav/balance/unrealized_pnl — they belong to the demo
+            # account (typically $0) and are meaningless for paper sizing.
             try:
-                summary             = self.oanda.get_account_summary()
-                self.account_nav    = summary.get("nav",            0.0)
-                self.unrealized_pnl = summary.get("unrealized_pnl", 0.0)
+                self.oanda.get_account_summary()   # connectivity check only; value discarded
             except Exception:
-                pass  # paper mode: broker summary is optional (used for position sync only)
+                pass  # paper mode: broker connectivity is optional at startup
             # SIM_STARTING_EQUITY seeds paper_account.json on first run only;
             # subsequent restarts always load persisted equity from disk.
             self.account = AccountState.for_live_paper(SIM_STARTING_EQUITY)
+            # NAV = paper equity (no open positions at startup → unrealized = 0)
+            self.account_nav    = self.account.equity   # type: ignore[assignment]
+            self.unrealized_pnl = 0.0
             logger.info(
                 f"[LIVE PAPER] Paper equity: {self.account.equity_display} "
+                f"| NAV: {self.account.equity_display} "
                 f"(SIM_STARTING_EQUITY={SIM_STARTING_EQUITY:,.0f})"
             )
 
@@ -391,15 +396,23 @@ class ForexOrchestrator:
         try:
             summary = self.oanda.get_account_summary()
             if self.account.mode == AccountMode.LIVE_REAL:
+                # LIVE_REAL: equity + NAV from broker; None fallback (never 0)
                 self.account.update_from_broker(summary)
-            # For LIVE_PAPER we still fetch summary for NAV / unrealized_pnl display
-            # but do NOT overwrite paper equity with broker balance.
-            self.account_nav    = summary.get("nav",            self.account_nav)
-            self.unrealized_pnl = summary.get("unrealized_pnl", 0.0)
+                broker_nav          = summary.get("nav")
+                self.account_nav    = broker_nav if broker_nav is not None else self.account.equity
+                self.unrealized_pnl = summary.get("unrealized_pnl") or 0.0
+            else:
+                # LIVE_PAPER: broker summary fetched only for open-trade sync.
+                # NAV and equity must NEVER come from the broker; paper account
+                # is typically $0 and would corrupt sizing / display.
+                # NAV = paper equity + simulated unrealized PnL (currently 0).
+                self.unrealized_pnl = 0.0   # paper mode: no live floating PnL yet
+                self.account_nav    = (self.account.equity or 0.0) + self.unrealized_pnl
         except Exception as e:
             logger.warning(f"Balance refresh failed: {e}")
             if self.account.mode == AccountMode.LIVE_REAL:
                 self.account.mark_broker_failed()
+                self.account_nav = None   # explicitly UNKNOWN — do NOT default to 0
 
         # Keep backward-compat attribute in sync (may be None for LIVE_REAL on failure)
         self.account_balance = self.account.equity
@@ -1348,8 +1361,11 @@ class ForexOrchestrator:
                 stats            = {
                     "traded_patterns":     len(self.strategy.traded_patterns),
                     "mode":                risk_status["mode"],
-                    "tier":                risk_status["tier_label"],
+                    "tier":               risk_status["tier_label"],
                     "peak_balance":        risk_status["peak_balance"],
+                    # nav / unrealized — mode-aware; None means broker fetch failed
+                    "nav":                self.account_nav,
+                    "unrealized_pnl":     self.unrealized_pnl,
                     "drawdown_pct":        risk_status["drawdown_pct"],
                     "regroup_ends":        risk_status["regroup_ends"],
                     "base_risk_pct":       risk_status["base_risk_pct"],
@@ -1428,6 +1444,8 @@ class ForexOrchestrator:
                 "open_positions":     list(self.strategy.open_positions.keys()),
                 "account_balance":    _hb_bal,
                 "account_equity":     self.account.equity,        # None = UNKNOWN
+                "nav":                self.account_nav,            # None = UNKNOWN
+                "unrealized_pnl":     self.unrealized_pnl,
                 "account_mode":       self.account.mode.value,
                 "equity_source":      self.account.equity_source,
                 "equity_unknown":     self.account.is_unknown,
