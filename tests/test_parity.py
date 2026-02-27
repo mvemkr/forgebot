@@ -133,23 +133,23 @@ class TestDDCaps:
     """Graduated DD caps: L1 (≥15% DD → 10%) and L2 (≥25% DD → 6%)."""
 
     def test_dd_cap_10_at_18pct(self, tmp_path):
-        """18% DD → DD_CAP_10 (base capped at 10%)."""
-        rm = _make_risk(tmp_path, peak=10_000)
-        pct, flag = rm.get_risk_pct_with_dd(8_200, peak_equity=10_000, consecutive_losses=0)
+        """18% DD → DD_CAP_10. $10K balance (tier-1=15%) so cap fires; peak ~$12.2K."""
+        rm = _make_risk(tmp_path, peak=12_200)
+        pct, flag = rm.get_risk_pct_with_dd(10_000, peak_equity=12_200, consecutive_losses=0)
         assert flag == "DD_CAP_10", f"Expected DD_CAP_10, got '{flag}'"
         assert pct <= 10.0
 
     def test_dd_cap_6_at_27pct(self, tmp_path):
-        """27% DD → DD_CAP_6 (base capped at 6%)."""
-        rm = _make_risk(tmp_path, peak=10_000)
-        pct, flag = rm.get_risk_pct_with_dd(7_300, peak_equity=10_000, consecutive_losses=0)
+        """27% DD → DD_CAP_6. $10K balance (tier-1=15%) so cap fires; peak ~$13.7K."""
+        rm = _make_risk(tmp_path, peak=13_700)
+        pct, flag = rm.get_risk_pct_with_dd(10_000, peak_equity=13_700, consecutive_losses=0)
         assert flag == "DD_CAP_6", f"Expected DD_CAP_6, got '{flag}'"
         assert pct <= 6.0
 
     def test_no_dd_below_15pct(self, tmp_path):
-        """14% DD → no DD cap (flag = '')."""
-        rm = _make_risk(tmp_path, peak=10_000)
-        pct, flag = rm.get_risk_pct_with_dd(8_600, peak_equity=10_000, consecutive_losses=0)
+        """14% DD at tier-1 balance → no DD cap (flag = '')."""
+        rm = _make_risk(tmp_path, peak=11_700)
+        pct, flag = rm.get_risk_pct_with_dd(10_000, peak_equity=11_700, consecutive_losses=0)
         assert flag == "", f"Expected no cap, got '{flag}'"
         assert pct > 0.0
 
@@ -161,10 +161,9 @@ class TestDDCaps:
         assert pct > 0.0
 
     def test_dd_cap_uses_provided_peak(self, tmp_path):
-        """peak_equity arg overrides self._peak_balance."""
-        rm = _make_risk(tmp_path, peak=5_000)   # stale peak
-        # Provide explicit peak = 10_000 → same result as above
-        pct, flag = rm.get_risk_pct_with_dd(8_200, peak_equity=10_000, consecutive_losses=0)
+        """peak_equity arg overrides self._peak_balance (stale inner peak)."""
+        rm = _make_risk(tmp_path, peak=5_000)   # stale — must be ignored
+        pct, flag = rm.get_risk_pct_with_dd(10_000, peak_equity=12_200, consecutive_losses=0)
         assert flag == "DD_CAP_10"
 
 
@@ -205,12 +204,11 @@ class TestStreakBrake:
         assert flag == ""
 
     def test_dd_cap_dominates_streak(self, tmp_path):
-        """When DD_CAP is already tighter than streak cap, DD_CAP flag wins."""
-        rm = _make_risk(tmp_path, peak=10_000)
-        # DD_CAP_6 (27% DD) with 2-loss streak: both want to cap at 6%
-        # DD cap is checked first → flag = "DD_CAP_6", streak sees final_pct already ≤ 6%
-        # streak flag is NOT overwritten because `if not flag` guard in the code
-        pct, flag = rm.get_risk_pct_with_dd(7_300, peak_equity=10_000, consecutive_losses=2)
+        """When DD_CAP fires first, DD_CAP flag wins over streak flag."""
+        rm = _make_risk(tmp_path, peak=13_700)
+        # $10K balance (tier-1=15%), peak=$13.7K → 27% DD → DD_CAP_6 fires first.
+        # 2-loss streak also wants cap at 6%, but DD_CAP_6 is the first reason.
+        pct, flag = rm.get_risk_pct_with_dd(10_000, peak_equity=13_700, consecutive_losses=2)
         assert flag == "DD_CAP_6", f"DD cap should win the flag, got '{flag}'"
         assert pct <= 6.0
 

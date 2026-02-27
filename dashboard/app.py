@@ -23,6 +23,10 @@ HEARTBEAT_FILE = LOG_DIR / "forex_orchestrator.heartbeat"
 STATE_FILE     = LOG_DIR / "bot_state.json"
 DECISIONS_FILE = LOG_DIR / "decision_log.jsonl"
 CONTROL_FILE   = LOG_DIR / "bot_control.json"
+
+# Persistent control plane (pause_new_entries) — separate from one-shot bot_control.json
+RUNTIME_STATE_DIR   = Path.home() / "trading-bot" / "runtime_state"
+RUNTIME_CONTROL_FILE = RUNTIME_STATE_DIR / "control.json"
 # Two independent whitelist files — live never touches backtest and vice versa
 WHITELIST_LIVE_FILE      = LOG_DIR / "whitelist_live.json"
 WHITELIST_BACKTEST_FILE  = LOG_DIR / "whitelist_backtest.json"
@@ -317,7 +321,52 @@ def api_status():
         "max_concurrent_live":          MAX_CONCURRENT_TRADES_LIVE,
         "max_concurrent_backtest":      MAX_CONCURRENT_TRADES_BACKTEST,
         "regime_score":                 bot_stats.get("regime_score"),  # dict or None
+        # ── Control plane (pause_new_entries) ────────────────────────────
+        **_load_control_state(),
+        # ── Regime / risk mode ────────────────────────────────────────────
+        "risk_mode":                    bot_stats.get("risk_mode"),
+        "risk_mode_mult":               bot_stats.get("risk_mode_mult"),
+        "regime_weekly_caps":           bot_stats.get("regime_weekly_caps"),
+        # ── Risk tier index (for status panel) ───────────────────────────
+        "tier_label":                   tier_label,
+        # ── Account mode + equity source ─────────────────────────────────
+        "account_mode":                 bot_stats.get("account_mode",           merged_hb.get("account_mode", "live_paper")),
+        "account_mode_label":           bot_stats.get("account_mode_label",     merged_hb.get("account_mode_label", "LIVE PAPER")),
+        "equity_source":                bot_stats.get("account_equity_source",  merged_hb.get("equity_source", "SIM")),
+        "equity_unknown":               bot_stats.get("account_is_unknown",     merged_hb.get("equity_unknown", False)),
+        "equity_display":               bot_stats.get("account_equity_display", merged_hb.get("equity_display", "—")),
+        "realized_session_pnl":         bot_stats.get("account_realized_session_pnl", 0.0),
+        "broker_fetch_failures":        bot_stats.get("account_broker_fetch_failures", 0),
     })
+
+def _load_control_state() -> dict:
+    """Read runtime_state/control.json; return safe default if missing/corrupt."""
+    default = {"pause_new_entries": False, "last_updated": None,
+               "updated_by": "system", "reason": ""}
+    if not RUNTIME_CONTROL_FILE.exists():
+        return default
+    try:
+        return {**default, **json.loads(RUNTIME_CONTROL_FILE.read_text())}
+    except Exception:
+        return default
+
+
+def _write_control_state(pause: bool, reason: str, updated_by: str = "dashboard") -> dict:
+    """Write runtime_state/control.json atomically; return new state."""
+    import os, tempfile
+    state = {
+        "pause_new_entries": pause,
+        "last_updated":      datetime.now(timezone.utc).isoformat(),
+        "updated_by":        updated_by,
+        "reason":            reason,
+    }
+    RUNTIME_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=RUNTIME_STATE_DIR, suffix=".tmp", prefix="control_")
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, RUNTIME_CONTROL_FILE)
+    return state
+
 
 def _write_control_audit(command: str, reason: str):
     """Append a pause/resume audit entry to decision_log.jsonl."""
@@ -362,6 +411,58 @@ def api_resume():
         return jsonify({"status": "ok", "command": "resume", "reason": reason})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/pause_entries", methods=["POST"])
+def api_pause_entries():
+    """
+    Pause NEW entries only.
+    Open positions continue to be managed (trail, stop, exits unaffected).
+    Persists in runtime_state/control.json — survives restarts.
+    """
+    data   = request.get_json() or {}
+    reason = data.get("reason", "Dashboard pause request")
+    try:
+        _write_control_audit("pause_entries", reason)
+        state = _write_control_state(pause=True, reason=reason, updated_by="dashboard")
+        return jsonify({"status": "ok", "pause_new_entries": True, "reason": reason,
+                        "last_updated": state["last_updated"]})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/resume_entries", methods=["POST"])
+def api_resume_entries():
+    """
+    Resume new entries after pause_entries.
+    Persistent — survives restarts until explicitly paused again.
+    """
+    data   = request.get_json() or {}
+    reason = data.get("reason", "Dashboard resume")
+    try:
+        _write_control_audit("resume_entries", reason)
+        state = _write_control_state(pause=False, reason=reason, updated_by="dashboard")
+        return jsonify({"status": "ok", "pause_new_entries": False, "reason": reason,
+                        "last_updated": state["last_updated"]})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/control_state", methods=["GET"])
+def api_control_state():
+    """Return current persistent control state (pause_new_entries, risk_mode, etc.)."""
+    ctrl = _load_control_state()
+    # Merge in risk_mode from bot_state if available
+    try:
+        bot_state = load_bot_state()
+        bot_stats = bot_state.get("stats", {})
+        ctrl["risk_mode"]          = bot_stats.get("risk_mode")
+        ctrl["risk_mode_mult"]     = bot_stats.get("risk_mode_mult")
+        ctrl["regime_weekly_caps"] = bot_stats.get("regime_weekly_caps")
+        ctrl["regime_score"]       = bot_stats.get("regime_score")
+    except Exception:
+        pass
+    return jsonify(ctrl)
 
 
 def _whitelist_file(scope: str) -> Path:

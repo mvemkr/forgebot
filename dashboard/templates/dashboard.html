@@ -46,17 +46,43 @@
       <div class="font-bold text-lg leading-tight">Forge Bot</div>
       <div class="text-xs text-base-content/50">Set & Forget Forex Strategy</div>
     </div>
-    <div class="badge ml-2" :class="state.dry_run === false ? 'badge-error' : 'badge-success'">
-      <span x-text="state.dry_run === false ? '⚠️ LIVE' : '🧪 DRY RUN'"></span>
+    <!-- Account mode badge: replaces old DRY RUN / LIVE label -->
+    <div class="badge ml-2 font-mono"
+         :class="{
+           'badge-error':   state.account_mode === 'live_real',
+           'badge-warning': state.account_mode === 'live_paper',
+           'badge-ghost':   !state.account_mode || state.account_mode === 'backtest'
+         }"
+         :title="state.account_mode_label || state.account_mode">
+      <span x-text="state.account_mode === 'live_real'  ? '⚠️ LIVE REAL'   :
+                    state.account_mode === 'live_paper' ? '🧪 LIVE PAPER'  :
+                    state.account_mode === 'backtest'   ? '📊 BACKTEST'    :
+                    state.dry_run === false              ? '⚠️ LIVE REAL'   : '🧪 LIVE PAPER'"></span>
     </div>
     <div x-show="state.halted" class="badge badge-error gap-1 ml-1">
       <i class="ph ph-warning"></i> HALTED
     </div>
   </div>
   <div class="flex-none flex flex-wrap items-center justify-end gap-x-5 gap-y-2 text-right">
-    <div class="text-right min-w-[140px]">
-      <div class="text-xs text-base-content/50 whitespace-nowrap">Account Balance</div>
-      <div class="font-mono font-bold text-success text-lg" x-text="'$' + fmt(state.account_balance)">—</div>
+    <div class="text-right min-w-[150px]">
+      <div class="flex items-center justify-end gap-1">
+        <span class="text-xs text-base-content/50 whitespace-nowrap">Account Balance</span>
+        <!-- Equity source chip -->
+        <span class="badge badge-xs font-mono"
+              :class="{
+                'badge-error':   state.equity_unknown,
+                'badge-success': state.equity_source === 'BROKER',
+                'badge-warning': state.equity_source === 'SIM',
+                'badge-ghost':   !state.equity_source
+              }"
+              x-text="state.equity_unknown ? 'UNKNOWN' :
+                       state.equity_source === 'BROKER'    ? 'BROKER'    :
+                       state.equity_source === 'SIM' ? 'SIM'       : '—'">
+        </span>
+      </div>
+      <div class="font-mono font-bold text-lg"
+           :class="state.equity_unknown ? 'text-error' : 'text-success'"
+           x-text="state.equity_unknown ? '— UNKNOWN —' : ('$' + fmt(state.account_balance))">—</div>
     </div>
     <div class="text-right min-w-[180px]">
       <div class="text-xs text-base-content/50 whitespace-nowrap">Risk / trade</div>
@@ -73,12 +99,12 @@
         <div class="text-base-content/40" x-text="lastSeen">—</div>
       </div>
     </div>
-    <!-- Pause / Resume controls -->
+    <!-- Pause / Resume controls (full bot stop) -->
     <div class="flex gap-1">
       <button class="btn btn-xs btn-error gap-1"
               x-show="!state.paused"
               @click="pauseBot()"
-              title="Pause trading (bot stops entering new trades)">
+              title="Full pause — stops all execution">
         <i class="ph ph-pause-circle"></i> Pause
       </button>
       <button class="btn btn-xs btn-success gap-1"
@@ -87,6 +113,32 @@
               title="Resume trading">
         <i class="ph ph-play-circle"></i> Resume
       </button>
+    </div>
+    <!-- Pause Entries toggle (entries only — open positions still managed) -->
+    <div class="flex gap-1">
+      <button class="btn btn-xs btn-warning gap-1"
+              x-show="!state.pause_new_entries"
+              @click="pauseEntries()"
+              title="Block new entries only — open positions continue to be managed">
+        <i class="ph ph-hand"></i> Pause Entries
+      </button>
+      <button class="btn btn-xs btn-success gap-1"
+              x-show="state.pause_new_entries"
+              @click="resumeEntries()"
+              title="Allow new entries again">
+        <i class="ph ph-play"></i> Resume Entries
+      </button>
+    </div>
+    <!-- Market State badge -->
+    <div class="badge badge-outline gap-1 font-mono text-xs"
+         :class="{
+           'badge-error':   state.risk_mode === 'EXTREME',
+           'badge-warning': state.risk_mode === 'HIGH',
+           'badge-info':    state.risk_mode === 'MEDIUM',
+           'badge-ghost':   state.risk_mode === 'LOW' || !state.risk_mode
+         }"
+         :title="'Market State: ' + (state.risk_mode || '—') + (state.risk_mode_mult ? ' (' + state.risk_mode_mult + '× risk)' : '')"
+         x-text="state.risk_mode ? ('MKT: ' + state.risk_mode) : 'MKT STATE—'">
     </div>
     <div class="countdown font-mono text-sm opacity-40 hidden lg:block">
       <span x-text="refreshIn + 's'"></span>
@@ -116,6 +168,40 @@
   <button class="btn btn-sm btn-success gap-1" @click="resumeBot()">
     <i class="ph ph-play-circle"></i> Resume Trading
   </button>
+</div>
+
+<!-- Entries paused banner (new entries blocked; open positions still managed) -->
+<div x-show="state.pause_new_entries && !state.paused"
+     class="alert alert-warning rounded-none flex justify-between">
+  <div class="flex items-center gap-3">
+    <i class="ph ph-hand ph-bold text-xl"></i>
+    <span>🟡 <strong>ENTRIES PAUSED</strong> — No new trades opened.
+      Open positions continue to be managed normally.
+      <span x-show="state.reason" class="opacity-70 ml-1">
+        Reason: <em x-text="state.reason"></em>
+      </span>
+      <span x-show="state.last_updated" class="opacity-50 ml-1 text-xs">
+        Set <span x-text="state.last_updated ? new Date(state.last_updated).toLocaleString() : ''"></span>
+        by <span x-text="state.updated_by || '?'"></span>
+      </span>
+    </span>
+  </div>
+  <button class="btn btn-sm btn-success gap-1" @click="resumeEntries()">
+    <i class="ph ph-play"></i> Resume Entries
+  </button>
+</div>
+
+<!-- Equity unknown banner (LIVE REAL only — broker fetch failed) -->
+<div x-show="state.equity_unknown && state.account_mode === 'live_real'"
+     class="alert alert-error rounded-none flex justify-between">
+  <div class="flex items-center gap-3">
+    <i class="ph ph-cloud-slash ph-bold text-xl"></i>
+    <span>🔴 <strong>EQUITY UNKNOWN</strong> — Broker fetch failed
+      (<span x-text="(state.broker_fetch_failures || '?') + ' consecutive failure(s)'"></span>).
+      New entries are blocked. Open positions continue to be managed.
+    </span>
+  </div>
+  <span class="badge badge-error font-mono text-xs">NO NEW ENTRIES</span>
 </div>
 
 <!-- ── WHY NOT TRADING? BANNER ───────────────────────────── -->
@@ -202,21 +288,50 @@
 
   <!-- ── ACCOUNT STATS ROW ────────────────────────────── -->
   <div class="col-span-12 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-    <div class="stat bg-base-200 rounded-2xl border border-base-300">
-      <div class="stat-figure text-success"><i class="ph ph-currency-dollar ph-bold text-3xl"></i></div>
-      <div class="stat-title">Balance</div>
-      <div class="stat-value text-success font-mono text-2xl" x-text="'$' + fmt(state.account_balance || acct.balance)">—</div>
-      <div class="stat-desc" x-text="'NAV: $' + fmt(acct.nav)">—</div>
-    </div>
-    <div class="stat bg-base-200 rounded-2xl border border-base-300">
-      <div class="stat-figure" :class="(acct.unrealized_pnl||0) >= 0 ? 'text-success' : 'text-error'">
-        <i class="ph ph-trend-up ph-bold text-3xl" x-show="(acct.unrealized_pnl||0) >= 0"></i>
-        <i class="ph ph-trend-down ph-bold text-3xl" x-show="(acct.unrealized_pnl||0) < 0"></i>
+    <!-- Balance tile — shows equity source chip + UNKNOWN state -->
+    <div class="stat bg-base-200 rounded-2xl border border-base-300"
+         :class="state.equity_unknown ? 'border-error/50' : ''">
+      <div class="stat-figure"
+           :class="state.equity_unknown ? 'text-error' : 'text-success'">
+        <i class="ph ph-currency-dollar ph-bold text-3xl"></i>
       </div>
-      <div class="stat-title">Unrealized P&L</div>
-      <div class="stat-value font-mono text-2xl" :class="(acct.unrealized_pnl||0)>=0?'text-success':'text-error'"
-           x-text="((acct.unrealized_pnl||0)>=0?'+':'') + '$' + Math.abs(acct.unrealized_pnl||0).toFixed(2)">—</div>
-      <div class="stat-desc" x-text="(acct.open_trades||0) + ' open trade(s)'"></div>
+      <div class="stat-title flex items-center gap-1">
+        Equity
+        <span class="badge badge-xs font-mono ml-1"
+              :class="{
+                'badge-error':   state.equity_unknown,
+                'badge-success': state.equity_source === 'BROKER',
+                'badge-warning': state.equity_source === 'SIM'
+              }"
+              x-text="state.equity_unknown ? 'UNKNOWN' :
+                       state.equity_source === 'BROKER' ? 'BROKER' :
+                       state.equity_source === 'SIM' ? 'SIM' : '—'">
+        </span>
+      </div>
+      <div class="font-mono font-bold text-2xl mt-1"
+           :class="state.equity_unknown ? 'text-error' : 'text-success'"
+           x-text="state.equity_unknown ? '— UNKNOWN —' : ('$' + fmt(state.account_balance || acct.balance))">—</div>
+      <div class="stat-desc"
+           x-text="state.account_mode_label || (state.dry_run === false ? 'LIVE REAL' : 'LIVE PAPER')">—</div>
+    </div>
+    <!-- Planned Risk vs Session PnL tile -->
+    <div class="stat bg-base-200 rounded-2xl border border-base-300">
+      <div class="stat-figure"
+           :class="(state.realized_session_pnl||0) >= 0 ? 'text-success' : 'text-error'">
+        <i class="ph ph-scales ph-bold text-3xl"></i>
+      </div>
+      <div class="stat-title">Planned Risk / Session PnL</div>
+      <div class="font-mono font-bold text-lg mt-1"
+           :class="state.equity_unknown ? 'text-base-content/40' : 'text-base-content'"
+           x-text="state.equity_unknown ? '— / —' :
+                   ('$' + fmt(state.final_risk_dollars||0) + ' / ' +
+                    ((state.realized_session_pnl||0)>=0?'+':'') +
+                    '$' + Math.abs(state.realized_session_pnl||0).toFixed(2))">—</div>
+      <div class="stat-desc">
+        <span x-text="'Risk: ' + (state.final_risk_pct||state.risk_pct||'—') + '%'"></span>
+        <span x-show="state.equity_source === 'SIM'" class="ml-1 opacity-60">· simulated</span>
+        <span x-show="state.equity_source === 'BROKER'" class="ml-1 opacity-60">· broker confirmed</span>
+      </div>
     </div>
     <div class="stat bg-base-200 rounded-2xl border border-base-300">
       <div class="stat-figure text-info"><i class="ph ph-chart-line-up ph-bold text-3xl"></i></div>
@@ -1223,6 +1338,41 @@ function dashboard() {
       } catch(e) { alert('Resume request failed: ' + e); }
     },
 
+    async pauseEntries() {
+      if (!confirm('Pause new entries?\nOpen positions will continue to be managed.\nPersists across restarts.')) return;
+      try {
+        const r = await fetch('/api/pause_entries', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Dashboard pause entries'})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.pause_new_entries = true;
+          await this.refresh();
+        } else {
+          alert('Pause entries failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Pause entries request failed: ' + e); }
+    },
+
+    async resumeEntries() {
+      try {
+        const r = await fetch('/api/resume_entries', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Dashboard resume entries'})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.pause_new_entries = false;
+          await this.refresh();
+        } else {
+          alert('Resume entries failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Resume entries request failed: ' + e); }
+    },
+
     async fetchNews() {
       try {
         const r = await fetch('/api/news');
@@ -1257,7 +1407,11 @@ function dashboard() {
           'peak_source','session_allowed','session_reason','next_session','next_session_mins',
           'whitelist_live_enabled','whitelist_live_pairs','whitelist_live_updated_at',
           'whitelist_backtest_enabled','whitelist_backtest_pairs','whitelist_backtest_updated_at',
-          'entry_trigger_mode','max_concurrent_live','max_concurrent_backtest'];
+          'entry_trigger_mode','max_concurrent_live','max_concurrent_backtest',
+          'account_mode','account_mode_label','equity_source','equity_unknown',
+          'equity_display','realized_session_pnl','broker_fetch_failures',
+          'pause_new_entries','reason','updated_by','last_updated',
+          'risk_mode','risk_mode_mult','regime_weekly_caps','regime_score'];
         this.state = { ...(status.heartbeat || {}) };
         for (const k of _topFields) {
           if (status[k] !== undefined) this.state[k] = status[k];
@@ -1511,7 +1665,7 @@ function dashboard() {
         x-text="'concurrent: live=' + state.max_concurrent_live + ' bt=' + state.max_concurrent_backtest"></span>
   <span x-show="state.regime_score"
         :class="state.regime_score?.regime_score >= 3.0 ? 'text-success' : ''"
-        x-text="state.regime_score ? 'regime: ' + state.regime_score.regime_score.toFixed(1) + (state.regime_score.eligible_high ? ' ✓HIGH' : '') + (state.regime_score.eligible_extreme ? ' ⚡EXTREME' : '') : ''"></span>
+        x-text="state.regime_score ? 'market state: ' + (state.regime_score.risk_mode || state.regime_score.regime_score?.toFixed(1) || '—') + (state.risk_mode_mult && state.risk_mode_mult !== 1 ? ' ' + state.risk_mode_mult + '×' : '') : ''"></span>
 </div>
 </body>
 </html>

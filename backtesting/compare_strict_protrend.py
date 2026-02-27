@@ -191,12 +191,21 @@ def _fmt_row(label: str, r: BacktestResult, start: datetime, end: datetime,
             f"time={r.time_blocks}  "
             f"htf_ct={r.countertrend_htf_blocks}  "
             f"wd_htf={r.wd_htf_blocks}  "
-            f"strict_htf={r.strict_htf_blocks}  "
             f"wkly={r.weekly_limit_blocks}  "
             f"rr={r.min_rr_small_blocks}  "
             f"dyn_pe={r.dyn_pip_eq_blocks}  "
             f"doji={r.indecision_doji_blocks}"
         )
+    # Stop quality — always shown
+    if r.stop_type_counts:
+        _atr_flag = "  ⚠ >40%" if r.atr_fallback_pct > 40 else ""
+        _st_parts = "  ".join(
+            f"{k.replace('neckline_retest_swing','nk_ret').replace('structural_anchor','struct').replace('broken_level','brk_lvl').replace('atr_fallback','ATR_fb').replace('legacy_pattern_stop','legacy')}={v}"
+            for k, v in sorted(r.stop_type_counts.items(), key=lambda x: -x[1])
+        )
+        row += (f"\n    Stops → {_st_parts}  "
+                f"atr_fb%={r.atr_fallback_pct:.0f}%{_atr_flag}  "
+                f"stop_p50={r.stop_pips_p50:.0f}p")
     return row
 
 

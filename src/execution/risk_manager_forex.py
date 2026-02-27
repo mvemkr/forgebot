@@ -45,6 +45,57 @@ KILL_SWITCH_LOG = Path.home() / "trading-bot" / "logs" / "kill_switch.log"
 REGROUP_STATE_FILE = Path.home() / "trading-bot" / "logs" / "regroup_state.json"
 
 
+# ── RiskSizingResult — single source of truth for ALL risk computations ───────
+# UI display, live executor, and backtester all derive from this one object.
+# Eliminates the "divergent getters" problem: no separate paths for display vs
+# sizing. Every field is derived from the same sequential cap stack.
+
+from dataclasses import dataclass as _dc, field as _field
+
+@_dc
+class RiskSizingResult:
+    """
+    Complete risk decomposition for one potential trade.
+
+    Fields:
+        base_pct       : raw tier % from hysteresis (before mode / DD)
+        mode           : regime mode string ("LOW"/"MEDIUM"/"HIGH"/"EXTREME")
+        mode_mult      : multiplier from mode (1.0 when no mode set)
+        premult_pct    : base × mode_mult  (before DD caps)
+        dd_cap_pct     : DD cap applied (99.0 if none)
+        streak_cap_pct : streak-brake cap applied (99.0 if none)
+        final_pct      : effective risk % after all caps — use this for sizing
+        dd_flag        : "DD_KILLSWITCH" | "DD_CAP_10" | "DD_CAP_6" | ""
+        blocked        : True iff DD_KILLSWITCH fired (final_pct == 0.0)
+        reasons        : ordered list of caps applied, empty if baseline
+    """
+    base_pct:       float
+    mode:           str
+    mode_mult:      float
+    premult_pct:    float
+    dd_cap_pct:     float       # 99.0 = no cap
+    streak_cap_pct: float       # 99.0 = no cap
+    final_pct:      float
+    dd_flag:        str
+    blocked:        bool
+    reasons:        list = _field(default_factory=list)
+
+    # ── Convenience ────────────────────────────────────────────────────
+    def to_dict(self) -> dict:
+        return {
+            "base_pct":       self.base_pct,
+            "risk_mode":      self.mode,
+            "mode_mult":      self.mode_mult,
+            "premult_pct":    self.premult_pct,
+            "dd_cap_pct":     None if self.dd_cap_pct >= 99 else self.dd_cap_pct,
+            "streak_cap_pct": None if self.streak_cap_pct >= 99 else self.streak_cap_pct,
+            "final_pct":      self.final_pct,
+            "dd_flag":        self.dd_flag,
+            "blocked":        self.blocked,
+            "reasons":        self.reasons,
+        }
+
+
 class BotMode(Enum):
     ACTIVE    = "active"       # normal trading
     REGROUP   = "regroup"      # cooldown — observe only, no new trades
@@ -116,6 +167,7 @@ class ForexRiskManager:
         self._paused_at: Optional[datetime] = None
         self._peak_balance: float = 0.0
         self._tier_idx: int = -1           # -1 = unset; initialised on first get_risk_pct call
+        self._regime_mode: Optional[str]  = None   # "LOW"|"MEDIUM"|"HIGH"|"EXTREME"|None
 
         if not backtest:
             KILL_SWITCH_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -199,26 +251,22 @@ class ForexRiskManager:
         )
         return risk_pct
 
-    def get_risk_pct_with_dd(
+    def compute_risk_sizing(
         self,
         account_balance: float,
         peak_equity: Optional[float] = None,
         consecutive_losses: int = 0,
-    ) -> tuple[float, str]:
+    ) -> "RiskSizingResult":
         """
-        Returns (final_risk_pct, reason_flag) with all four risk controls applied
-        in priority order:
+        Single source of truth for all risk sizing.
 
-          1. DD kill-switch  (DD ≥ 40%) → returns (0.0, "DD_KILLSWITCH")
-             Caller MUST treat 0.0 as "block entry entirely" — not a small bet.
-          2. DD graduated caps (15% → cap 10%, 25% → cap 6%)
-          3. Loss-streak brake (2 losses → cap 6%, 3+ losses → cap 3%)
-          4. Absolute dollar risk cap (prevents $ blowups at high equity)
+        Sequential cap stack (same order as before, now returns structured result):
+          1. DD kill-switch  (DD ≥ 40%) → blocked=True, final_pct=0.0
+          2. DD graduated caps
+          3. Loss-streak brake
+          4. Absolute dollar risk cap
 
-        Final risk = min(base_tier, dd_cap, streak_cap, dollar_cap)
-
-        Caps lift only when equity recovers above DD_RESUME_PCT × peak.
-        peak_equity defaults to self._peak_balance when not supplied.
+        Use final_pct for ALL sizing — live executor, backtester, display.
         """
         from src.strategy.forex.strategy_config import (
             DD_CIRCUIT_BREAKER_ENABLED,
@@ -232,46 +280,69 @@ class ForexRiskManager:
             STREAK_L3_LOSSES, STREAK_L3_CAP,
         )
 
-        base = self.get_risk_pct(account_balance)
+        base       = self.get_risk_pct(account_balance)
+        mode_str   = self._regime_mode or ""
+        mode_mult  = self.regime_risk_multiplier()
+        premult    = self.regime_adjusted_risk_pct(base)
 
         if not DD_CIRCUIT_BREAKER_ENABLED:
-            return base, ""
+            return RiskSizingResult(
+                base_pct=base, mode=mode_str, mode_mult=mode_mult,
+                premult_pct=premult, dd_cap_pct=99.0, streak_cap_pct=99.0,
+                final_pct=premult, dd_flag="", blocked=False, reasons=[],
+            )
 
         peak = peak_equity if peak_equity is not None else self._peak_balance
         if peak <= 0:
-            return base, ""
+            return RiskSizingResult(
+                base_pct=base, mode=mode_str, mode_mult=mode_mult,
+                premult_pct=premult, dd_cap_pct=99.0, streak_cap_pct=99.0,
+                final_pct=premult, dd_flag="", blocked=False, reasons=[],
+            )
 
-        dd = (peak - account_balance) / peak   # 0.0 → 1.0
+        dd = (peak - account_balance) / peak
 
-        # ── 1. Kill-switch: hard block at ≥ 40% DD ────────────────────
+        # ── 1. Kill-switch ─────────────────────────────────────────────
         if dd >= DD_KILLSWITCH_PCT / 100:
-            return 0.0, "DD_KILLSWITCH"
+            return RiskSizingResult(
+                base_pct=base, mode=mode_str, mode_mult=mode_mult,
+                premult_pct=premult, dd_cap_pct=0.0, streak_cap_pct=99.0,
+                final_pct=0.0, dd_flag="DD_KILLSWITCH", blocked=True,
+                reasons=["DD_KILLSWITCH"],
+            )
 
-        final_pct = base
-        flag      = ""
+        final_pct      = premult
+        dd_flag        = ""
+        dd_cap_pct     = 99.0
+        streak_cap_pct = 99.0
+        reasons: list  = []
 
-        # ── 2. DD graduated caps ──────────────────────────────────────
+        # ── 2. DD graduated caps ───────────────────────────────────────
         if dd >= DD_L2_PCT / 100:
-            final_pct = min(final_pct, DD_L2_CAP)
-            flag = "DD_CAP_6"
+            dd_cap_pct = DD_L2_CAP
+            if final_pct > DD_L2_CAP:
+                final_pct = DD_L2_CAP
+                dd_flag   = "DD_CAP_6"
+                reasons.append(dd_flag)
         elif dd >= DD_L1_PCT / 100:
-            final_pct = min(final_pct, DD_L1_CAP)
-            flag = "DD_CAP_10"
+            dd_cap_pct = DD_L1_CAP
+            if final_pct > DD_L1_CAP:
+                final_pct = DD_L1_CAP
+                dd_flag   = "DD_CAP_10"
+                reasons.append(dd_flag)
 
-        # ── 3. Loss-streak brake ──────────────────────────────────────
+        # ── 3. Loss-streak brake ───────────────────────────────────────
         if LOSS_STREAK_BRAKE_ENABLED and consecutive_losses > 0:
-            if consecutive_losses >= STREAK_L3_LOSSES:
-                if final_pct > STREAK_L3_CAP:
-                    final_pct = STREAK_L3_CAP
-                    if not flag:
-                        flag = f"STREAK_CAP_{STREAK_L3_CAP:.0f}"
-            elif consecutive_losses >= STREAK_L2_LOSSES:
-                if final_pct > STREAK_L2_CAP:
-                    final_pct = STREAK_L2_CAP
-                    if not flag:
-                        flag = f"STREAK_CAP_{STREAK_L2_CAP:.0f}"
+            if consecutive_losses >= STREAK_L3_LOSSES and final_pct > STREAK_L3_CAP:
+                streak_cap_pct = STREAK_L3_CAP
+                final_pct      = STREAK_L3_CAP
+                reasons.append(f"STREAK_CAP_{STREAK_L3_CAP:.0f}")
+            elif consecutive_losses >= STREAK_L2_LOSSES and final_pct > STREAK_L2_CAP:
+                streak_cap_pct = STREAK_L2_CAP
+                final_pct      = STREAK_L2_CAP
+                reasons.append(f"STREAK_CAP_{STREAK_L2_CAP:.0f}")
 
-        # ── 4. Absolute dollar risk cap ───────────────────────────────
+        # ── 4. Absolute dollar risk cap ────────────────────────────────
         if DOLLAR_RISK_CAP_ENABLED and account_balance > 0:
             max_dollar: Optional[float] = None
             for threshold, cap in DOLLAR_RISK_TIERS:
@@ -279,13 +350,33 @@ class ForexRiskManager:
                     max_dollar = cap
                     break
             if max_dollar is not None:
-                max_pct_from_dollar = max_dollar / account_balance * 100
-                if max_pct_from_dollar < final_pct:
-                    final_pct = max_pct_from_dollar
-                    if not flag:
-                        flag = "DOLLAR_CAP"
+                implied = max_dollar / account_balance * 100
+                if final_pct > implied:
+                    final_pct = implied
+                    reasons.append("DOLLAR_CAP")   # match legacy flag string
 
-        return final_pct, flag or ""
+        return RiskSizingResult(
+            base_pct=base, mode=mode_str, mode_mult=mode_mult,
+            premult_pct=premult, dd_cap_pct=dd_cap_pct,
+            streak_cap_pct=streak_cap_pct, final_pct=final_pct,
+            dd_flag=dd_flag, blocked=False, reasons=reasons,
+        )
+
+    def get_risk_pct_with_dd(
+        self,
+        account_balance: float,
+        peak_equity: Optional[float] = None,
+        consecutive_losses: int = 0,
+    ) -> tuple[float, str]:
+        """
+        Backward-compat shim → compute_risk_sizing().
+        Returns (final_pct, first_reason_flag).
+        first_reason_flag matches old "if not flag" guard: first cap applied wins
+        (DD cap before streak before dollar cap).
+        """
+        r = self.compute_risk_sizing(account_balance, peak_equity, consecutive_losses)
+        flag = r.reasons[0] if r.reasons else ""
+        return r.final_pct, flag
 
     def get_tier_label(self, account_balance: float) -> str:
         # Note: use &lt; not < — these labels are sent via Telegram HTML parse mode
@@ -417,6 +508,69 @@ class ForexRiskManager:
         self._regroup_ends    = None
         self._save_regroup_state()
 
+    # ── Regime mode (risk scaling) ─────────────────────────────────────
+
+    @property
+    def regime_mode(self) -> Optional[str]:
+        """Current regime mode string ("LOW" / "MEDIUM" / "HIGH" / "EXTREME") or None."""
+        return self._regime_mode
+
+    def set_regime_mode(self, mode: Optional[str]) -> None:
+        """
+        Set regime mode from orchestrator after each regime computation.
+        mode must be one of "LOW" | "MEDIUM" | "HIGH" | "EXTREME" | None.
+        None resets to neutral (1.0× multiplier, static weekly caps apply).
+        """
+        from src.strategy.forex.regime_score import RISK_MODE_PARAMS
+        if mode is not None and mode not in RISK_MODE_PARAMS:
+            logger.warning(f"set_regime_mode: unknown mode {mode!r} — ignored")
+            return
+        if mode != self._regime_mode:
+            logger.info(f"📊 Regime mode: {self._regime_mode or 'None'} → {mode or 'None'}")
+        self._regime_mode = mode
+
+    def regime_risk_multiplier(self) -> float:
+        """
+        Risk multiplier from current regime mode.
+        Returns 1.0 when no mode is set (neutral / MEDIUM default).
+        """
+        if not self._regime_mode:
+            return 1.0
+        from src.strategy.forex.regime_score import RISK_MODE_PARAMS
+        return RISK_MODE_PARAMS.get(self._regime_mode, {}).get("risk_mult", 1.0)
+
+    def regime_weekly_caps(self) -> tuple[int, int]:
+        """
+        (weekly_cap_small, weekly_cap_std) from current regime mode.
+        Falls back to strategy_config constants when no mode set.
+        """
+        from src.strategy.forex.regime_score import RISK_MODE_PARAMS
+        from src.strategy.forex import strategy_config as _sc
+        if not self._regime_mode:
+            return _sc.MAX_TRADES_PER_WEEK_SMALL, _sc.MAX_TRADES_PER_WEEK_STANDARD
+        params = RISK_MODE_PARAMS.get(self._regime_mode, {})
+        return (
+            params.get("weekly_cap_small", _sc.MAX_TRADES_PER_WEEK_SMALL),
+            params.get("weekly_cap_std",   _sc.MAX_TRADES_PER_WEEK_STANDARD),
+        )
+
+    def regime_adjusted_risk_pct(self, base_pct: float) -> float:
+        """
+        Apply regime multiplier to a base risk percentage.
+        Clamps to [0.5, 25.0] to prevent pathological values.
+        """
+        adjusted = base_pct * self.regime_risk_multiplier()
+        return max(0.5, min(25.0, adjusted))
+
+    def get_effective_risk_pct(self, account_balance: float) -> float:
+        """
+        Pre-DD-cap risk % (tier × mode_mult).  For display + size previews.
+        Returns compute_risk_sizing().premult_pct — same calc, no extra work.
+        For actual trade-sizing callers should use compute_risk_sizing().final_pct
+        or get_book_risk_pct() which already does so.
+        """
+        return self.compute_risk_sizing(account_balance).premult_pct
+
     def resume_early(self, reason: str = "Manual resume by Mike"):
         """Mike explicitly resumes trading before cooldown expires."""
         logger.warning(f"Early resume: {reason}")
@@ -543,18 +697,25 @@ class ForexRiskManager:
         """
         Return the appropriate risk % for the NEXT trade given current book exposure.
 
-        - First trade:  full tier rate (10/15/20/25%)
-        - Second trade: min(tier_rate, MAX_BOOK_EXPOSURE - committed_pct)
-        - Returns 0.0 if budget is below MIN_SECOND_TRADE_PCT (caller should block)
+        Uses compute_risk_sizing() so regime multiplier and ALL DD caps are applied
+        before the book-budget check.  Single source of truth.
+
+        - First trade:  full effective rate (tier × mode_mult, after caps)
+        - Second trade: min(effective_rate, MAX_BOOK_EXPOSURE - committed_pct)
+        - Returns 0.0 if blocked (killswitch or budget exhausted)
         """
-        tier_rate  = self.get_risk_pct(account_balance)
+        sizing     = self.compute_risk_sizing(account_balance)
+        if sizing.blocked:
+            return 0.0
+
+        effective  = sizing.final_pct
         committed  = self.committed_book_pct(open_positions)
         budget     = self.MAX_BOOK_EXPOSURE - committed
 
         if budget < self.MIN_SECOND_TRADE_PCT:
-            return 0.0   # not enough room for a meaningful second trade
+            return 0.0
 
-        return min(tier_rate, budget)
+        return min(effective, budget)
 
     @staticmethod
     def _open_position_theme_gate(

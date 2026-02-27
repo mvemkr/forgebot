@@ -82,6 +82,11 @@ class BacktestResult:
     regime_avg:          float = 0.0
     regime_pct_high:     float = 0.0    # % trades with score ≥ 3.0
     regime_pct_extreme:  float = 0.0    # % trades with score ≥ 3.5
+    # ── Risk mode time distribution (% of trades in each mode) ──────────
+    risk_mode_pct_low:     float = 0.0   # % trades where RiskMode == LOW
+    risk_mode_pct_medium:  float = 0.0   # % trades where RiskMode == MEDIUM
+    risk_mode_pct_high:    float = 0.0   # % trades where RiskMode == HIGH
+    risk_mode_pct_extreme: float = 0.0   # % trades where RiskMode == EXTREME
 
     # ── Stop selection quality ───────────────────────────────────────────
     stop_type_counts:  dict  = field(default_factory=dict)  # {stop_type: count}

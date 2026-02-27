@@ -91,6 +91,7 @@ from ..strategy.forex.strategy_config import (
     winner_rule_check,
 )
 from ..strategy.forex import alex_policy   # shared Alex small-account gate logic
+from .account_state import AccountMode, AccountState  # execution-mode + equity tracking
 
 
 class ForexOrchestrator:
@@ -114,7 +115,11 @@ class ForexOrchestrator:
 
         self.dry_run  = dry_run
         self.BotMode  = BotMode
-        mode_label    = "DRY RUN" if dry_run else "⚠️  LIVE TRADING"
+        # ── Determine execution mode ───────────────────────────────────────────
+        # dry_run=False → LIVE_REAL (real OANDA orders, equity from broker)
+        # dry_run=True  → LIVE_PAPER (simulated equity, no real orders)
+        exec_mode     = AccountMode.LIVE_PAPER if dry_run else AccountMode.LIVE_REAL
+        mode_label    = exec_mode.value.upper().replace("_", " ")
         logger.info(f"Initializing ForexOrchestrator [{mode_label}]")
 
         self.oanda    = OandaClient()
@@ -122,50 +127,84 @@ class ForexOrchestrator:
         self.notifier = Notifier()
         self.state    = BotState()
 
-        try:
-            summary              = self.oanda.get_account_summary()
-            real_balance         = summary.get("balance", 0.0)
-            self.account_nav     = summary.get("nav", real_balance)
-            self.unrealized_pnl  = summary.get("unrealized_pnl", 0.0)
-            # In dry_run with an unfunded account ($0), use a paper balance so
-            # risk sizing and kill-switch math work correctly.
-            if dry_run and real_balance < 100.0:
-                self.account_balance = DRY_RUN_PAPER_BALANCE
-                logger.info(
-                    f"DRY RUN — OANDA balance ${real_balance:.2f} (unfunded). "
-                    f"Using paper balance ${DRY_RUN_PAPER_BALANCE:,.0f} for sizing."
-                )
-            else:
-                self.account_balance = real_balance
-                logger.info(f"Account balance: ${self.account_balance:,.2f}")
-        except Exception as e:
-            logger.error(f"Could not fetch account balance: {e}")
-            self.account_balance = DRY_RUN_PAPER_BALANCE if dry_run else 4000.0
-            self.account_nav     = self.account_balance
-            self.unrealized_pnl  = 0.0
+        self.account_nav    = 0.0
+        self.unrealized_pnl = 0.0
+
+        # ── Build AccountState ─────────────────────────────────────────────────
+        if exec_mode == AccountMode.LIVE_REAL:
+            try:
+                summary             = self.oanda.get_account_summary()
+                self.account        = AccountState.for_live_real(summary)
+                self.account_nav    = summary.get("nav",            self.account.safe_equity())
+                self.unrealized_pnl = summary.get("unrealized_pnl", 0.0)
+                logger.info(f"[LIVE REAL] Broker equity: {self.account.equity_display}")
+            except Exception as e:
+                logger.error(f"Could not fetch account balance: {e}")
+                self.account = AccountState.for_live_real(None)   # equity = UNKNOWN
+                logger.warning("[LIVE REAL] Starting with equity UNKNOWN — entries blocked until broker responds")
+        else:
+            # LIVE_PAPER: load persisted paper balance (or start fresh)
+            try:
+                summary             = self.oanda.get_account_summary()
+                self.account_nav    = summary.get("nav",            0.0)
+                self.unrealized_pnl = summary.get("unrealized_pnl", 0.0)
+            except Exception:
+                pass  # paper mode: broker summary is optional (used for position sync only)
+            self.account = AccountState.for_live_paper(DRY_RUN_PAPER_BALANCE)
+            logger.info(f"[LIVE PAPER] Paper equity: {self.account.equity_display}")
+
+        # Backward-compat: self.account_balance mirrors account.equity (may be None)
+        self.account_balance = self.account.equity
 
         self.risk             = ForexRiskManager(self.journal)
 
-        # ── Dry-run peak isolation ─────────────────────────────────────
-        # If running in dry_run with a paper balance, the persisted peak may
-        # be from a previous live/practice run (e.g., OANDA practice $10K).
-        # Inheriting that peak permanently caps risk during development and
-        # makes testing misleading.  Reset peak to the paper balance so DD
-        # logic only measures this bot's simulated performance.
-        if dry_run and self.risk._peak_balance > self.account_balance * 1.02:
-            old_peak = self.risk._peak_balance
-            self.risk._peak_balance = self.account_balance
-            self.risk._save_regroup_state()
-            logger.info(
-                f"DRY RUN — reset inherited peak ${old_peak:,.0f} → "
-                f"${self.account_balance:,.0f} (paper balance). "
-                f"DD tracking now starts from scratch."
+        # ── Persistent control plane (pause_new_entries) ───────────────
+        from .control_state import ControlState
+        self.control = ControlState(is_backtest=False)
+
+        # ── LIVE_REAL safety gate: auto-pause on every startup ──────────────
+        # In LIVE_REAL mode entries are paused by default on every restart.
+        # This is a hard safety rule — real money is at stake.
+        # Entries only open after Mike explicitly clicks "Resume Entries" in
+        # the dashboard (or calls /api/resume_entries).
+        if exec_mode == AccountMode.LIVE_REAL and not self.control.pause_new_entries:
+            self.control.pause(
+                "LIVE_REAL startup — auto-paused for safety. Resume via dashboard.",
+                "system:startup",
+            )
+            logger.warning(
+                "⏸  [LIVE REAL] Auto-paused on startup. "
+                "Resume entries via dashboard after confirming system state."
+            )
+        elif self.control.pause_new_entries:
+            logger.warning(
+                f"⏸  STARTUP: pause_new_entries=True "
+                f"(set by {self.control.updated_by}: {self.control.reason!r}). "
+                f"New entries blocked until resumed."
             )
 
-        initial_risk_pct      = self.risk.get_risk_pct(self.account_balance)
+        # ── Paper-mode peak isolation ──────────────────────────────────
+        # In LIVE_PAPER, the risk manager's persisted peak may be stale from a
+        # previous live/practice run (e.g., OANDA practice $10K).
+        # Reset so DD logic only measures this bot's simulated performance.
+        if exec_mode == AccountMode.LIVE_PAPER and self.account.equity is not None:
+            if self.risk._peak_balance > self.account.equity * 1.02:
+                old_peak = self.risk._peak_balance
+                self.risk._peak_balance = self.account.equity
+                self.risk._save_regroup_state()
+                logger.info(
+                    f"[LIVE PAPER] Reset inherited peak ${old_peak:,.0f} → "
+                    f"${self.account.equity:,.0f}. DD tracking starts from scratch."
+                )
+            # Sync AccountState peak with risk manager's persisted peak
+            if self.risk._peak_balance and self.risk._peak_balance > self.account.peak_equity:
+                self.account.peak_equity = self.risk._peak_balance
+
+        _sizing_balance   = self.account.safe_equity(DRY_RUN_PAPER_BALANCE)
+        initial_risk_pct  = self.risk.get_risk_pct(_sizing_balance)
 
         self.strategy = SetAndForgetStrategy(
-            account_balance=self.account_balance,
+            account_balance=_sizing_balance,
             risk_pct=initial_risk_pct,
         )
 
@@ -183,6 +222,7 @@ class ForexOrchestrator:
             journal=self.journal,
             notifier=self.notifier,
             dry_run=dry_run,
+            account=self.account,
         )
 
         self.scanner = WeeklyScanner(self.strategy)
@@ -310,25 +350,33 @@ class ForexOrchestrator:
         # Check control file for commands from Mike (relayed via Forge)
         self._check_control_file()
 
+        # Reload persistent control plane (pause_new_entries may have changed)
+        self.control.reload()
+
         # Save full state to disk (dashboard reads this)
         self._save_state()
 
-        # Refresh balance
+        # ── Balance / equity refresh ──────────────────────────────────────
         try:
-            summary    = self.oanda.get_account_summary()
-            real_bal   = summary.get("balance", self.account_balance)
-            # Dry run with unfunded account: always use paper balance so risk
-            # sizing and kill-switch math work. Never let $0 bleed through.
-            if self.dry_run and real_bal < 100.0:
-                self.account_balance = DRY_RUN_PAPER_BALANCE
-            else:
-                self.account_balance = real_bal
-            self.account_nav     = summary.get("nav",     self.account_nav)
-            self.unrealized_pnl  = summary.get("unrealized_pnl", 0.0)
-            self.strategy.update_balance(self.account_balance)
-            self.strategy.risk_pct = self.risk.get_risk_pct(self.account_balance)
+            summary = self.oanda.get_account_summary()
+            if self.account.mode == AccountMode.LIVE_REAL:
+                self.account.update_from_broker(summary)
+            # For LIVE_PAPER we still fetch summary for NAV / unrealized_pnl display
+            # but do NOT overwrite paper equity with broker balance.
+            self.account_nav    = summary.get("nav",            self.account_nav)
+            self.unrealized_pnl = summary.get("unrealized_pnl", 0.0)
         except Exception as e:
             logger.warning(f"Balance refresh failed: {e}")
+            if self.account.mode == AccountMode.LIVE_REAL:
+                self.account.mark_broker_failed()
+
+        # Keep backward-compat attribute in sync (may be None for LIVE_REAL on failure)
+        self.account_balance = self.account.equity
+
+        # Propagate usable balance to strategy (use safe fallback if UNKNOWN)
+        _eff_bal = self.account.safe_equity(self.risk._peak_balance or DRY_RUN_PAPER_BALANCE)
+        self.strategy.update_balance(_eff_bal)
+        self.strategy.risk_pct = self.risk.get_effective_risk_pct(_eff_bal)
 
         # Mode check
         mode, mode_reason = self.risk.check_and_update_mode(self.account_balance)
@@ -365,7 +413,30 @@ class ForexOrchestrator:
             self._last_4h = now
 
         if self._should_run_hourly(now):
-            self._run_strategy_evaluation(now)
+            # ── Equity-unknown guard (LIVE_REAL only) ─────────────────
+            # If broker fetch has failed, we don't know true equity.
+            # Skip ALL entry sizing / evaluation — never default to 0.
+            # Position management (monitor, stop moves) continues unaffected.
+            if self.account.is_unknown:
+                logger.warning(
+                    f"⚠️  EQUITY UNKNOWN ({self.account.broker_fetch_failures} consecutive "
+                    f"broker failures) — skipping entry scan this cycle. "
+                    f"Existing positions continue to be managed."
+                )
+                # Log one BROKER_EQUITY_UNKNOWN decision so the dashboard can surface it
+                for pair in getattr(self.strategy, "universe", []):
+                    self.state.log_decision(
+                        "WAIT",
+                        pair,
+                        {
+                            "reason":        "BROKER_EQUITY_UNKNOWN",
+                            "failures":      self.account.broker_fetch_failures,
+                            "equity_source": self.account.equity_source,
+                        },
+                    )
+                    break   # one representative entry is enough
+            else:
+                self._run_strategy_evaluation(now)
             self._last_hourly = now
 
     # ── Mode Transition Handling ───────────────────────────────────────
@@ -502,6 +573,30 @@ class ForexOrchestrator:
                     f"perf={_rs.recent_performance} cluster={_rs.correlation_cluster}  "
                     f"{'✅ HIGH_ELIGIBLE' if _rs.eligible_high else ''}"
                     f"{'⚡ EXTREME_ELIGIBLE' if _rs.eligible_extreme else ''}"
+                )
+
+                # ── RiskMode computation (simplified integer score) ───────
+                from ..strategy.forex.regime_score import compute_risk_mode
+                _primary_pair = next(iter(self._last_h4_slices.keys()), "")
+                _trend_w = ""
+                _trend_d = ""
+                if _primary_pair and hasattr(self.strategy, "_last_weekly_trend"):
+                    _trend_w = getattr(self.strategy, "_last_weekly_trend", {}).get(_primary_pair, "")
+                    _trend_d = getattr(self.strategy, "_last_daily_trend",  {}).get(_primary_pair, "")
+                _rms = compute_risk_mode(
+                    trend_weekly  = _trend_w,
+                    trend_daily   = _trend_d,
+                    df_h4         = _primary_h4,
+                    recent_trades = _recent_trades,
+                    loss_streak   = self._consecutive_losses,
+                )
+                self._last_regime_score.update(_rms.to_dict())
+                self.risk.set_regime_mode(_rms.mode.value)
+                logger.info(
+                    f"📊 RiskMode: {_rms.mode.value}  score={_rms.score}/4  "
+                    f"mult={_rms.params['risk_mult']}×  "
+                    f"wd={_rms.wd_aligned} vol={_rms.atr_expanding} "
+                    f"edge={_rms.edge_positive} streak={_rms.streak_clear}"
                 )
         except Exception as e:
             logger.warning(f"Regime score computation failed: {e}")
@@ -688,6 +783,17 @@ class ForexOrchestrator:
                 logger.info(
                     f"⚠ {pair}: ENTER signal BLOCKED — confidence {decision.confidence:.0%} "
                     f"< {MIN_CONFIDENCE:.0%} threshold. Waiting for stronger setup."
+                )
+                return
+
+            # ── Global pause gate ─────────────────────────────────────────
+            # pause_new_entries=True: scanning continues, open positions are
+            # managed normally, but no NEW entries are opened.
+            # Set via dashboard toggle → runtime_state/control.json.
+            if self.control.pause_new_entries:
+                logger.info(
+                    f"⏸  {pair}: ENTER BLOCKED — PAUSE_BLOCK "
+                    f"(pause_new_entries=True, reason={self.control.reason!r})"
                 )
                 return
 
@@ -956,10 +1062,11 @@ class ForexOrchestrator:
         except Exception:
             weekly_pnl = trades_week = wins_week = losses_week = 0
 
-        risk_status = self.risk.status(self.account_balance, consecutive_losses=self._consecutive_losses, dry_run=self.dry_run)
+        _std_bal    = self.account.safe_equity(self.risk._peak_balance or DRY_RUN_PAPER_BALANCE)
+        risk_status = self.risk.status(_std_bal, consecutive_losses=self._consecutive_losses, dry_run=self.dry_run)
 
         self.notifier.send_standings(
-            account_balance  = self.account_balance,
+            account_balance  = _std_bal,
             nav              = self.account_nav,
             unrealized_pnl   = self.unrealized_pnl,
             weekly_pnl       = weekly_pnl,
@@ -1187,14 +1294,17 @@ class ForexOrchestrator:
         """Save full bot state to disk — dashboard reads this."""
         try:
             self._refresh_consecutive_losses()
+            # Use safe equity so risk.status() always gets a float, even when
+            # broker equity is UNKNOWN.  Display layer will show UNKNOWN separately.
+            _safe_bal    = self.account.safe_equity(self.risk._peak_balance or DRY_RUN_PAPER_BALANCE)
             risk_status  = self.risk.status(
-                self.account_balance,
+                _safe_bal,
                 consecutive_losses=self._consecutive_losses,
                 dry_run=self.dry_run,
             )
             session_info = self._session_status()
             self.state.save(
-                account_balance  = self.account_balance,
+                account_balance  = _safe_bal,    # display fallback; equity_display shows UNKNOWN
                 dry_run          = self.dry_run,
                 halted           = self.risk.is_halted,
                 halt_reason      = self.risk.regroup_reason,
@@ -1226,6 +1336,17 @@ class ForexOrchestrator:
                     "next_session_mins":   session_info["next_session_mins"],
                     "traded_pattern_keys": list(self.strategy.traded_patterns.keys()),
                     "regime_score":        self._last_regime_score,
+                    # ── Control plane ─────────────────────────────────
+                    "pause_new_entries":   self.control.pause_new_entries,
+                    "pause_reason":        self.control.reason,
+                    "pause_updated_by":    self.control.updated_by,
+                    "pause_last_updated":  self.control.last_updated,
+                    # ── Regime mode (risk scaling) ────────────────────
+                    "risk_mode":           self.risk.regime_mode,
+                    "risk_mode_mult":      self.risk.regime_risk_multiplier(),
+                    "regime_weekly_caps":  self.risk.regime_weekly_caps(),
+                    # ── Account mode / equity source ──────────────────
+                    **{f"account_{k}": v for k, v in self.account.to_dict().items()},
                 },
             )
         except Exception as e:
@@ -1251,8 +1372,9 @@ class ForexOrchestrator:
 
     def _write_heartbeat(self, status: str = "ok"):
         try:
+            _hb_bal       = self.account.safe_equity(self.risk._peak_balance or DRY_RUN_PAPER_BALANCE)
             risk_status   = self.risk.status(
-                self.account_balance,
+                _hb_bal,
                 consecutive_losses=self._consecutive_losses,
                 dry_run=self.dry_run,
             )
@@ -1262,7 +1384,11 @@ class ForexOrchestrator:
                 "status":             status,
                 "mode":               risk_status["mode"],
                 "open_positions":     list(self.strategy.open_positions.keys()),
-                "account_balance":    self.account_balance,
+                "account_balance":    _hb_bal,
+                "account_equity":     self.account.equity,        # None = UNKNOWN
+                "account_mode":       self.account.mode.value,
+                "equity_source":      self.account.equity_source,
+                "equity_unknown":     self.account.is_unknown,
                 "risk_pct":           risk_status["risk_pct"],
                 "base_risk_pct":      risk_status["base_risk_pct"],
                 "final_risk_pct":     risk_status["final_risk_pct"],

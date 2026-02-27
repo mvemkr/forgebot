@@ -250,3 +250,159 @@ def compute_regime_score(
         eligible_extreme    = total >= SCORE_EXTREME_THRESH,
         notes               = notes,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Risk Mode System (Regime-based risk scaling)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Simplified integer score (0–4) → RiskMode mapping.
+# Used by ForexRiskManager to select risk %, weekly cap, and DD thresholds.
+#
+# Score rules (one point each, no partial credit):
+#   +1  Weekly trend == Daily trend  (macro alignment)
+#   +1  H4 ATR ratio > 1.1           (volatility expanding)
+#   +1  last-5-trades sum_R > 0      (recent positive edge)
+#   +1  loss_streak == 0             (no active loss run)
+#
+# Mode thresholds:
+#   score 0–1  → LOW     (reduce risk, tighten cap)
+#   score 2    → MEDIUM  (normal risk)
+#   score 3    → HIGH    (increase risk)
+#   score 4    → EXTREME (max risk, zero streak required — automatic when score=4)
+
+from enum import Enum
+
+
+class RiskMode(Enum):
+    LOW     = "LOW"
+    MEDIUM  = "MEDIUM"
+    HIGH    = "HIGH"
+    EXTREME = "EXTREME"
+
+
+# ── Per-mode risk parameters ───────────────────────────────────────────────
+# Multipliers applied to the base tier risk %.
+# Example: base=6%, HIGH multiplier=1.5 → 9% risk.
+# Weekly cap: max trades per ISO week regardless of account size.
+RISK_MODE_PARAMS: dict[str, dict] = {
+    "LOW":     {"risk_mult": 0.5,  "weekly_cap_small": 1, "weekly_cap_std": 1},
+    "MEDIUM":  {"risk_mult": 1.0,  "weekly_cap_small": 1, "weekly_cap_std": 2},
+    "HIGH":    {"risk_mult": 1.5,  "weekly_cap_small": 2, "weekly_cap_std": 3},
+    "EXTREME": {"risk_mult": 2.0,  "weekly_cap_small": 3, "weekly_cap_std": 4},
+}
+
+ATR_RATIO_THRESH = 1.1    # H4 ATR expansion threshold
+LAST5_SUMR_THRESH = 0.0   # last-5 sum_R threshold
+
+
+@dataclass
+class RegimeModeScore:
+    """Simplified integer-score regime assessment → RiskMode."""
+    wd_aligned:    bool    # Weekly trend == Daily trend
+    atr_expanding: bool    # H4 ATR ratio > ATR_RATIO_THRESH
+    edge_positive: bool    # last-5 sum_R > LAST5_SUMR_THRESH
+    streak_clear:  bool    # loss_streak == 0
+    score:         int     # 0–4
+    mode:          RiskMode
+    atr_ratio:     float = 0.0
+    last5_sum_r:   float = 0.0
+    loss_streak:   int   = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "risk_mode":       self.mode.value,
+            "regime_score_v2": self.score,
+            "wd_aligned":      self.wd_aligned,
+            "atr_expanding":   self.atr_expanding,
+            "edge_positive":   self.edge_positive,
+            "streak_clear":    self.streak_clear,
+            "atr_ratio":       round(self.atr_ratio, 3),
+            "last5_sum_r":     round(self.last5_sum_r, 2),
+            "loss_streak":     self.loss_streak,
+        }
+
+    @property
+    def params(self) -> dict:
+        return RISK_MODE_PARAMS[self.mode.value]
+
+
+def compute_risk_mode(
+    trend_weekly: str,
+    trend_daily:  str,
+    df_h4:        "pd.DataFrame",
+    recent_trades: list,
+    loss_streak:  int,
+) -> RegimeModeScore:
+    """
+    Compute integer regime score and RiskMode from four independent inputs.
+
+    Args:
+        trend_weekly:  weekly trend string ("bullish" / "bearish" / "neutral" / …)
+        trend_daily:   daily trend string
+        df_h4:         H4 OHLC DataFrame (needs ≥ 21 bars for ATR calc)
+        recent_trades: list of trade dicts with 'r' field; last 5 used
+        loss_streak:   consecutive loss count from risk manager
+
+    Returns:
+        RegimeModeScore dataclass
+    """
+    # ── Component 1: Weekly == Daily alignment ────────────────────────
+    def _bull(t: str) -> bool:
+        return "bullish" in (t or "").lower()
+
+    def _bear(t: str) -> bool:
+        return "bearish" in (t or "").lower()
+
+    wd_aligned = (
+        (_bull(trend_weekly) and _bull(trend_daily)) or
+        (_bear(trend_weekly) and _bear(trend_daily))
+    )
+
+    # ── Component 2: H4 ATR expansion ────────────────────────────────
+    atr_ratio    = 0.0
+    atr_expanding = False
+    if df_h4 is not None and len(df_h4) >= 21:
+        try:
+            hi = df_h4["high"].values if "high" in df_h4.columns else df_h4["High"].values
+            lo = df_h4["low"].values  if "low"  in df_h4.columns else df_h4["Low"].values
+            tr = hi - lo
+            current_atr = float(tr[-1])
+            avg_atr     = float(np.mean(tr[-21:-1]))
+            if avg_atr > 0:
+                atr_ratio    = current_atr / avg_atr
+                atr_expanding = atr_ratio > ATR_RATIO_THRESH
+        except Exception:
+            pass
+
+    # ── Component 3: Last-5 sum_R ─────────────────────────────────────
+    last5      = (recent_trades or [])[-5:]
+    last5_sum_r = sum(t.get("r", 0.0) for t in last5)
+    edge_positive = last5_sum_r > LAST5_SUMR_THRESH
+
+    # ── Component 4: Loss streak clear ───────────────────────────────
+    streak_clear = loss_streak == 0
+
+    # ── Total + mode mapping ──────────────────────────────────────────
+    score = sum([wd_aligned, atr_expanding, edge_positive, streak_clear])
+
+    if score >= 4:
+        mode = RiskMode.EXTREME
+    elif score >= 3:
+        mode = RiskMode.HIGH
+    elif score >= 2:
+        mode = RiskMode.MEDIUM
+    else:
+        mode = RiskMode.LOW
+
+    return RegimeModeScore(
+        wd_aligned    = wd_aligned,
+        atr_expanding = atr_expanding,
+        edge_positive = edge_positive,
+        streak_clear  = streak_clear,
+        score         = score,
+        mode          = mode,
+        atr_ratio     = atr_ratio,
+        last5_sum_r   = last5_sum_r,
+        loss_streak   = loss_streak,
+    )

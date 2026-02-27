@@ -59,6 +59,7 @@ class PositionMonitor:
         journal: TradeJournal,
         notifier: "Notifier",
         dry_run: bool = True,
+        account=None,   # Optional[AccountState] — for paper equity updates
     ):
         from .trade_analyzer import TradeAnalyzer
         self.strategy = strategy
@@ -66,6 +67,7 @@ class PositionMonitor:
         self.journal = journal
         self.notifier = notifier
         self.dry_run = dry_run
+        self.account = account   # AccountState reference (may be None for back-compat)
         self._signal_detector = EntrySignalDetector(min_body_ratio=0.45)
         self._breakeven_moved: set = set()   # track which trades already moved to BE
         self.analyzer = TradeAnalyzer(notifier=notifier)
@@ -123,12 +125,29 @@ class PositionMonitor:
                     pos = self.strategy.open_positions[pair]
                     logger.info(f"📌 {pair}: No longer in OANDA open trades — stop hit or closed")
 
-                    # Get final account balance
-                    try:
-                        summary = self.oanda.get_account_summary()
-                        balance_after = summary.get("balance", 0)
-                    except Exception:
-                        balance_after = 0
+                    # ── Get balance after exit ────────────────────────
+                    realized_pnl = -(pos.get("risk_dollars", 0))
+                    if self.account is not None:
+                        from .account_state import AccountMode
+                        if self.account.mode == AccountMode.LIVE_PAPER:
+                            # Paper mode: apply PnL to simulated equity
+                            self.account.apply_pnl(realized_pnl)
+                            balance_after = self.account.safe_equity()
+                        else:
+                            # LIVE_REAL: fetch actual broker balance
+                            try:
+                                summary = self.oanda.get_account_summary()
+                                self.account.update_from_broker(summary)
+                                balance_after = self.account.safe_equity()
+                            except Exception:
+                                self.account.mark_broker_failed()
+                                balance_after = self.account.safe_equity()
+                    else:
+                        try:
+                            summary = self.oanda.get_account_summary()
+                            balance_after = summary.get("balance", 0)
+                        except Exception:
+                            balance_after = 0
 
                     # Log the exit — we don't know exact exit price, use stop as approximation
                     self.journal.log_trade_exited(
