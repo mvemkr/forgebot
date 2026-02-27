@@ -63,9 +63,12 @@ class ForexRiskManager:
       - Mike can extend cooldown or resume early
     """
 
-    # Scenario B risk tiers (agreed 2026-02-21)
+    # Scenario B risk tiers — updated 2026-02-26 (Arm D prod lock)
+    # <$8K: 10% → 6% after grid test showed 10% triggers killswitch in adverse
+    # months (W2 Oct–Feb: 10 losses hit 40% DD at bar 11, ruining remainder).
+    # 6% survives all 18 W2 trades with DD=29.2%. Other tiers unchanged.
     RISK_TIERS = [
-        (8_000,          10.0),
+        (8_000,          6.0),   # was 10% — see risk_grid.py results 2026-02-26
         (15_000,         15.0),
         (30_000,         20.0),
         (float("inf"),   25.0),
