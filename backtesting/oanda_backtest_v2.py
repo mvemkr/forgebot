@@ -533,7 +533,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  strict_protrend_htf: bool = False,
                  dynamic_pip_equity: bool = False,
                  wd_protrend_htf: bool = False,
-                 flat_risk_pct: Optional[float] = None):
+                 flat_risk_pct: Optional[float] = None,
+                 force_risk_mode: Optional[str] = None):
     """Run a single backtest simulation.
 
     quiet=True suppresses all stdout (useful when called from compare scripts).
@@ -541,6 +542,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
 
     trail_arm_key: label stored in model_tags and _result_record (e.g. "A", "B", "C").
                    Auto-detected from trail_cfg if omitted.
+    force_risk_mode: pin risk mode for every entry ("LOW"|"MEDIUM"|"HIGH"|"EXTREME").
+                     None = AUTO (compute dynamically per entry — default).
     """
     import io, sys as _sys
     # Resolve arm key ↔ trail_cfg (bidirectional)
@@ -568,6 +571,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             dynamic_pip_equity=dynamic_pip_equity,
             wd_protrend_htf=wd_protrend_htf,
             flat_risk_pct=flat_risk_pct,
+            force_risk_mode=force_risk_mode,
         )
     finally:
         _sys.stdout = _orig_stdout
@@ -585,7 +589,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                        strict_protrend_htf: bool = False,
                        dynamic_pip_equity: bool = False,
                        wd_protrend_htf: bool = False,
-                       flat_risk_pct: Optional[float] = None):
+                       flat_risk_pct: Optional[float] = None,
+                       force_risk_mode: Optional[str] = None):
     # PROTREND_ONLY config flag → wd_protrend_htf gate.
     # Config wins when True; explicit True caller arg also wins.
     if getattr(_sc, "PROTREND_ONLY", False) and not wd_protrend_htf:
@@ -636,7 +641,9 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     print(f"│  trigger mode    : {_sc.ENTRY_TRIGGER_MODE:<15}  "
           f"spread model : {'ON' if _sc.SPREAD_MODEL_ENABLED else 'OFF'}{'':>16}│")
     _pt_label = "ON (W+D gate, 4H exempt)" if wd_protrend_htf else "OFF (full counter-trend)"
+    _fm_label = f"FORCED:{force_risk_mode}" if force_risk_mode else "AUTO (dynamic per entry)"
     print(f"│  protrend_only   : {_pt_label:<43}│")
+    print(f"│  risk_mode       : {_fm_label:<43}│")
     if _exp_flag:
         print(f"│  ⚠  EXPERIMENTAL RUN — BT concurrency > 1, not comparable to live{'':>3}│")
     print(f"└{'─'*63}┘")
@@ -1589,10 +1596,12 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     recent_trades = trades,          # closed trades so far
                     loss_streak   = consecutive_losses,
                 )
-                risk.set_regime_mode(_rms_entry.mode.value)
+                # force_risk_mode pins mode for every entry (used in comparison runs).
+                # AUTO = None → use compute_risk_mode() result.
+                risk.set_regime_mode(force_risk_mode or _rms_entry.mode.value)
             except Exception:
                 _rms_entry = None
-                risk.set_regime_mode(None)
+                risk.set_regime_mode(force_risk_mode or None)
 
             _base_rpct, _dd_flag = _risk_pct_with_flag(balance)
 
@@ -1790,7 +1799,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                 "streak_at_entry": consecutive_losses,  # for per-trade risk audit
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
                 "regime_score": _rs.total,              # RegimeScore at entry
-                "risk_mode_at_entry": (_rms_entry.mode.value if _rms_entry else "MEDIUM"),  # RiskMode
+                "risk_mode_at_entry": (force_risk_mode or (_rms_entry.mode.value if _rms_entry else "MEDIUM")),
                 "target_price": _target,
                 "target_type":  decision.exec_target_type,
                 "stop_type":    decision.stop_type,
@@ -2342,7 +2351,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         "model_tags":   _sc.get_model_tags(trail_arm=trail_arm_key or "?",
                                            pairs_hash=_pairs_hash)
                         + ([f"policy={policy_tag}"]       if policy_tag else [])
-                        + ([f"risk={flat_risk_pct:.0f}pct"] if flat_risk_pct else []),
+                        + ([f"risk={flat_risk_pct:.0f}pct"] if flat_risk_pct else [])
+                        + ([f"forced_mode={force_risk_mode}"] if force_risk_mode else []),
         "trail_arm":    trail_arm_key or "?",
         "pairs":        _active_pairs,
         "pairs_hash":   _pairs_hash,
@@ -2382,6 +2392,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             "wd_protrend_htf":                   wd_protrend_htf,
             "dynamic_pip_equity":                dynamic_pip_equity,
             "policy_tag":                        policy_tag,
+            "force_risk_mode":                   force_risk_mode,
         },
         "results": {
             "n_trades":   len(trades),
@@ -2571,6 +2582,11 @@ Examples:
                         help="Gate entries: require Weekly AND Daily bias to agree with trade direction. "
                              "4H is exempt (Alex enters during 4H retracements). "
                              "Wires PROTREND_ONLY=True. Use for W2 regime vs bug diagnostic.")
+    parser.add_argument("--force-mode", default=None,
+                        metavar="MODE",
+                        help="Pin risk mode for every entry: LOW | MEDIUM | HIGH | EXTREME. "
+                             "None = AUTO (compute dynamically per entry — default). "
+                             "Use for mode comparison runs.")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -2665,12 +2681,17 @@ Examples:
 
         _t_run = time.perf_counter()
         _protrend_flag = getattr(args, "protrend_only", False)
+        _force_mode_raw = getattr(args, "force_mode", None)
+        _force_mode = _force_mode_raw.upper() if _force_mode_raw else None
+        if _force_mode and _force_mode not in ("LOW", "MEDIUM", "HIGH", "EXTREME"):
+            parser.error(f"--force-mode must be LOW|MEDIUM|HIGH|EXTREME, got '{_force_mode_raw}'")
         result = run_backtest(
             start_dt=start, end_dt=end, starting_bal=args.balance,
             notes=_arm_notes, trail_cfg=_tcfg, trail_arm_key=_arm_key,
             preloaded_candle_data=_shared_candles,
             use_cache=_use_cache,
             wd_protrend_htf=_protrend_flag,
+            force_risk_mode=_force_mode,
         )
         _t_run_elapsed = time.perf_counter() - _t_run
 
