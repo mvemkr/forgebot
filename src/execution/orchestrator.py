@@ -1163,10 +1163,23 @@ class ForexOrchestrator:
     # ── Daily Brief ───────────────────────────────────────────────────
 
     def _send_daily_brief(self):
-        try:
-            summary = self.oanda.get_account_summary()
-        except Exception:
-            summary = {}
+        # ── Equity source: SIM (paper) or broker (real/unknown) ───────────
+        # LIVE_PAPER: never show broker balance — it's the OANDA practice
+        # account default ($100K play-money) and has no relation to our sim.
+        # Always use paper_account.json equity for display.
+        if self.account.mode == AccountMode.LIVE_PAPER:
+            _eq    = float(self.account.equity or 0.0)
+            _nav   = _eq + float(self.unrealized_pnl or 0.0)
+            summary = {
+                "balance":         _eq,
+                "nav":             _nav,
+                "unrealized_pnl":  float(self.unrealized_pnl or 0.0),
+            }
+        else:
+            try:
+                summary = self.oanda.get_account_summary()
+            except Exception:
+                summary = {}
 
         # Include today's Tier 1 news events in the brief
         try:
