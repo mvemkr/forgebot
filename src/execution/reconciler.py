@@ -162,9 +162,10 @@ class Reconciler:
           - Before computing risk that depends on equity/open exposure
           - Every 60s on LIVE_REAL (orchestrator timer)
 
-        Fails open on broker API error — never blocks an action due to
-        a transient network hiccup.  Throttled to at most once per
-        MIN_LIGHT_INTERVAL_S seconds when throttle=True.
+        Failure policy:
+          LIVE_REAL  — fail-CLOSED: API error → pause entries (BROKER_SYNC_FAILED).
+          LIVE_PAPER — fail-open:   API error → return clean=True, no side-effects.
+        Throttled to at most once per MIN_LIGHT_INTERVAL_S seconds when throttle=True.
         """
         if throttle and self._last_light_ts is not None:
             elapsed = (datetime.now(timezone.utc) - self._last_light_ts).total_seconds()
@@ -180,7 +181,10 @@ class Reconciler:
                 else None
             )
         except Exception as e:
-            logger.warning(f"reconcile_light(): broker fetch failed (fail-open): {e}")
+            if self.account_mode == "LIVE_REAL":
+                return self._handle_broker_sync_failure(e)
+            # LIVE_PAPER: fail-open — no real money at risk from a missed sync
+            logger.warning(f"reconcile_light(): broker fetch failed (fail-open, LIVE_PAPER): {e}")
             return ReconcileResult(clean=True)
 
         self._last_light_ts = datetime.now(timezone.utc)
@@ -505,6 +509,33 @@ class Reconciler:
             result.actions.append(f"EXTERNAL_MODIFY:{pair}:take_profit")
 
     # ── Helper ────────────────────────────────────────────────────────
+
+    def _handle_broker_sync_failure(self, exc: Exception) -> ReconcileResult:
+        """
+        LIVE_REAL only: broker fetch failed → fail-closed.
+
+        Sets pause_new_entries=True so no new orders are placed until the
+        next successful reconcile clears the state.  Existing open positions
+        continue to be managed (bot does not crash).
+
+        Returns a ReconcileResult with clean=False and pause_triggered=True
+        so callers (pre-order gate, periodic check) abort order placement.
+        """
+        reason = "BROKER_SYNC_FAILED"
+        logger.error(
+            f"reconcile_light() LIVE_REAL broker fetch failed — "
+            f"pausing new entries: {exc}"
+        )
+        if not self.dry_run:
+            self.control.pause(reason=reason, updated_by="reconciler")
+        self._journal_reconcile("*", "PAUSE", {
+            "reason":  reason,
+            "error":   str(exc),
+            "notes":   "LIVE_REAL broker sync failure — entries paused until next successful reconcile",
+        })
+        result = ReconcileResult(clean=False, pause_triggered=True)
+        result.actions.append(f"RECONCILE_PAUSE:{reason}")
+        return result
 
     def _journal_reconcile(self, pair: str, event: str, data: dict) -> None:
         try:

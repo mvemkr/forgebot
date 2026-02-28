@@ -526,30 +526,89 @@ class TestCleanState:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestFailOpen:
-    """reconcile_light must never block trading due to a network failure."""
+    """reconcile_light: fail-closed on LIVE_REAL, fail-open on LIVE_PAPER."""
 
-    def test_api_error_returns_clean(self):
-        """If OANDA API throws, reconcile_light returns clean=True (fail-open)."""
+    def test_api_error_live_real_pauses_entries(self):
+        """
+        LIVE_REAL + API exception → fail-closed:
+          - result.clean == False
+          - result.pause_triggered == True
+          - control.pause called with reason BROKER_SYNC_FAILED
+        """
         oanda = MagicMock()
         oanda.get_open_trades.side_effect = Exception("Connection timeout")
 
-        strategy = MagicMock()
-        strategy.open_positions = {}
+        control = MagicMock()
+        control.pause_new_entries = False
 
         rec = Reconciler(
             oanda        = oanda,
-            strategy     = strategy,
+            strategy     = MagicMock(),
             journal      = MagicMock(),
             notifier     = MagicMock(),
-            control      = MagicMock(),
-            dry_run      = True,
+            control      = control,
+            account_mode = "LIVE_REAL",
+            dry_run      = False,
         )
         result = rec.reconcile_light(throttle=False)
 
-        assert result.clean   # fail-open — don't block trading
+        assert not result.clean
+        assert result.pause_triggered
+        control.pause.assert_called_once()
+        pause_reason = control.pause.call_args.kwargs.get("reason", "")
+        assert "BROKER_SYNC_FAILED" in pause_reason
+
+    def test_api_error_live_real_aborts_order_via_result(self):
+        """
+        Pre-order gate in orchestrator checks result.pause_triggered.
+        Confirm the returned result signals abort (pause_triggered=True).
+        """
+        oanda = MagicMock()
+        oanda.get_open_trades.side_effect = TimeoutError("read timeout")
+
+        rec = Reconciler(
+            oanda        = oanda,
+            strategy     = MagicMock(),
+            journal      = MagicMock(),
+            notifier     = MagicMock(),
+            control      = MagicMock(),
+            account_mode = "LIVE_REAL",
+            dry_run      = False,
+        )
+        result = rec.reconcile_light(throttle=False)
+
+        # Orchestrator checks: if result.pause_triggered → return (abort order)
+        assert result.pause_triggered
+
+    def test_api_error_live_paper_stays_open(self):
+        """
+        LIVE_PAPER + API exception → fail-open:
+          - result.clean == True
+          - control.pause NOT called
+          - trading continues unblocked
+        """
+        oanda = MagicMock()
+        oanda.get_open_trades.side_effect = Exception("Connection timeout")
+
+        control = MagicMock()
+
+        rec = Reconciler(
+            oanda        = oanda,
+            strategy     = MagicMock(),
+            journal      = MagicMock(),
+            notifier     = MagicMock(),
+            control      = control,
+            account_mode = "LIVE_PAPER",
+            dry_run      = False,
+        )
+        result = rec.reconcile_light(throttle=False)
+
+        assert result.clean
+        assert not result.pause_triggered
+        control.pause.assert_not_called()
 
     def test_api_error_on_full_returns_clean(self):
-        """reconcile_full also fails open — startup must not be blocked."""
+        """reconcile_full fails open — startup must not be blocked."""
         oanda = MagicMock()
         oanda.get_open_trades.side_effect = RuntimeError("timeout")
 
