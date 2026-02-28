@@ -1193,20 +1193,29 @@ class ForexOrchestrator:
         _std_bal    = self.account.safe_equity(self._equity_fallback)
         risk_status = self.risk.status(_std_bal, consecutive_losses=self._consecutive_losses, dry_run=self.dry_run)
 
+        _base_risk    = risk_status["base_risk_pct"]
+        _risk_mode    = self.risk.regime_mode or "MEDIUM"
+        _mode_mult    = self.risk.regime_risk_multiplier()
+        _eff_risk_pct = self.risk.get_effective_risk_pct(_std_bal)
+
         self.notifier.send_standings(
-            account_balance  = _std_bal,
-            nav              = self.account_nav,
-            unrealized_pnl   = self.unrealized_pnl,
-            weekly_pnl       = weekly_pnl,
-            peak_balance     = self.risk._peak_balance or self.account_balance,
-            risk_pct         = risk_status["risk_pct"],
-            tier_label       = risk_status["tier_label"],
-            open_positions   = self.strategy.open_positions,
-            trades_this_week = trades_week,
-            wins_this_week   = wins_week,
-            losses_this_week = losses_week,
-            mode             = risk_status["mode"],
-            regroup_ends     = self.risk.regroup_ends,
+            account_balance    = _std_bal,
+            nav                = self.account_nav,
+            unrealized_pnl     = self.unrealized_pnl,
+            weekly_pnl         = weekly_pnl,
+            peak_balance       = self.risk._peak_balance or self.account_balance,
+            risk_pct           = risk_status["risk_pct"],
+            tier_label         = risk_status["tier_label"],
+            open_positions     = self.strategy.open_positions,
+            trades_this_week   = trades_week,
+            wins_this_week     = wins_week,
+            losses_this_week   = losses_week,
+            mode               = risk_status["mode"],
+            regroup_ends       = self.risk.regroup_ends,
+            base_risk_pct      = _base_risk,
+            risk_mode          = _risk_mode,
+            mode_mult          = _mode_mult,
+            effective_risk_pct = _eff_risk_pct,
         )
 
     # ── Data Fetching ─────────────────────────────────────────────────

@@ -147,15 +147,17 @@ def _wd_calendar_agreement_pct(candle_data: dict, start_dt: datetime, end_dt: da
     if df_d_raw is None or df_d_raw.empty:
         return None
 
-    # Strip tz so comparisons work
-    start_naive = pd.Timestamp(start_dt).replace(tzinfo=None)
-    end_naive   = pd.Timestamp(end_dt).replace(tzinfo=None)
-
-    # Full daily history (we need past data to compute trend at each point)
+    # Normalise to tz-naive so all comparisons are consistent
     df_d_full = df_d_raw.copy()
+    if df_d_full.index.tz is not None:
+        df_d_full.index = df_d_full.index.tz_localize(None)
 
     # Resample full daily history to weekly once
     df_w_full = _resample_weekly(df_d_full)
+
+    # Comparison bounds — always tz-naive
+    start_naive = pd.Timestamp(start_dt).tz_localize(None) if start_dt.tzinfo else pd.Timestamp(start_dt)
+    end_naive   = pd.Timestamp(end_dt).tz_localize(None)   if end_dt.tzinfo   else pd.Timestamp(end_dt)
 
     detector = PatternDetector(rep_pair)
 

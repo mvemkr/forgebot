@@ -427,6 +427,14 @@ def compute_risk_mode(
     else:
         mode = RiskMode.LOW
 
+    # ── W==D alignment is a REQUIRED condition for HIGH / EXTREME ────
+    # Rationale: HIGH/EXTREME increase risk size; doing so into a mixed
+    # macro trend (W and D pointing different directions) is not justified
+    # even if ATR and edge score qualify.  Cap at MEDIUM without alignment.
+    # LOW and MEDIUM are unaffected — they do not require alignment.
+    if mode in (RiskMode.HIGH, RiskMode.EXTREME) and not wd_aligned:
+        mode = RiskMode.MEDIUM
+
     return RegimeModeScore(
         wd_aligned    = wd_aligned,
         atr_expanding = atr_expanding,
