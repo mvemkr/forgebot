@@ -1,1 +1,7 @@
-{}
+{
+  "equity": 8000.0,
+  "peak_equity": 8000.0,
+  "realized_session_pnl": 0.0,
+  "mode": "live_paper",
+  "saved_at": null
+}
