@@ -71,6 +71,9 @@ class PositionMonitor:
         self._signal_detector = EntrySignalDetector(min_body_ratio=0.45)
         self._breakeven_moved: set = set()   # track which trades already moved to BE
         self.analyzer = TradeAnalyzer(notifier=notifier)
+        # Reconciler injected by orchestrator after construction.
+        # Optional: position_monitor works standalone without it.
+        self.reconciler = None
 
     # ── Main Check ─────────────────────────────────────────────────────
 
@@ -304,6 +307,22 @@ class PositionMonitor:
 
         if new_stop is None:
             return   # no improvement to make
+
+        # ── Pre-modification reconcile ─────────────────────────────────────
+        # Validate broker state before pushing a stop update. Catches the case
+        # where the position was manually closed or the stop already moved.
+        # Fails open — trail move proceeds even if reconcile can't reach broker.
+        if self.reconciler is not None:
+            try:
+                _rm = self.reconciler.reconcile_light()
+                if _rm.external_closes and pair in _rm.external_closes:
+                    logger.warning(
+                        f"🔒 {pair}: position was externally closed — "
+                        f"aborting stop modification"
+                    )
+                    return   # position is gone; stop move is now a ghost
+            except Exception as _re:
+                logger.debug(f"Pre-stop reconcile failed (fail-open): {_re}")
 
         logger.info(f"🔒 {pair}: {stage_msg}")
         pos["stop"] = new_stop

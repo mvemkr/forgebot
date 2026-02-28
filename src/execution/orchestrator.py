@@ -266,9 +266,26 @@ class ForexOrchestrator:
         from .trade_analyzer import TradeAnalyzer
         self.analyzer = TradeAnalyzer(notifier=self.notifier)
 
-        self._last_hourly:         Optional[datetime] = None
-        self._last_4h:             Optional[datetime] = None
-        self._last_weekly:         Optional[datetime] = None
+        # ── Reconciler: continuous broker state integrity guardrail ────────────
+        from .reconciler import Reconciler
+        self.reconciler = Reconciler(
+            oanda        = self.oanda,
+            strategy     = self.strategy,
+            journal      = self.journal,
+            notifier     = self.notifier,
+            control      = self.control,
+            account      = self.account,
+            account_mode = exec_mode.value,   # "LIVE_REAL" | "LIVE_PAPER"
+            dry_run      = self.dry_run,
+        )
+        # Pass reconciler to PositionMonitor so it can call reconcile_light()
+        # before modifying stops (broker state may have drifted since last check)
+        self.monitor.reconciler = self.reconciler
+
+        self._last_hourly:          Optional[datetime] = None
+        self._last_4h:              Optional[datetime] = None
+        self._last_weekly:          Optional[datetime] = None
+        self._last_recon_periodic:  Optional[datetime] = None   # 60s light reconcile (LIVE_REAL)
         self._last_daily_brief:    Optional[datetime] = None
         self._last_standings:      Optional[datetime] = None
         self._last_regroup_obs:    Optional[datetime] = None
@@ -293,35 +310,39 @@ class ForexOrchestrator:
         self._consec_high_live:    int               = 0
         self._demote_streak_live:  int               = 0
 
-        # ── Crash recovery — restore full state from last save ───────────
-        # Reconciles saved state with OANDA live data:
-        #   - Open positions: restores full context (entry, stop, direction,
-        #     pattern, trends, confidence, entry_reason, tier — everything)
-        #   - Pattern memory: marks exhausted patterns so we don't re-enter
-        # If the bot restarts mid-trade, it picks up exactly where it left off.
+        # ── Startup reconcile: restore state + validate broker integrity ─────
+        # Phase 1: restore rich saved context (patterns, trends, confidence,
+        #          tier, entry_reason) that the reconciler can't infer from
+        #          broker data alone. Must run BEFORE reconcile_full() so the
+        #          reconciler sees the full local position dict for diff logic.
         try:
-            recovery = self.state.reconcile_with_oanda(self.oanda, self.strategy)
-            if recovery.get("recovered"):
-                n_pos = len(recovery.get("recovered_positions", {}))
-                age_m = int(recovery.get("state_age_seconds", 0) / 60)
+            legacy = self.state.reconcile_with_oanda(self.oanda, self.strategy)
+            if legacy.get("recovered"):
+                n_pos = len(legacy.get("recovered_positions", {}))
+                age_m = int(legacy.get("state_age_seconds", 0) / 60)
                 if n_pos:
                     logger.info(
-                        f"✅ Recovered {n_pos} open position(s) from state "
-                        f"({age_m}m ago): {list(recovery['recovered_positions'].keys())}"
-                    )
-                    self.notifier.send(
-                        f"♻️ Bot restarted — recovered {n_pos} open position(s) from saved state "
-                        f"({age_m}m ago):\n" +
-                        "\n".join(
-                            f"  • {p}: {v.get('direction','?')} @ {v.get('entry','?'):.5f}  "
-                            f"SL={v.get('stop','?'):.5f}  pattern={v.get('pattern_type','?')}"
-                            for p, v in recovery["recovered_positions"].items()
-                        )
+                        f"✅ State-file recovery: {n_pos} position(s) "
+                        f"({age_m}m ago): {list(legacy['recovered_positions'].keys())}"
                     )
                 else:
-                    logger.info("State reconciled — no open positions to recover")
+                    logger.info("State file loaded — no saved open positions")
         except Exception as e:
-            logger.warning(f"State recovery failed: {e}")
+            logger.warning(f"State-file recovery failed: {e}")
+
+        # Phase 2: full broker reconcile — validates invariants, catches any
+        #          broker positions that the state file missed, and pauses
+        #          entries if a safety-relevant mismatch is detected.
+        try:
+            recon = self.reconciler.reconcile_full()
+            if recon.external_closes:
+                logger.warning(f"Startup: external close(s) detected: {recon.external_closes}")
+            if recon.recovered:
+                logger.info(f"Startup: position(s) recovered from broker: {recon.recovered}")
+            if recon.external_modifies:
+                logger.info(f"Startup: stop(s) adopted from broker: {recon.external_modifies}")
+        except Exception as e:
+            logger.warning(f"Startup reconcile_full() failed: {e}")
 
         # Restore pattern memory from last saved state
         try:
@@ -392,6 +413,43 @@ class ForexOrchestrator:
 
         # Reload persistent control plane (pause_new_entries may have changed)
         self.control.reload()
+
+        # ── Chop Shield: auto-resume when 48h pause expires ──────────────
+        # chop_pause_until in control.json marks the deadline for a streak-based pause.
+        # When it has passed, clear the pause so recovery-selectivity rules take over.
+        if (self.control.pause_new_entries
+                and "AUTO_PAUSE_STREAK3" in (self.control.reason or "")
+                and self.control.chop_pause_expired()):
+            self.control.resume(reason="Chop Shield 48h pause expired — recovery mode",
+                                updated_by="bot")
+            logger.info("▶  Chop Shield: 48h pause expired — entries re-enabled in recovery mode")
+            try:
+                from .telegram_notify import send_telegram
+                send_telegram(
+                    "▶ *Chop Shield: 48h pause expired*\n"
+                    "Recovery mode active — higher-quality entries only:\n"
+                    f"• exec_rr ≥ {getattr(_sc, 'RECOVERY_MIN_RR', 3.0):.1f}R\n"
+                    f"• confidence +{getattr(_sc, 'RECOVERY_CONF_BOOST', 0.05):.0%}\n"
+                    f"• weekly_cap = {getattr(_sc, 'RECOVERY_WEEKLY_CAP', 1)}"
+                )
+            except Exception:
+                pass
+
+        # ── Periodic light reconcile: every 60s on LIVE_REAL ─────────────
+        # Catches manual closes/edits while the bot is running.
+        # LIVE_PAPER skips this — no real broker positions to drift.
+        if self.account.mode == AccountMode.LIVE_REAL:
+            _now_recon = datetime.now(timezone.utc)
+            _recon_due = (
+                self._last_recon_periodic is None
+                or (_now_recon - self._last_recon_periodic).total_seconds() >= 60
+            )
+            if _recon_due:
+                try:
+                    self.reconciler.reconcile_light(throttle=False)
+                except Exception as _re:
+                    logger.debug(f"Periodic reconcile_light failed (harmless): {_re}")
+                self._last_recon_periodic = _now_recon
 
         # Save full state to disk (dashboard reads this)
         self._save_state()
@@ -909,6 +967,61 @@ class ForexOrchestrator:
                 )
                 return
 
+            # ── Chop Shield Part B: recovery-selectivity filters ─────────
+            # Active when: streak >= THRESH AND pause has expired (we're past the 48h window).
+            # Does NOT block during active pause (pause gate above handles that).
+            # Blocks: entries with exec_rr < RECOVERY_MIN_RR, conf below boosted floor,
+            # or weekly_cap already reached at RECOVERY_WEEKLY_CAP=1.
+            _chop_thresh = getattr(_sc, "CHOP_SHIELD_STREAK_THRESH", 3)
+            if self._consecutive_losses >= _chop_thresh:
+                _rec_rr  = getattr(_sc, "RECOVERY_MIN_RR", 3.0)
+                _rec_boost = getattr(_sc, "RECOVERY_CONF_BOOST", 0.05)
+                _rec_wcap  = getattr(_sc, "RECOVERY_WEEKLY_CAP", 1)
+                _rec_conf  = _sc.MIN_CONFIDENCE + _rec_boost
+                # exec_rr gate
+                if decision.exec_rr < _rec_rr:
+                    logger.info(
+                        f"🔵 {pair}: RECOVERY_MIN_RR BLOCK"
+                        f" — streak={self._consecutive_losses}, exec_rr={decision.exec_rr:.2f}R"
+                        f" < {_rec_rr:.1f}R required"
+                    )
+                    self._set_block_reason(
+                        pair, "BLOCKED",
+                        f"Recovery mode: exec_rr {decision.exec_rr:.2f}R < {_rec_rr:.1f}R",
+                        "RECOVERY_MIN_RR",
+                    )
+                    return
+                # Confidence gate
+                if decision.confidence < _rec_conf:
+                    logger.info(
+                        f"🔵 {pair}: RECOVERY_CONF BLOCK"
+                        f" — streak={self._consecutive_losses},"
+                        f" conf={decision.confidence:.0%} < {_rec_conf:.0%}"
+                    )
+                    self._set_block_reason(
+                        pair, "BLOCKED",
+                        f"Recovery mode: conf {decision.confidence:.0%} < {_rec_conf:.0%}",
+                        "RECOVERY_CONF",
+                    )
+                    return
+                # Weekly cap gate (stricter than normal during recovery)
+                try:
+                    _wk_count_rec = self.journal.get_trades_this_week()
+                    if _wk_count_rec >= _rec_wcap:
+                        logger.info(
+                            f"🔵 {pair}: RECOVERY_WEEKLY_CAP BLOCK"
+                            f" — streak={self._consecutive_losses},"
+                            f" week trades={_wk_count_rec} ≥ cap={_rec_wcap}"
+                        )
+                        self._set_block_reason(
+                            pair, "BLOCKED",
+                            f"Recovery mode: weekly_cap={_rec_wcap} reached",
+                            "RECOVERY_WEEKLY_CAP",
+                        )
+                        return
+                except Exception:
+                    pass
+
             # ── Macro theme direction gate ────────────────────────────────
             if _sc.REQUIRE_THEME_GATE and macro_theme:
                 _theme_dir_map = dict(macro_theme.suggested_trades)
@@ -1045,6 +1158,24 @@ class ForexOrchestrator:
                     logger.info(f"⚠ {pair}: ENTER BLOCKED — {_msg}")
                     self._set_block_reason(pair, "BLOCKED", _msg, "STOP_TIGHT")
                     return
+
+            # ── Pre-order reconcile: validate broker state before committing ──
+            # Catches any drift (manual close, external stop edit) that occurred
+            # since the last periodic reconcile. Fails open — never blocks entry
+            # due to a network hiccup.
+            try:
+                _pre_recon = self.reconciler.reconcile_light()
+                if not _pre_recon.clean:
+                    logger.warning(
+                        f"⚠ {pair}: pre-order reconcile found mismatch: "
+                        f"{_pre_recon.summary()} — continuing with caution"
+                    )
+                    if _pre_recon.pause_triggered:
+                        # Reconciler already paused entries; don't place this order.
+                        logger.warning(f"⚠ {pair}: entry aborted — reconciler paused entries")
+                        return
+            except Exception as _re:
+                logger.debug(f"Pre-order reconcile failed (fail-open): {_re}")
 
             logger.info(f"🎯 {pair}: ENTER signal! overnight={overnight} conf={decision.confidence:.0%}")
             result = self.executor.execute(decision, self.account_balance)
@@ -1470,6 +1601,10 @@ class ForexOrchestrator:
         Recompute _consecutive_losses from recent journal entries.
         Called at the start of each state save so the dashboard is always current.
         Scratch exits (|pnl| < 0.10 × risk) count as wins (don't extend streak).
+
+        Chop Shield (Part A): if streak first reaches CHOP_SHIELD_STREAK_THRESH,
+        auto-set pause_new_entries=True for CHOP_SHIELD_PAUSE_HOURS via control.json.
+        Does nothing when already paused with reason=AUTO_PAUSE_STREAK3.
         """
         try:
             trades = self.journal.get_recent_trades(30)  # most-recent first
@@ -1486,6 +1621,32 @@ class ForexOrchestrator:
             self._consecutive_losses = count
         except Exception:
             pass  # keep existing value on error
+
+        # ── Chop Shield Part A: auto-pause on streak ≥ 3 ─────────────────
+        try:
+            _thresh = getattr(_sc, "CHOP_SHIELD_STREAK_THRESH", 3)
+            _hours  = getattr(_sc, "CHOP_SHIELD_PAUSE_HOURS", 48.0)
+            if self._consecutive_losses >= _thresh:
+                # Only trigger if not already paused by chop shield
+                _already_chop = "AUTO_PAUSE_STREAK3" in (self.control.reason or "")
+                if not _already_chop and not self.control.pause_new_entries:
+                    self.control.chop_pause(_hours, updated_by="bot")
+                    logger.warning(
+                        f"🛑  Chop Shield: streak={self._consecutive_losses}"
+                        f" ≥ {_thresh} — auto-paused for {_hours:.0f}h"
+                    )
+                    try:
+                        from .telegram_notify import send_telegram
+                        send_telegram(
+                            f"🛑 *Chop Shield Activated*\n"
+                            f"Loss streak: {self._consecutive_losses} consecutive losses\n"
+                            f"New entries paused for {_hours:.0f}h\n"
+                            f"Recovery rules apply after pause expires."
+                        )
+                    except Exception:
+                        pass
+        except Exception as _ex:
+            logger.debug(f"Chop Shield streak check failed: {_ex}")
 
     def _save_state(self):
         """Save full bot state to disk — dashboard reads this."""

@@ -249,6 +249,21 @@ class TradeJournal:
             "notes": notes,
         })
 
+    def log_reconcile_event(
+        self,
+        pair: str,
+        event: str,   # "EXTERNAL_CLOSE" | "RECOVERED_POSITION" | "EXTERNAL_MODIFY" | "RECONCILE_PAUSE"
+        data: dict,
+        notes: str = "",
+    ):
+        """Record a broker reconciliation event (state integrity, not a trade signal)."""
+        self._write({
+            "event":   f"RECONCILE_{event}",
+            "pair":    pair,
+            "notes":   notes or data.get("notes", ""),
+            **{k: v for k, v in data.items() if k != "notes"},
+        })
+
     # ── Read / Stats ──────────────────────────────────────────────────
 
     def _load_all(self) -> List[dict]:

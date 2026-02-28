@@ -191,6 +191,27 @@ class OandaClient:
             })
         return trades
 
+    def get_pending_orders(self) -> List[Dict]:
+        """Return all pending (unfilled) orders for this account."""
+        data = self._get(f"/v3/accounts/{self.account_id}/pendingOrders")
+        orders = []
+        for o in data.get("orders", []):
+            units_raw = float(o.get("units", 0))
+            orders.append({
+                "id":         o.get("id", ""),
+                "type":       o.get("type", ""),
+                "instrument": o.get("instrument", ""),
+                "direction":  "long" if units_raw > 0 else "short",
+                "units":      abs(units_raw),
+                "price":      float(o["price"]) if "price" in o else None,
+                "stop_loss":  (
+                    float(o["stopLossOnFill"]["price"])
+                    if "stopLossOnFill" in o else None
+                ),
+                "created":    o.get("createTime"),
+            })
+        return orders
+
     # ── Market Data ───────────────────────────────────────────────────
 
     def get_quote(self, pair: str) -> Dict:
