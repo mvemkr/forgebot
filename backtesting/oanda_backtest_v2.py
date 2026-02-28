@@ -824,8 +824,9 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _eval_calls: int = 0            # performance counter: evaluate() call count
     _eval_ms:    float = 0.0        # total ms spent in evaluate()
     # Regime hysteresis state: consecutive H4 evaluations where HIGH conditions held.
-    # Persisted entry-to-entry (approximation of H4-bar hysteresis).
-    _consec_high_entry: int = 0
+    # Persisted entry-to-entry (approximation of H4-bar hysteresis for entries).
+    _consec_high_entry:  int = 0
+    _demote_streak_entry: int = 0
 
     # ── Alex small-account gate counters ───────────────────────────────────
     _weekly_trade_counts:   dict = {}  # {(iso_year, iso_week): count} — opened trades
@@ -1603,9 +1604,11 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     loss_streak           = consecutive_losses,
                     dd_pct                = _dd_pct_entry,
                     consecutive_high_bars = _consec_high_entry,
+                    demotion_streak       = _demote_streak_entry,
                 )
-                # Persist hysteresis counter for next entry evaluation.
-                _consec_high_entry = _rms_entry.consecutive_high_bars
+                # Persist both hysteresis counters for next entry evaluation.
+                _consec_high_entry   = _rms_entry.consecutive_high_bars
+                _demote_streak_entry = _rms_entry.demotion_streak
                 # Debug: log every HIGH/EXTREME promotion with full inputs.
                 if _rms_entry.promotion_note:
                     print(f"  🔺 {ts_utc.strftime('%Y-%m-%d')} {pair} → {_rms_entry.mode.value}"
@@ -1613,7 +1616,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                 # force_risk_mode pins mode for every entry (used in comparison runs).
                 risk.set_regime_mode(force_risk_mode or _rms_entry.mode.value)
             except Exception:
-                _consec_high_entry = 0
+                _consec_high_entry   = 0
+                _demote_streak_entry = 0
                 _rms_entry = None
                 risk.set_regime_mode(force_risk_mode or None)
 
@@ -1939,39 +1943,78 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     # ── Time-in-mode: H4 bar sampling (computed once, used in print + result) ─
     # Samples compute_risk_mode() at every H4 bar in the window.
     # Gives % of CALENDAR TIME in each mode — independent of entry frequency.
-    # Notes:
-    #   - trend_weekly = trend_daily = H4 proxy (wd_aligned always True in sampling).
-    #     This is a known approximation; real W/D alignment requires full candle data.
-    #     The strict ATR + last5 + streak conditions still gate HIGH/EXTREME correctly.
-    #   - consecutive_high_bars is propagated bar-to-bar within the sampling loop
-    #     so the 2-bar hysteresis is faithfully simulated at H4 granularity.
-    #   - loss_streak is re-derived from closed trades preceding each bar.
+    #
+    # Real W/D bias: uses actual daily ("d") and weekly ("w") candle series from
+    # the representative pair.  Daily trend cached per calendar date; weekly trend
+    # cached per ISO week.  This eliminates the "H4 proxy = wd_aligned always True"
+    # artifact that inflated HIGH/EXTREME time in previous runs.
     _tim_counts = Counter({"LOW": 0, "MEDIUM": 0, "HIGH": 0, "EXTREME": 0})
     try:
         from src.strategy.forex.pattern_detector import PatternDetector as _PD
         _pd_inst  = _PD()
         _rep_pair = next(iter(candle_data.keys()), None)
         _rep_h4   = candle_data[_rep_pair].get("4h") if _rep_pair else None
+        _rep_d    = candle_data[_rep_pair].get("d")  if _rep_pair else None
+        _rep_w    = candle_data[_rep_pair].get("w")  if _rep_pair else None
         if _rep_h4 is not None and len(_rep_h4) > 0:
             _start_ts = pd.Timestamp(start_dt).replace(tzinfo=None)
             _end_ts   = (pd.Timestamp(end_dt).replace(tzinfo=None)
                          if end_dt else _rep_h4.index[-1])
             _h4_window = _rep_h4[(_rep_h4.index >= _start_ts) &
                                   (_rep_h4.index <  _end_ts)]
-            _tim_consec = 0   # H4-bar-level hysteresis state for sampling loop
+
+            # ── Bias caches: compute once per day/week, not once per H4 bar ─
+            _daily_bias_cache:  dict = {}   # date_str  → trend str
+            _weekly_bias_cache: dict = {}   # week_str  → trend str
+
+            def _get_daily_bias(ts: "pd.Timestamp") -> str:
+                """Daily trend from D candles sliced to < ts; cached per date."""
+                key = str(ts.date())
+                if key not in _daily_bias_cache:
+                    if _rep_d is not None:
+                        _d_sl = _rep_d[_rep_d.index < ts]
+                        if len(_d_sl) >= 21:
+                            try:
+                                _daily_bias_cache[key] = _pd_inst.detect_trend(_d_sl).value
+                                return _daily_bias_cache[key]
+                            except Exception:
+                                pass
+                    _daily_bias_cache[key] = "neutral"
+                return _daily_bias_cache[key]
+
+            def _get_weekly_bias(ts: "pd.Timestamp") -> str:
+                """Weekly trend from W candles sliced to < ts; cached per ISO week."""
+                iso = ts.isocalendar()
+                key = f"{iso[0]}-W{iso[1]:02d}"
+                if key not in _weekly_bias_cache:
+                    if _rep_w is not None:
+                        _w_sl = _rep_w[_rep_w.index < ts]
+                        if len(_w_sl) >= 21:
+                            try:
+                                _weekly_bias_cache[key] = _pd_inst.detect_trend(_w_sl).value
+                                return _weekly_bias_cache[key]
+                            except Exception:
+                                pass
+                    _weekly_bias_cache[key] = "neutral"
+                return _weekly_bias_cache[key]
+
+            _tim_consec  = 0   # consecutive qualifying H4 bars
+            _tim_demote  = 0   # consecutive failing bars while in HIGH zone
             for _hi, (_h4_ts, _) in enumerate(_h4_window.iterrows()):
                 _h4_slice = _h4_window.iloc[max(0, _hi - 80): _hi + 1]
                 if len(_h4_slice) < 21:
                     continue
-                try:
-                    _h4_trend_str = _pd_inst.detect_trend(_h4_slice).value
-                except Exception:
-                    _h4_trend_str = "neutral"
+
+                # Real W/D trends (accurate wd_aligned — no H4 proxy)
+                _trend_w_str = _get_weekly_bias(_h4_ts)
+                _trend_d_str = _get_daily_bias(_h4_ts)
+
                 _h4_ts_str = str(_h4_ts)
                 _recent_closed = [t for t in trades
                                   if (t.get("exit_ts") or "0") < _h4_ts_str]
-                _recent5  = _recent_closed[-5:]
-                # Derive loss streak at this H4 bar from most recent closed trades
+                _recent5 = _recent_closed[-5:]
+
+                # Loss streak at this H4 bar from most recent closed trades
                 _tim_streak = 0
                 for _rt in reversed(_recent_closed):
                     if _rt.get("r", 0.0) < 0:
@@ -1980,18 +2023,21 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         break
                 try:
                     _rms_h4 = compute_risk_mode(
-                        trend_weekly          = _h4_trend_str,
-                        trend_daily           = _h4_trend_str,  # H4 proxy (see note above)
+                        trend_weekly          = _trend_w_str,
+                        trend_daily           = _trend_d_str,
                         df_h4                 = _h4_slice,
                         recent_trades         = _recent5,
                         loss_streak           = _tim_streak,
-                        dd_pct                = 0.0,            # conservative; no per-bar balance
+                        dd_pct                = 0.0,   # no per-bar balance in sampling
                         consecutive_high_bars = _tim_consec,
+                        demotion_streak       = _tim_demote,
                     )
-                    _tim_consec = _rms_h4.consecutive_high_bars   # propagate hysteresis
+                    _tim_consec = _rms_h4.consecutive_high_bars
+                    _tim_demote = _rms_h4.demotion_streak
                     _tim_counts[_rms_h4.mode.value] += 1
                 except Exception:
                     _tim_consec = 0
+                    _tim_demote = 0
                     _tim_counts["MEDIUM"] += 1
     except Exception:
         pass   # time-in-mode is diagnostic — never crash the backtest

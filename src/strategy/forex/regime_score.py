@@ -344,7 +344,9 @@ class RegimeModeScore:
     last5_sum_r:   float = 0.0
     loss_streak:   int   = 0
     # ── Hysteresis state (caller must persist and pass back each call) ─────
-    consecutive_high_bars: int   = 0    # output: consecutive bars where high_conds_met=True
+    # ── Hysteresis state (caller must persist and pass back each call) ─────
+    consecutive_high_bars: int   = 0    # qualifying-bar counter (output for next call)
+    demotion_streak:       int   = 0    # consecutive failing bars while in HIGH zone
     # ── Extended diagnostics ──────────────────────────────────────────────
     last10_sum_r:   float = 0.0
     dd_pct:         float = 0.0
@@ -362,6 +364,7 @@ class RegimeModeScore:
             "last5_sum_r":     round(self.last5_sum_r, 2),
             "loss_streak":     self.loss_streak,
             "consec_high":     self.consecutive_high_bars,
+            "demote_streak":   self.demotion_streak,
         }
         if self.promotion_note:
             d["promotion_note"] = self.promotion_note
@@ -380,21 +383,30 @@ def compute_risk_mode(
     loss_streak:           int,
     dd_pct:                float = 0.0,
     consecutive_high_bars: int   = 0,
+    demotion_streak:       int   = 0,
 ) -> RegimeModeScore:
-    """Compute risk mode from four independent conditions + hysteresis state.
+    """Compute risk mode from four conditions + promotion/demotion hysteresis.
 
-    HIGH promotion rules (ALL required — not any-3-of-4):
+    HIGH promotion rules (ALL required):
       1. W==D aligned        – weekly and daily trend point same direction
-      2. ATR expanding       – ATR_H4 / ATR_H4_20avg >= ATR_RATIO_THRESH (1.10)
-      3. Recent edge         – last-5 sum_R > LAST5_SUMR_THRESH (0.0)
-      4. No loss streak      – loss_streak == 0
-      5. Hysteresis          – conditions held for ≥2 consecutive evaluations
-                               (caller must persist consecutive_high_bars across calls)
+      2. ATR expanding       – ATR_H4/ATR_H4_20avg >= ATR_RATIO_THRESH (1.10)
+      3. Recent edge         – last-5 sum_R > LAST5_SUMR_THRESH (> 0)
+      4. Loss streak <= 1    – allows one-loss streaks through (EXTREME still requires 0)
+      5. Promotion hysteresis – ALL conditions must hold for ≥2 consecutive evals
+                                (caller persists consecutive_high_bars across calls)
 
-    EXTREME promotion: all HIGH conditions + score==4 + last10_sum_R>=1.5 + dd<10%
+    Demotion hysteresis (from HIGH):
+      - Soft demotion: requires 2 consecutive failing H4 bars to demote HIGH→MED
+        (caller persists demotion_streak across calls)
+      - Immediate demotion: loss_streak ≥ 2 hard-resets both counters at once
 
-    Immediate demotion (resets hysteresis counter):
-      W!=D  OR  ATR ratio < ATR_DEMOTE_THRESH (1.00)  OR  loss_streak >= 1
+    ATR hysteresis band:
+      - Promote: atr_ratio >= 1.10 (ATR_RATIO_THRESH)
+      - Demote band: 1.00 ≤ atr_ratio < 1.10 enters soft demotion
+      - Immediate: atr_ratio < 1.00 (ATR_DEMOTE_THRESH) triggers immediate hard reset
+
+    EXTREME promotion: HIGH eligible + score==4 (all 4 booleans True, forces streak==0)
+      + last10_sum_R >= 1.5 + dd < 10%
 
     Args:
         trend_weekly, trend_daily : bias strings ("bullish" / "bearish" / ...)
@@ -402,12 +414,11 @@ def compute_risk_mode(
         recent_trades             : trade dicts with 'r' field (last 5/10 used)
         loss_streak               : consecutive loss count from risk manager
         dd_pct                    : current drawdown % from peak (EXTREME gate)
-        consecutive_high_bars     : number of prior consecutive qualifying bars
-                                    (caller persists from previous call's output)
+        consecutive_high_bars     : qualifying-bar count from previous call (persisted)
+        demotion_streak           : consecutive failing bars from previous call (persisted)
 
     Returns:
-        RegimeModeScore — note: `consecutive_high_bars` in the result is the
-        UPDATED counter the caller should store for the next call.
+        RegimeModeScore with updated consecutive_high_bars + demotion_streak for caller to store.
     """
     # ── Component 1: Weekly == Daily alignment ────────────────────────────
     def _bull(t: str) -> bool:
@@ -442,55 +453,76 @@ def compute_risk_mode(
     last5_sum_r = sum(t.get("r", 0.0) for t in last5)
     edge_positive = last5_sum_r > LAST5_SUMR_THRESH
 
-    # ── Component 4: Loss streak clear ────────────────────────────────────
+    # ── Component 4: Loss streak ──────────────────────────────────────────
+    # streak_clear used only for the integer score (EXTREME requires score==4 → streak==0)
     streak_clear = loss_streak == 0
 
-    # ── Integer score (0–4) for EXTREME eligibility check ─────────────────
+    # ── Integer score (0–4) for EXTREME gate ──────────────────────────────
     score = sum([wd_aligned, atr_expanding, edge_positive, streak_clear])
 
-    # ── HIGH: ALL 4 conditions required (strict gate, replaces any-3-of-4) ─
-    # Every condition must be True — W==D is not just a prerequisite but a
-    # full veto; ATR must exceed the promotion threshold (1.10); edge and
-    # streak together ensure we only scale up during confirmed good conditions.
+    # ── HIGH qualifying conditions (relaxed: loss_streak ≤ 1) ────────────
+    # Relaxing streak from ==0 to <=1 restores W1 escalation while W2
+    # protection comes from W==D + ATR + edge conditions (all still required).
+    # EXTREME stays strict: requires score==4 which forces streak_clear=True.
     high_conds_met = (
         wd_aligned
-        and atr_expanding                # atr_ratio >= 1.10
-        and edge_positive                # last5_sum_r > 0
-        and streak_clear                 # loss_streak == 0
+        and atr_expanding             # atr_ratio >= 1.10
+        and edge_positive             # last5_sum_r > 0
+        and loss_streak <= 1          # relaxed from ==0; allows one-loss through
     )
 
-    # ── Immediate demotion: resets hysteresis counter ─────────────────────
-    # Triggers when: W!=D  OR  ATR ratio < ATR_DEMOTE_THRESH (1.00)  OR  streak>=1
-    # ATR hysteresis band: promote at >= 1.10, demote at < 1.00.
-    # Gray zone [1.00, 1.10): not qualifying but no hard demotion → counter
-    # still resets to 0 because high_conds_met is False (atr < 1.10).
-    _immediate_demote = (
-        not wd_aligned
-        or atr_ratio < ATR_DEMOTE_THRESH   # < 1.00
-        or loss_streak >= 1
-    )
+    # ── Immediate hard reset: loss_streak ≥ 2 or severe ATR compression ──
+    _hard_reset = loss_streak >= 2 or atr_ratio < ATR_DEMOTE_THRESH
 
     # ── Hysteresis counter update ─────────────────────────────────────────
-    # Increment when conditions met; reset on any demotion signal.
-    # Using _immediate_demote as override ensures ATR < 1.00 and streak
-    # always reset even if somehow high_conds_met were True (defensive).
-    consec_out = (
-        (consecutive_high_bars + 1) if (high_conds_met and not _immediate_demote) else 0
+    # Promotion counter:
+    #   +1 each qualifying bar; hard-reset to 0 on immediate demote;
+    #   held (frozen) during soft-demotion grace period so re-promotion
+    #   requires fresh 2-bar accumulation after full demotion.
+    # Demotion counter:
+    #   increments while conditions fail (no hard-reset), resets on qualifying bar.
+    #   When demotion_streak_out >= 2, promotion counter is also zeroed.
+    if _hard_reset:
+        consec_out  = 0
+        demote_out  = 0
+    elif high_conds_met:
+        consec_out  = consecutive_high_bars + 1
+        demote_out  = 0
+    elif consecutive_high_bars >= 2:
+        # Previously promoted — enter/continue soft-demotion grace period
+        demote_out  = demotion_streak + 1
+        if demote_out >= 2:
+            # Grace expired: zero promotion counter so re-promotion needs fresh run
+            consec_out = 0
+        else:
+            consec_out = consecutive_high_bars   # hold during grace bar
+    else:
+        # Never entered HIGH zone — just a plain failing bar
+        consec_out  = 0
+        demote_out  = 0
+
+    # ── HIGH eligibility ──────────────────────────────────────────────────
+    # Promotion path: conditions met for 2+ consecutive bars
+    _promoting = high_conds_met and consecutive_high_bars >= 1 and not _hard_reset
+
+    # Grace path: was in HIGH zone (consec_in >= 2), soft-failing, < 2 fail bars
+    _in_grace  = (
+        not high_conds_met
+        and not _hard_reset
+        and consecutive_high_bars >= 2     # was previously promoted
+        and demote_out < 2                 # still within 1-bar grace window
     )
+    high_eligible = _promoting or _in_grace
 
-    # ── HIGH / EXTREME eligibility ────────────────────────────────────────
-    # HIGH: all conditions held for this bar AND at least 1 prior qualifying bar
-    # (i.e., current is the 2nd consecutive qualifying bar).
-    high_eligible = high_conds_met and (consecutive_high_bars >= 1) and not _immediate_demote
-
-    # EXTREME: HIGH eligible + score=4 + sustained performance + low DD
+    # ── EXTREME eligibility ───────────────────────────────────────────────
+    # score==4 requires streak_clear (loss_streak==0), keeping EXTREME strict.
     last10       = (recent_trades or [])[-10:]
     last10_sum_r = sum(t.get("r", 0.0) for t in last10)
     extreme_eligible = (
         high_eligible
-        and score == 4
-        and last10_sum_r >= LAST10_SUMR_EXTREME   # >= +1.5R across last 10 trades
-        and dd_pct < DD_EXTREME_MAX_PCT            # drawdown < 10%
+        and score == 4                                # forces streak_clear → streak==0
+        and last10_sum_r >= LAST10_SUMR_EXTREME       # >= +1.5R last 10 trades
+        and dd_pct < DD_EXTREME_MAX_PCT               # drawdown < 10%
     )
 
     # ── Mode mapping ──────────────────────────────────────────────────────
@@ -506,6 +538,7 @@ def compute_risk_mode(
     # ── Promotion debug note ──────────────────────────────────────────────
     promotion_note = ""
     if mode in (RiskMode.HIGH, RiskMode.EXTREME):
+        _grace_tag = " [GRACE]" if _in_grace else ""
         promotion_note = (
             f"W={trend_weekly[:4] if trend_weekly else '?'} "
             f"D={trend_daily[:4] if trend_daily else '?'} "
@@ -514,7 +547,8 @@ def compute_risk_mode(
             f"streak={loss_streak} "
             f"dd={dd_pct:.1f}% "
             f"consec={consecutive_high_bars}→{consec_out} "
-            f"score={score}"
+            f"demote={demotion_streak}→{demote_out} "
+            f"score={score}{_grace_tag}"
         )
 
     return RegimeModeScore(
@@ -528,6 +562,7 @@ def compute_risk_mode(
         last5_sum_r            = last5_sum_r,
         loss_streak            = loss_streak,
         consecutive_high_bars  = consec_out,
+        demotion_streak        = demote_out,
         last10_sum_r           = last10_sum_r,
         dd_pct                 = dd_pct,
         promotion_note         = promotion_note,

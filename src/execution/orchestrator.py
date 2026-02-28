@@ -291,6 +291,7 @@ class ForexOrchestrator:
         # Hysteresis: consecutive H4 evals where ALL HIGH conditions held.
         # Persisted across hourly regime evaluations (stateful, not per-entry).
         self._consec_high_live:    int               = 0
+        self._demote_streak_live:  int               = 0
 
         # ── Crash recovery — restore full state from last save ───────────
         # Reconciles saved state with OANDA live data:
@@ -645,9 +646,11 @@ class ForexOrchestrator:
                     loss_streak           = self._consecutive_losses,
                     dd_pct                = _live_dd_pct,
                     consecutive_high_bars = self._consec_high_live,
+                    demotion_streak       = self._demote_streak_live,
                 )
-                # Persist hysteresis counter for next evaluation.
-                self._consec_high_live = _rms.consecutive_high_bars
+                # Persist both hysteresis counters for next evaluation.
+                self._consec_high_live   = _rms.consecutive_high_bars
+                self._demote_streak_live = _rms.demotion_streak
                 if _rms.promotion_note:
                     logger.info(f"🔺 REGIME PROMOTION: {_rms.mode.value} | {_rms.promotion_note}")
                 self._last_regime_score.update(_rms.to_dict())
