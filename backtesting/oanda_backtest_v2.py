@@ -2221,6 +2221,14 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     print(f"    Avg loss $:              ${sum(_losses_dollar)/len(_losses_dollar):,.2f}"
           if _losses_dollar else "    Avg loss $:              n/a")
 
+    # Worst-3-losses DD — sum of 3 biggest individual losses as % of starting balance.
+    # Answers "if these 3 hit back-to-back from start, what DD?". Useful for comparing
+    # LOW_mult variants: higher mult → bigger individual losses → higher Worst3L DD.
+    _w3 = _losses_dollar[:3]   # already sorted most-negative first
+    _w3_sum_pct = abs(sum(_w3)) / starting_bal * 100 if _w3 else 0.0
+    _w3_pnl_str = "  ".join(f"${p:,.0f}" for p in _w3) if _w3 else "n/a"
+    print(f"    Worst-3-losses DD (vs start): {_w3_sum_pct:.1f}%  [{_w3_pnl_str}]")
+
     # DD killswitch
     if dd_killswitch_blocks > 0:
         print(f"    DD_KILLSWITCH blocks:    {dd_killswitch_blocks}  "
@@ -2516,6 +2524,21 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
 
     print(f"  Results log:  {_results_log}  [{_commit}{'-dirty' if _dirty else ''}]")
 
+    # ── Compact comparison line (useful when diffing mult variants) ────────
+    try:
+        _cmp_low_n  = sum(1 for m in _rm_at_entry if m == "LOW")
+        _cmp_med_n  = sum(1 for m in _rm_at_entry if m == "MEDIUM")
+        _cmp_high_n = sum(1 for m in _rm_at_entry if m == "HIGH")
+        _cmp_ext_n  = sum(1 for m in _rm_at_entry if m == "EXTREME")
+        _low_m = RISK_MODE_PARAMS["LOW"]["risk_mult"]
+        print(f"\n  ▶ SUMMARY  low_mult={_low_m}×"
+              f"  ret={ret_pct:+.1f}%  maxDD={_max_dd_pct:.1f}%"
+              f"  worst3L={_w3_sum_pct:.1f}%"
+              f"  LOW={_cmp_low_n}  MED={_cmp_med_n}"
+              f"  HIGH={_cmp_high_n}  EXT={_cmp_ext_n}")
+    except Exception:
+        pass  # compact summary is optional — never crash the run
+
     # ── Auto-run miss analyzer on Alex window ─────────────────────────
     # Only fires when running the Jul 15 – Oct 31 2024 window so we
     # always get an up-to-date Alex vs bot scorecard.
@@ -2668,6 +2691,11 @@ Examples:
                         help="Pin risk mode for every entry: LOW | MEDIUM | HIGH | EXTREME. "
                              "None = AUTO (compute dynamically per entry — default). "
                              "Use for mode comparison runs.")
+    parser.add_argument("--low-mult", type=float, default=None,
+                        metavar="MULT",
+                        help="Override LOW risk-mode risk_mult (default 0.5). "
+                             "e.g. --low-mult 0.7 to reduce drag vs MEDIUM in bad markets. "
+                             "Only applies in AUTO mode when entries fall into LOW mode.")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -2710,6 +2738,14 @@ Examples:
     start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end   = datetime.strptime(args.end,   "%Y-%m-%d").replace(tzinfo=timezone.utc) if args.end else None
 
+    # ── LOW multiplier override ────────────────────────────────────────────────
+    # Patches RISK_MODE_PARAMS["LOW"]["risk_mult"] for this run only.
+    # Allows quantifying drag/protection tradeoff without touching source constants.
+    if args.low_mult is not None:
+        _low_mult_val = round(float(args.low_mult), 3)
+        RISK_MODE_PARAMS["LOW"]["risk_mult"] = _low_mult_val
+        print(f"  ⚡ LOW risk_mult overridden → {_low_mult_val}×  (default: 0.5×)")
+
     # Build notes string that captures any lever overrides
     notes = args.notes
     extra = []
@@ -2719,6 +2755,8 @@ Examples:
         extra.append(f"profile={args.profile}")
     if args.lever:
         extra.extend(args.lever)
+    if args.low_mult is not None:
+        extra.append(f"low_mult={args.low_mult}")
     if extra:
         notes = (notes + " [levers: " + ", ".join(extra) + "]").strip()
 
