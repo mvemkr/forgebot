@@ -135,6 +135,7 @@ class PositionMonitor:
                                 realized_pnl,
                                 pair=pair,
                                 exit_reason="stop_hit",
+                                planned_risk_dollars=pos.get("risk_dollars", 0),
                             )
                             balance_after = self.account.safe_equity()
                         else:

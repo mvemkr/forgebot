@@ -337,7 +337,7 @@ class RegimeModeScore:
     wd_aligned:    bool    # Weekly trend == Daily trend
     atr_expanding: bool    # H4 ATR ratio ≥ ATR_RATIO_THRESH (1.10)
     edge_positive: bool    # last-5 sum_R > LAST5_SUMR_THRESH
-    streak_clear:  bool    # loss_streak == 0
+    streak_clear:  bool    # loss_streak < streak_demotion_thresh (default: streak == 0)
     score:         int     # 0–4
     mode:          RiskMode
     atr_ratio:     float = 0.0
@@ -376,15 +376,16 @@ class RegimeModeScore:
 
 
 def compute_risk_mode(
-    trend_weekly:          str,
-    trend_daily:           str,
-    df_h4:                 "pd.DataFrame",
-    recent_trades:         list,
-    loss_streak:           int,
-    dd_pct:                float = 0.0,
-    consecutive_high_bars: int   = 0,
-    demotion_streak:       int   = 0,
-    instantaneous:         bool  = False,
+    trend_weekly:           str,
+    trend_daily:            str,
+    df_h4:                  "pd.DataFrame",
+    recent_trades:          list,
+    loss_streak:            int,
+    dd_pct:                 float = 0.0,
+    consecutive_high_bars:  int   = 0,
+    demotion_streak:        int   = 0,
+    instantaneous:          bool  = False,
+    streak_demotion_thresh: int   = 1,
 ) -> RegimeModeScore:
     """Compute risk mode from four conditions + promotion/demotion hysteresis.
 
@@ -427,6 +428,11 @@ def compute_risk_mode(
         consecutive_high_bars     : qualifying-bar count from previous call (persisted)
         demotion_streak           : consecutive failing bars from previous call (persisted)
         instantaneous             : if True, skip all hysteresis — pure snapshot evaluation
+        streak_demotion_thresh    : min consecutive losses to flip streak_clear=False (default 1).
+                                    1 = current: any loss → streak_clear=False → score−1 → easier LOW.
+                                    2 = relax: need ≥2 losses → keeps 1-loss trades in MEDIUM.
+                                    Does NOT affect HIGH gate (which uses loss_streak ≤ 1 directly).
+                                    NOTE: also affects EXTREME (score==4 requires streak_clear=True).
 
     Returns:
         RegimeModeScore with updated consecutive_high_bars + demotion_streak for caller to store.
@@ -465,8 +471,11 @@ def compute_risk_mode(
     edge_positive = last5_sum_r > LAST5_SUMR_THRESH
 
     # ── Component 4: Loss streak ──────────────────────────────────────────
-    # streak_clear used only for the integer score (EXTREME requires score==4 → streak==0)
-    streak_clear = loss_streak == 0
+    # streak_clear is used for the integer score (EXTREME requires score==4 → streak_clear True).
+    # streak_demotion_thresh controls how many losses flip streak_clear False:
+    #   1 (default): any loss (streak ≥ 1) → False  (current behavior)
+    #   2           : need ≥ 2 losses → False        (keep 1-loss trades in MEDIUM)
+    streak_clear = loss_streak < streak_demotion_thresh
 
     # ── Integer score (0–4) for EXTREME gate ──────────────────────────────
     score = sum([wd_aligned, atr_expanding, edge_positive, streak_clear])

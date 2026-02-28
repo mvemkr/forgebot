@@ -534,7 +534,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  dynamic_pip_equity: bool = False,
                  wd_protrend_htf: bool = False,
                  flat_risk_pct: Optional[float] = None,
-                 force_risk_mode: Optional[str] = None):
+                 force_risk_mode: Optional[str] = None,
+                 streak_demotion_thresh: int = 1):
     """Run a single backtest simulation.
 
     quiet=True suppresses all stdout (useful when called from compare scripts).
@@ -572,6 +573,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             wd_protrend_htf=wd_protrend_htf,
             flat_risk_pct=flat_risk_pct,
             force_risk_mode=force_risk_mode,
+            streak_demotion_thresh=streak_demotion_thresh,
         )
     finally:
         _sys.stdout = _orig_stdout
@@ -590,7 +592,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                        dynamic_pip_equity: bool = False,
                        wd_protrend_htf: bool = False,
                        flat_risk_pct: Optional[float] = None,
-                       force_risk_mode: Optional[str] = None):
+                       force_risk_mode: Optional[str] = None,
+                       streak_demotion_thresh: int = 1):
     # PROTREND_ONLY config flag → wd_protrend_htf gate.
     # Config wins when True; explicit True caller arg also wins.
     if getattr(_sc, "PROTREND_ONLY", False) and not wd_protrend_htf:
@@ -1595,22 +1598,23 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             )
             try:
                 _rms_entry = compute_risk_mode(
-                    trend_weekly          = (decision.trend_weekly.value
-                                             if hasattr(decision.trend_weekly, "value")
-                                             else str(decision.trend_weekly or "")),
-                    trend_daily           = (decision.trend_daily.value
-                                             if hasattr(decision.trend_daily, "value")
-                                             else str(decision.trend_daily or "")),
-                    df_h4                 = hist_4h,
-                    recent_trades         = trades,      # closed trades so far
-                    loss_streak           = consecutive_losses,
-                    dd_pct                = _dd_pct_entry,
+                    trend_weekly            = (decision.trend_weekly.value
+                                               if hasattr(decision.trend_weekly, "value")
+                                               else str(decision.trend_weekly or "")),
+                    trend_daily             = (decision.trend_daily.value
+                                               if hasattr(decision.trend_daily, "value")
+                                               else str(decision.trend_daily or "")),
+                    df_h4                   = hist_4h,
+                    recent_trades           = trades,      # closed trades so far
+                    loss_streak             = consecutive_losses,
+                    dd_pct                  = _dd_pct_entry,
                     # Instantaneous evaluation: Alex's ~1 trade/week cadence is too
                     # sparse for 2-bar consecutive accumulation across entries.
                     # HIGH/EXTREME granted immediately when ALL conditions are met at
                     # this exact bar — no state carried between entries.
                     # 2-bar hysteresis runs only in the H4 time-sampling loop.
-                    instantaneous         = True,
+                    instantaneous           = True,
+                    streak_demotion_thresh  = streak_demotion_thresh,
                 )
                 # Debug: log every HIGH/EXTREME promotion with full inputs.
                 if _rms_entry.promotion_note:
@@ -1859,6 +1863,20 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                   f" @ {decision.entry_price:.5f}  SL={decision.stop_loss:.5f}"
                   f"  conf={decision.confidence:.0%}  [{decision.reason[:55]}]"
                   f"  📊{pe:.0f}p{theme_tag}")
+            # ── Risk mode audit print (every trade — proves multiplier wired) ──
+            _pos_now = open_pos[pair]
+            _mode_label = _pos_now.get("risk_mode_at_entry", "MEDIUM")
+            _base_pct_now = _pos_now.get("base_risk_pct", 0)
+            _eff_pct_now  = _pos_now.get("final_risk_pct", 0)
+            _risk_usd_now = _pos_now.get("entry_risk_dollars", 0)
+            _mode_mult_now = (_eff_pct_now / _base_pct_now) if _base_pct_now else 1.0
+            _mode_icon = {"LOW": "🔵", "HIGH": "🟠", "EXTREME": "🔴"}.get(_mode_label, "⚪")
+            print(f"       {_mode_icon} mode={_mode_label:<8}"
+                  f"  base={_base_pct_now:.2f}%  eff={_eff_pct_now:.2f}%"
+                  f"  mult≈{_mode_mult_now:.2f}×"
+                  f"  risk=${_risk_usd_now:,.0f}"
+                  f"  streak={consecutive_losses}"
+                  f"  dd={_dd_pct_entry:.1f}%")
 
     # ── Last-resort close (runout period exhausted) ───────────────────
     # Normally positions close via target or stop during the runout window.
@@ -2024,14 +2042,15 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         break
                 try:
                     _rms_h4 = compute_risk_mode(
-                        trend_weekly          = _trend_w_str,
-                        trend_daily           = _trend_d_str,
-                        df_h4                 = _h4_slice,
-                        recent_trades         = _recent5,
-                        loss_streak           = _tim_streak,
-                        dd_pct                = 0.0,   # no per-bar balance in sampling
-                        consecutive_high_bars = _tim_consec,
-                        demotion_streak       = _tim_demote,
+                        trend_weekly            = _trend_w_str,
+                        trend_daily             = _trend_d_str,
+                        df_h4                   = _h4_slice,
+                        recent_trades           = _recent5,
+                        loss_streak             = _tim_streak,
+                        dd_pct                  = 0.0,   # no per-bar balance in sampling
+                        consecutive_high_bars   = _tim_consec,
+                        demotion_streak         = _tim_demote,
+                        streak_demotion_thresh  = streak_demotion_thresh,
                     )
                     _tim_consec = _rms_h4.consecutive_high_bars
                     _tim_demote = _rms_h4.demotion_streak
@@ -2482,6 +2501,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             "dynamic_pip_equity":                dynamic_pip_equity,
             "policy_tag":                        policy_tag,
             "force_risk_mode":                   force_risk_mode,
+            "streak_demotion_thresh":             streak_demotion_thresh,
         },
         "results": {
             "n_trades":   len(trades),
@@ -2494,17 +2514,24 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         },
         "trades": [
             {
-                "pair":        t["pair"],
-                "direction":   t["direction"],
-                "entry":       t["entry"],
-                "exit":        t["exit"],
-                "r":           round(t["r"], 2),
-                "pnl":         round(t["pnl"], 2),
-                "reason":      t["reason"],
-                "pattern":     t.get("pattern", ""),
-                "macro_theme": t.get("macro_theme", ""),
-                "entry_ts":    t.get("entry_ts", ""),
-                "exit_ts":     t.get("exit_ts", ""),
+                "pair":                  t["pair"],
+                "direction":             t["direction"],
+                "entry":                 t["entry"],
+                "exit":                  t["exit"],
+                "r":                     round(t["r"], 2),
+                "pnl":                   round(t["pnl"], 2),
+                "reason":                t["reason"],
+                "pattern":               t.get("pattern", ""),
+                "macro_theme":           t.get("macro_theme", ""),
+                "entry_ts":              t.get("entry_ts", ""),
+                "exit_ts":               t.get("exit_ts", ""),
+                # Risk mode audit (added 2026-02-28 — always present from now on)
+                "risk_mode_at_entry":    t.get("risk_mode_at_entry", "MEDIUM"),
+                "entry_risk_dollars":    round(t.get("entry_risk_dollars", 0), 2),
+                "base_risk_pct":         round(t.get("base_risk_pct", 0), 4),
+                "final_risk_pct":        round(t.get("final_risk_pct", 0), 4),
+                "entry_equity":          round(t.get("entry_equity", 0), 2),
+                "streak_at_entry":       t.get("streak_at_entry", 0),
             }
             for t in trades
         ],
@@ -2696,6 +2723,13 @@ Examples:
                         help="Override LOW risk-mode risk_mult (default 0.5). "
                              "e.g. --low-mult 0.7 to reduce drag vs MEDIUM in bad markets. "
                              "Only applies in AUTO mode when entries fall into LOW mode.")
+    parser.add_argument("--demote-after-losses", type=int, default=None,
+                        metavar="N",
+                        dest="demote_after_losses",
+                        help="Consecutive losses needed to flip streak_clear=False (default 1). "
+                             "1=current: any single loss demotes score; "
+                             "2=relax: need 2+ losses; keeps 1-loss trades in MEDIUM not LOW. "
+                             "Only affects mode assignment — HIGH gate uses loss_streak<=1 unchanged.")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -2746,6 +2780,13 @@ Examples:
         RISK_MODE_PARAMS["LOW"]["risk_mult"] = _low_mult_val
         print(f"  ⚡ LOW risk_mult overridden → {_low_mult_val}×  (default: 0.5×)")
 
+    # ── Streak demotion threshold override ────────────────────────────────────
+    # Controls how many consecutive losses flip streak_clear=False in compute_risk_mode.
+    # 1 (default): any loss → LOW eligible; 2: need 2+ losses → 1-loss stays MEDIUM.
+    _streak_demote_thresh = int(args.demote_after_losses) if args.demote_after_losses is not None else 1
+    if args.demote_after_losses is not None:
+        print(f"  ⚡ streak_demotion_thresh overridden → {_streak_demote_thresh}  (default: 1)")
+
     # Build notes string that captures any lever overrides
     notes = args.notes
     extra = []
@@ -2757,6 +2798,8 @@ Examples:
         extra.extend(args.lever)
     if args.low_mult is not None:
         extra.append(f"low_mult={args.low_mult}")
+    if args.demote_after_losses is not None:
+        extra.append(f"demote_after={_streak_demote_thresh}")
     if extra:
         notes = (notes + " [levers: " + ", ".join(extra) + "]").strip()
 
@@ -2811,6 +2854,7 @@ Examples:
             use_cache=_use_cache,
             wd_protrend_htf=_protrend_flag,
             force_risk_mode=_force_mode,
+            streak_demotion_thresh=_streak_demote_thresh,
         )
         _t_run_elapsed = time.perf_counter() - _t_run
 

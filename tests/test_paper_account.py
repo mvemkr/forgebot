@@ -389,8 +389,8 @@ class TestEquityIdentity:
         e = entries[0]
         assert e["pair"]         == "GBP/JPY"
         assert e["direction"]    == "short"
-        assert e["risk_dollars"] == pytest.approx(480.0)
-        assert e["equity_now"]   == pytest.approx(8_000.0)
+        assert e["planned_risk_dollars"] == pytest.approx(480.0)
+        assert e["equity_before"]        == pytest.approx(8_000.0)
 
     def test_backtest_mode_never_writes_journal(self, tmp_path):
         """BACKTEST AccountState must not write any files."""

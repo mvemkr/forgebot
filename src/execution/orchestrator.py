@@ -1052,12 +1052,41 @@ class ForexOrchestrator:
             if result.get("status") in ("filled", "pending", "dry_run"):
                 # ── Paper journal: log entry event ──────────────────────────
                 if self.account.mode == AccountMode.LIVE_PAPER:
+                    # Gather risk-mode audit data from risk manager state.
+                    # All fields are optional — journal write never blocks entry.
+                    try:
+                        _j_eq    = self._equity_fallback
+                        _j_peak  = self.account.peak_equity or _j_eq
+                        _j_mode  = self.risk._regime_mode or "MEDIUM"
+                        _j_mult  = self.risk.regime_risk_multiplier()
+                        _j_base  = self.risk.get_risk_pct(_j_eq)
+                        _j_eff   = self.risk.get_risk_pct_with_dd(
+                            _j_eq,
+                            peak_equity=_j_peak,
+                            consecutive_losses=self._consecutive_losses,
+                        )[0]
+                        _j_tier  = self.risk._tier_idx
+                        _j_dd    = (max(0.0, (_j_peak - _j_eq) / _j_peak * 100)
+                                    if _j_peak > 0 else 0.0)
+                        _j_stk   = self._consecutive_losses
+                    except Exception:
+                        _j_mode, _j_mult, _j_base = "UNKNOWN", 1.0, 0.0
+                        _j_eff, _j_tier, _j_dd, _j_stk = 0.0, 0, 0.0, 0
+                    _j_risk_usd = result.get("risk_amount", 0)
                     self.account.log_entry_event(
-                        pair        = pair,
-                        direction   = decision.direction or "?",
-                        entry_price = decision.entry_price or 0,
-                        stop_loss   = decision.stop_price  or 0,
-                        risk_dollars= result.get("risk_amount", 0),
+                        pair                 = pair,
+                        direction            = decision.direction or "?",
+                        entry_price          = decision.entry_price or 0,
+                        stop_loss            = decision.stop_price  or 0,
+                        risk_dollars         = _j_risk_usd,
+                        risk_mode            = _j_mode,
+                        base_risk_pct        = _j_base,
+                        mode_mult            = _j_mult,
+                        effective_risk_pct   = _j_eff,
+                        planned_risk_dollars = _j_risk_usd,
+                        tier_idx             = _j_tier,
+                        dd_pct_at_entry      = _j_dd,
+                        loss_streak_at_entry = _j_stk,
                     )
                 # Send trade notification — extra detail if overnight
                 self.notifier.send_trade_entry(

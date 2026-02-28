@@ -263,6 +263,7 @@ class AccountState:
         pair: str = "",
         exit_reason: str = "",
         ts: Optional[str] = None,
+        planned_risk_dollars: float = 0.0,
     ) -> None:
         """
         Apply realized PnL to paper equity and enforce all accounting invariants.
@@ -322,18 +323,24 @@ class AccountState:
         self.week_trades += 1
 
         # ── Journal entry ────────────────────────────────────────────────────
+        _realized_r = (
+            round(realized_pnl / planned_risk_dollars, 4)
+            if planned_risk_dollars and planned_risk_dollars != 0
+            else None
+        )
         self._append_journal({
-            "event":          "exit",
-            "ts":             ts or self.last_update_ts,
-            "pair":           pair,
-            "exit_reason":    exit_reason,
-            "realized_pnl":   round(realized_pnl, 4),
-            "equity_before":  round(equity_before, 4) if equity_before is not None else None,
-            "equity_after":   round(self.equity, 4),
-            "peak_equity":    round(self.peak_equity, 4),
-            "week_id":        self.week_id,
-            "week_pnl":       round(self.week_pnl, 4),
-            "week_trades":    self.week_trades,
+            "event":                "exit",
+            "ts":                   ts or self.last_update_ts,
+            "pair":                 pair,
+            "exit_reason":          exit_reason,
+            "realized_pnl":         round(realized_pnl, 4),
+            "realized_R":           _realized_r,
+            "equity_before":        round(equity_before, 4) if equity_before is not None else None,
+            "equity_after":         round(self.equity, 4),
+            "peak_equity":          round(self.peak_equity, 4),
+            "week_id":              self.week_id,
+            "week_pnl":             round(self.week_pnl, 4),
+            "week_trades":          self.week_trades,
         })
 
         # ── Persist ──────────────────────────────────────────────────────────
@@ -354,24 +361,52 @@ class AccountState:
         stop_loss: float,
         risk_dollars: float,
         ts: Optional[str] = None,
+        # ── Risk mode audit fields (all optional for backward compat) ──────
+        risk_mode:            str   = "UNKNOWN",
+        base_risk_pct:        float = 0.0,
+        mode_mult:            float = 1.0,
+        effective_risk_pct:   float = 0.0,
+        planned_risk_dollars: float = 0.0,
+        tier_idx:             int   = 0,
+        dd_pct_at_entry:      float = 0.0,
+        loss_streak_at_entry: int   = 0,
     ) -> None:
         """
         Log a trade entry event to the paper journal.
         Does NOT modify equity — that only happens on close via apply_pnl().
+
+        Risk mode audit fields (added 2026-02-28):
+          risk_mode            — e.g. "HIGH", "LOW", "MEDIUM", "EXTREME"
+          base_risk_pct        — raw tier % before mode multiplier (e.g. 6.0 for $8K account)
+          mode_mult            — regime multiplier (0.5 LOW / 1.0 MED / 1.5 HIGH / 2.0 EXT)
+          effective_risk_pct   — final risk % after all caps (= planned_risk_dollars / equity * 100)
+          planned_risk_dollars — exact dollar amount at risk for this trade
+          tier_idx             — which risk tier (0–3) based on equity
+          dd_pct_at_entry      — drawdown % from peak at entry time
+          loss_streak_at_entry — consecutive loss count at entry time
         """
         if self.mode not in (AccountMode.LIVE_PAPER,):
             return
-        self._append_journal({
-            "event":        "entry",
-            "ts":           ts or datetime.now(timezone.utc).isoformat(),
-            "pair":         pair,
-            "direction":    direction,
-            "entry_price":  entry_price,
-            "stop_loss":    stop_loss,
-            "risk_dollars": round(risk_dollars, 4),
-            "equity_now":   round(self.equity, 4) if self.equity is not None else None,
-            "week_id":      self.week_id,
-        })
+        record: dict = {
+            "event":                "entry",
+            "ts":                   ts or datetime.now(timezone.utc).isoformat(),
+            "pair":                 pair,
+            "direction":            direction,
+            "entry_price":          entry_price,
+            "stop_loss":            stop_loss,
+            "planned_risk_dollars": round(planned_risk_dollars or risk_dollars, 4),
+            "equity_before":        round(self.equity, 4) if self.equity is not None else None,
+            "week_id":              self.week_id,
+            # Risk mode audit
+            "risk_mode":            risk_mode,
+            "base_risk_pct":        round(base_risk_pct, 4),
+            "mode_mult":            round(mode_mult, 4),
+            "effective_risk_pct":   round(effective_risk_pct, 4),
+            "tier_idx":             tier_idx,
+            "dd_pct_at_entry":      round(dd_pct_at_entry, 3),
+            "loss_streak_at_entry": loss_streak_at_entry,
+        }
+        self._append_journal(record)
 
     # ── Paper journal ─────────────────────────────────────────────────────────
 
