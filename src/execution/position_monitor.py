@@ -59,6 +59,7 @@ class PositionMonitor:
         journal: TradeJournal,
         notifier: "Notifier",
         dry_run: bool = True,
+        account=None,   # Optional[AccountState] — for paper equity updates
     ):
         from .trade_analyzer import TradeAnalyzer
         self.strategy = strategy
@@ -66,9 +67,13 @@ class PositionMonitor:
         self.journal = journal
         self.notifier = notifier
         self.dry_run = dry_run
+        self.account = account   # AccountState reference (may be None for back-compat)
         self._signal_detector = EntrySignalDetector(min_body_ratio=0.45)
         self._breakeven_moved: set = set()   # track which trades already moved to BE
         self.analyzer = TradeAnalyzer(notifier=notifier)
+        # Reconciler injected by orchestrator after construction.
+        # Optional: position_monitor works standalone without it.
+        self.reconciler = None
 
     # ── Main Check ─────────────────────────────────────────────────────
 
@@ -123,12 +128,34 @@ class PositionMonitor:
                     pos = self.strategy.open_positions[pair]
                     logger.info(f"📌 {pair}: No longer in OANDA open trades — stop hit or closed")
 
-                    # Get final account balance
-                    try:
-                        summary = self.oanda.get_account_summary()
-                        balance_after = summary.get("balance", 0)
-                    except Exception:
-                        balance_after = 0
+                    # ── Get balance after exit ────────────────────────
+                    realized_pnl = -(pos.get("risk_dollars", 0))
+                    if self.account is not None:
+                        from .account_state import AccountMode
+                        if self.account.mode == AccountMode.LIVE_PAPER:
+                            # Paper mode: apply PnL to simulated equity
+                            self.account.apply_pnl(
+                                realized_pnl,
+                                pair=pair,
+                                exit_reason="stop_hit",
+                                planned_risk_dollars=pos.get("risk_dollars", 0),
+                            )
+                            balance_after = self.account.safe_equity()
+                        else:
+                            # LIVE_REAL: fetch actual broker balance
+                            try:
+                                summary = self.oanda.get_account_summary()
+                                self.account.update_from_broker(summary)
+                                balance_after = self.account.safe_equity()
+                            except Exception:
+                                self.account.mark_broker_failed()
+                                balance_after = self.account.safe_equity()
+                    else:
+                        try:
+                            summary = self.oanda.get_account_summary()
+                            balance_after = summary.get("balance", 0)
+                        except Exception:
+                            balance_after = 0
 
                     # Log the exit — we don't know exact exit price, use stop as approximation
                     self.journal.log_trade_exited(
@@ -189,48 +216,123 @@ class PositionMonitor:
 
     def _check_breakeven(self, pair: str, pos: dict, current_price: float):
         """
-        Move SL to breakeven when price has moved 1:1 in our favor.
-        This is automatic — always safe, never moves SL further from entry.
+        Trail Arm C — two-stage ratchet stop management (parity with backtester).
+
+        Stage 1 (at 2R MFE, fires once):
+            Lock stop to entry + 0.5R  → trade is risk-reduced, not just breakeven.
+
+        Stage 2 (at 3R MFE, continuous):
+            Trail stop at (trail_max − 1.0R), floor at Stage-1 level.
+            Stop only ever moves toward entry → never backward.
+
+        Always updates trail_max from current_price before gate checks.
         """
-        trade_key = f"{pair}_{pos.get('oanda_trade_id', 'noid')}"
-        if trade_key in self._breakeven_moved:
-            return
-
-        entry = pos["entry"]
-        stop  = pos["stop"]
+        entry     = pos["entry"]
+        stop      = pos["stop"]
         direction = pos["direction"]
-
-        risk = abs(entry - stop)
+        risk      = pos.get("initial_risk") or abs(entry - stop)
         if risk == 0:
             return
 
-        # Has price moved 1:1 in our favor?
-        if direction == "long":
-            moved_1r = current_price >= entry + risk
-        else:
-            moved_1r = current_price <= entry - risk
-
-        if not moved_1r:
-            return
-
-        # Already at breakeven?
-        if stop == entry:
-            self._breakeven_moved.add(trade_key)
-            return
-
-        logger.info(f"✅ {pair}: Price moved 1:1 — moving stop to breakeven at {entry:.5f}")
-
         oanda_trade_id = pos.get("oanda_trade_id")
-        result = self.oanda.move_stop_to_breakeven(
-            trade_id=oanda_trade_id or "unknown",
-            entry_price=entry,
-            dry_run=self.dry_run,
+
+        # ── Trail Arm C constants (parity with backtester TRAIL_ARMS["C"]) ────
+        STAGE1_ACTIVATE_R  = 2.0   # MFE ≥ 2R → fire Stage-1 lock
+        STAGE1_LOCK_R      = 0.5   # lock stop at entry + 0.5R
+        STAGE2_ACTIVATE_R  = 3.0   # MFE ≥ 3R → engage Stage-2 trail
+        STAGE2_TRAIL_R     = 1.0   # trail at trail_max ± 1.0R
+
+        lock_dist    = STAGE1_LOCK_R  * risk
+        stage2_dist  = STAGE2_TRAIL_R * risk
+
+        # ── Update trail_max (best price seen) ────────────────────────────────
+        if direction == "long":
+            if current_price > pos.get("trail_max", entry):
+                pos["trail_max"] = current_price
+            mfe = pos["trail_max"] - entry
+        else:
+            if current_price < pos.get("trail_max", entry):
+                pos["trail_max"] = current_price
+            mfe = entry - pos["trail_max"]
+
+        if mfe < 0:
+            return   # price hasn't moved in our favor at all
+
+        new_stop  = None
+        stage_msg = None
+
+        # ── Stage 1: lock at entry + 0.5R ────────────────────────────────────
+        if not pos.get("trail_locked") and mfe >= STAGE1_ACTIVATE_R * risk:
+            if direction == "long":
+                candidate = entry + lock_dist
+                if candidate > stop:          # only tighten
+                    new_stop  = candidate
+                    stage_msg = (
+                        f"Stage 1 lock: stop {stop:.5f} → {new_stop:.5f} "
+                        f"(+{STAGE1_LOCK_R:.1f}R at {mfe/risk:.1f}R MFE)"
+                    )
+            else:
+                candidate = entry - lock_dist
+                if candidate < stop:          # only tighten (for shorts: lower)
+                    new_stop  = candidate
+                    stage_msg = (
+                        f"Stage 1 lock: stop {stop:.5f} → {new_stop:.5f} "
+                        f"(-{STAGE1_LOCK_R:.1f}R at {mfe/risk:.1f}R MFE)"
+                    )
+            pos["trail_locked"] = True        # arm Stage-2; Stage-1 never fires again
+
+        # ── Stage 2: trail at trail_max ± 1.0R ───────────────────────────────
+        if mfe >= STAGE2_ACTIVATE_R * risk:
+            trail_max = pos.get("trail_max", entry)
+            if direction == "long":
+                candidate = trail_max - stage2_dist
+                floor     = entry + lock_dist  # never go below Stage-1 level
+                candidate = max(candidate, floor)
+                if candidate > stop and (new_stop is None or candidate > new_stop):
+                    new_stop  = candidate
+                    stage_msg = (
+                        f"Stage 2 trail: stop → {new_stop:.5f} "
+                        f"(trail_max={trail_max:.5f} − {STAGE2_TRAIL_R:.1f}R at {mfe/risk:.1f}R MFE)"
+                    )
+            else:
+                candidate = trail_max + stage2_dist
+                ceiling   = entry - lock_dist  # never go above Stage-1 level
+                candidate = min(candidate, ceiling)
+                if candidate < stop and (new_stop is None or candidate < new_stop):
+                    new_stop  = candidate
+                    stage_msg = (
+                        f"Stage 2 trail: stop → {new_stop:.5f} "
+                        f"(trail_max={trail_max:.5f} + {STAGE2_TRAIL_R:.1f}R at {mfe/risk:.1f}R MFE)"
+                    )
+
+        if new_stop is None:
+            return   # no improvement to make
+
+        # ── Pre-modification reconcile ─────────────────────────────────────
+        # Validate broker state before pushing a stop update. Catches the case
+        # where the position was manually closed or the stop already moved.
+        # Fails open — trail move proceeds even if reconcile can't reach broker.
+        if self.reconciler is not None:
+            try:
+                _rm = self.reconciler.reconcile_light()
+                if _rm.external_closes and pair in _rm.external_closes:
+                    logger.warning(
+                        f"🔒 {pair}: position was externally closed — "
+                        f"aborting stop modification"
+                    )
+                    return   # position is gone; stop move is now a ghost
+            except Exception as _re:
+                logger.debug(f"Pre-stop reconcile failed (fail-open): {_re}")
+
+        logger.info(f"🔒 {pair}: {stage_msg}")
+        pos["stop"] = new_stop
+
+        # Push new stop to OANDA
+        self.oanda.modify_stop_loss(
+            trade_id  = oanda_trade_id or "unknown",
+            new_stop  = new_stop,
+            dry_run   = self.dry_run,
         )
-
-        # Update local position tracker
-        pos["stop"] = entry
-
-        self._breakeven_moved.add(trade_key)
 
         self.journal.log_breakeven_moved(
             pair=pair,
@@ -241,9 +343,10 @@ class PositionMonitor:
         )
 
         self.notifier.send(
-            f"✅ {pair}: Stop moved to breakeven\n"
-            f"Entry: {entry:.5f} | Current: {current_price:.5f}\n"
-            f"Trade is now risk-free 🎉"
+            f"🔒 {pair}: Stop tightened (Trail Arm C)\n"
+            f"{stage_msg}\n"
+            f"Entry: {entry:.5f} | Current: {current_price:.5f} | "
+            f"MFE: {mfe/risk:.1f}R"
         )
 
     # ── Exit Signal Detection ──────────────────────────────────────────

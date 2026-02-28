@@ -90,6 +90,47 @@ class OandaClient:
             "Content-Type":  "application/json",
         }
 
+    # ── Factory: LIVE_PAPER / demo pricing feed ───────────────────────────
+
+    @classmethod
+    def for_paper_mode(cls) -> "OandaClient":
+        """
+        Build an OandaClient using OANDA_DEMO_* credentials for LIVE_PAPER mode.
+
+        The client provides live pricing and open-trade sync only.
+        Order placement is blocked at the TradeExecutor level (dry_run=True),
+        but using a demo account here gives an extra safety layer.
+
+        OANDA_DEMO_ENV normalization:
+          'LIVE_PAPER' or 'paper' or '' or None → 'practice'
+          'practice'                             → 'practice'
+          'live'                                 → 'live'  (unusual but respected)
+        """
+        raw_env = os.getenv("OANDA_DEMO_ENV", "practice") or "practice"
+        # Normalize human-readable values to what OandaClient understands
+        _env_map = {
+            "live_paper": "practice",
+            "paper":      "practice",
+            "practice":   "practice",
+            "live":       "live",
+        }
+        oanda_env = _env_map.get(raw_env.lower(), "practice")
+
+        api_key    = os.getenv("OANDA_DEMO_API_KEY")
+        account_id = os.getenv("OANDA_DEMO_ACCOUNT_ID")
+
+        if not api_key:
+            raise ValueError(
+                "OANDA_DEMO_API_KEY not set in .env — required for LIVE_PAPER pricing feed. "
+                "Add it or set ACCOUNT_MODE=LIVE_REAL."
+            )
+        if not account_id:
+            raise ValueError(
+                "OANDA_DEMO_ACCOUNT_ID not set in .env — required for LIVE_PAPER pricing feed."
+            )
+
+        return cls(env=oanda_env, account_id=account_id, api_key=api_key)
+
     def _get(self, path: str, params: dict = None) -> dict:
         resp = requests.get(
             f"{self.base}{path}", headers=self.headers,
@@ -149,6 +190,27 @@ class OandaClient:
                 "open_time":   t.get("openTime"),
             })
         return trades
+
+    def get_pending_orders(self) -> List[Dict]:
+        """Return all pending (unfilled) orders for this account."""
+        data = self._get(f"/v3/accounts/{self.account_id}/pendingOrders")
+        orders = []
+        for o in data.get("orders", []):
+            units_raw = float(o.get("units", 0))
+            orders.append({
+                "id":         o.get("id", ""),
+                "type":       o.get("type", ""),
+                "instrument": o.get("instrument", ""),
+                "direction":  "long" if units_raw > 0 else "short",
+                "units":      abs(units_raw),
+                "price":      float(o["price"]) if "price" in o else None,
+                "stop_loss":  (
+                    float(o["stopLossOnFill"]["price"])
+                    if "stopLossOnFill" in o else None
+                ),
+                "created":    o.get("createTime"),
+            })
+        return orders
 
     # ── Market Data ───────────────────────────────────────────────────
 
@@ -320,6 +382,20 @@ class OandaClient:
         return self._put(
             f"/v3/accounts/{self.account_id}/trades/{trade_id}/close",
             {"units": "ALL"}
+        )
+
+    def modify_stop_loss(self, trade_id: str, new_stop: float, dry_run: bool = True) -> Dict:
+        """
+        Move stop loss to any price (Trail Arm C, Stage-1 lock, Stage-2 ratchet).
+        Caller is responsible for ensuring the new stop is tighter than current.
+        """
+        decimals = 5
+        if dry_run:
+            logger.info(f"[DRY RUN] Modifying SL to {new_stop:.{decimals}f} for trade {trade_id}")
+            return {"dry_run": True}
+        return self._put(
+            f"/v3/accounts/{self.account_id}/trades/{trade_id}/orders",
+            {"stopLoss": {"price": str(round(new_stop, decimals)), "timeInForce": "GTC"}}
         )
 
     def move_stop_to_breakeven(self, trade_id: str, entry_price: float, dry_run: bool = True) -> Dict:

@@ -29,18 +29,28 @@ Usage:
 import sys
 import json
 import time
+import pickle
 import argparse
 import requests
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from collections import Counter
+from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Optional, Dict, List
+import pytz
+
+_ET_TZ = pytz.timezone("America/New_York")   # for adaptive Thu/Fri gate
 
 # ── Real strategy imports ─────────────────────────────────────────────────────
 from src.exchange.oanda_client import OandaClient, INSTRUMENT_MAP
 from src.strategy.forex.set_and_forget   import SetAndForgetStrategy, Decision
 from src.strategy.forex.news_filter      import NewsFilter
+from src.strategy.forex.regime_score     import (
+    compute_regime_score, RegimeScore,
+    compute_risk_mode, RISK_MODE_PARAMS,
+)
+from src.strategy.forex.targeting        import select_target, find_next_structure_level
 from src.execution.risk_manager_forex    import ForexRiskManager
 from src.execution.trade_journal         import TradeJournal
 from src.strategy.forex.currency_strength import CurrencyStrengthAnalyzer, CurrencyTheme, STACK_MAX
@@ -60,7 +70,7 @@ from src.strategy.forex.strategy_config import (
     ATR_STOP_MULTIPLIER,
     ATR_MIN_MULTIPLIER,
     ATR_LOOKBACK,
-    MAX_CONCURRENT_TRADES,
+    MAX_CONCURRENT_TRADES_BACKTEST,
     LONDON_SESSION_START_UTC,
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
@@ -70,14 +80,18 @@ from src.strategy.forex.strategy_config import (
     NECKLINE_CLUSTER_PCT,
     get_model_tags,
     DRY_RUN_PAPER_BALANCE,
+    CACHE_VERSION,
 )
+from src.strategy.forex.backtest_schema import BacktestResult
+from src.strategy.forex import alex_policy
 
 # ── Backtest-only config ──────────────────────────────────────────────────────
 BACKTEST_START  = datetime(2025, 7, 1, tzinfo=timezone.utc)   # ~7 months of history
 STARTING_BAL    = 8_000.0
 MAX_HOLD_BARS   = 365 * 24         # effectively no cap — strategy has no TP or hold limit
                                    # (live bot runs until stop hit or Mike manually closes)
-GAP_LOG_PATH    = Path.home() / "trading-bot" / "logs" / "backtest_gap_log.jsonl"
+GAP_LOG_PATH         = Path.home() / "trading-bot" / "logs" / "backtest_gap_log.jsonl"
+WHITELIST_BACKTEST_FILE = Path.home() / "trading-bot" / "logs" / "whitelist_backtest.json"
 DECISION_LOG    = Path.home() / "trading-bot" / "logs" / "backtest_v2_decisions.json"
 V1_DECISION_LOG = Path.home() / "trading-bot" / "logs" / "backtest_decisions.json"
 
@@ -299,51 +313,6 @@ def _resample_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
 
 # ── 4H structure target ───────────────────────────────────────────────────────
 
-def _find_next_structure_level(
-    df_4h: pd.DataFrame,
-    direction: str,
-    reference_price: float,
-    swing_bars: int = 5,
-) -> Optional[float]:
-    """
-    Find the nearest prior 4H swing level beyond the neckline in trade direction.
-
-    Alex explicitly places his target at "the next 4-hour low/high" visible on
-    the chart at entry time — not the geometric measured move.
-
-    For SHORT: nearest swing LOW strictly below reference_price
-    For LONG:  nearest swing HIGH strictly above reference_price
-
-    Returns the level, or None if no swing found.
-    """
-    if df_4h is None or len(df_4h) < swing_bars * 2 + 1:
-        return None
-
-    lows  = df_4h["low"].values  if "low"  in df_4h.columns else df_4h["Low"].values
-    highs = df_4h["high"].values if "high" in df_4h.columns else df_4h["High"].values
-    n     = len(df_4h)
-
-    candidates: List[float] = []
-    for i in range(swing_bars, n - swing_bars):
-        if direction == "short":
-            price = lows[i]
-            if price >= reference_price:
-                continue
-            if (all(price <= lows[i - j] for j in range(1, swing_bars + 1)) and
-                    all(price <= lows[i + j] for j in range(1, swing_bars + 1))):
-                candidates.append(price)
-        else:  # long
-            price = highs[i]
-            if price <= reference_price:
-                continue
-            if (all(price >= highs[i - j] for j in range(1, swing_bars + 1)) and
-                    all(price >= highs[i + j] for j in range(1, swing_bars + 1))):
-                candidates.append(price)
-
-    if not candidates:
-        return None
-    # nearest = highest swing low (SHORT) or lowest swing high (LONG)
-    return max(candidates) if direction == "short" else min(candidates)
 
 
 # ── Gap logger ────────────────────────────────────────────────────────────────
@@ -378,48 +347,419 @@ def _load_v1_decisions():
         return {}
 
 
+# ── Trail arm configurations ──────────────────────────────────────────────────
+# Used by ab9 multi-arm comparison.  Each arm overrides only the trail params.
+#
+# Two-stage trail (Arm C):
+#   Stage 1 — at TRAIL_ACTIVATE_R MFE: lock stop to entry + TRAIL_LOCK_R (one-time)
+#   Stage 2 — at TRAIL_STAGE2_R  MFE: start trailing at (trail_max − TRAIL_STAGE2_DIST_R)
+#
+# Standard trail (Arms A/B):
+#   At TRAIL_ACTIVATE_R MFE: trail continuously at (trail_max − TRAIL_LOCK_R),
+#   floor at entry + TRAIL_LOCK_R.  (TRAIL_STAGE2_R = None → stage 2 disabled)
+TRAIL_ARMS: Dict[str, dict] = {
+    "A": {
+        "label":               "Arm A — activate 1.0R, trail 0.5R  (ab8 baseline)",
+        "TRAIL_ACTIVATE_R":    1.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      None,
+        "TRAIL_STAGE2_DIST_R": None,
+    },
+    "B": {
+        "label":               "Arm B — activate 1.5R, trail 0.5R",
+        "TRAIL_ACTIVATE_R":    1.5,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      None,
+        "TRAIL_STAGE2_DIST_R": None,
+    },
+    "C": {
+        "label":               "Arm C — 2-stage: lock +0.5R at 2R, trail 1.0R after 3R",
+        "TRAIL_ACTIVATE_R":    2.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 1.0,
+        "STALL_EXIT_BARS":     None,   # no stall exit
+        "STALL_EXIT_MFE_R":    None,
+    },
+    # ── Tuning variants (Step 3 of 6K% path) ────────────────────────────────
+    # C1: earlier lock (1.8R, +0.3R), same stage-2 → smaller initial lock gain,
+    #     but activates sooner → less exposure during early adverse moves.
+    "C1": {
+        "label":               "Arm C1 — lock +0.3R at 1.8R, trail 1.0R after 3R",
+        "TRAIL_ACTIVATE_R":    1.8,
+        "TRAIL_LOCK_R":        0.3,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 1.0,
+        "STALL_EXIT_BARS":     None,
+        "STALL_EXIT_MFE_R":    None,
+    },
+    # C2: same lock point, tighter trailing distance → stops closer, smaller
+    #     wins but less retracement to exit → lower MaxDD expected.
+    "C2": {
+        "label":               "Arm C2 — lock +0.5R at 2R, trail 0.8R after 3R",
+        "TRAIL_ACTIVATE_R":    2.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 0.8,
+        "STALL_EXIT_BARS":     None,
+        "STALL_EXIT_MFE_R":    None,
+    },
+    # C3: same as C + stall exit — if MFE hasn't reached 0.5R after 5 bars,
+    #     close at market to free capital for better setups.
+    "C3": {
+        "label":               "Arm C3 — lock +0.5R at 2R, trail 1.0R + stall-exit 5b/0.5R",
+        "TRAIL_ACTIVATE_R":    2.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 1.0,
+        "STALL_EXIT_BARS":     5,      # bars after entry to check
+        "STALL_EXIT_MFE_R":    0.5,    # if MFE < 0.5R at that point → close
+    },
+}
+_DEFAULT_ARM = "A"   # used when trail_cfg=None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Per-pair/TF raw candle cache ─────────────────────────────────────────────
+# One file per (pair, TF, price_type, env, CACHE_VERSION).
+# Any run whose date window falls within the cached range = zero OANDA requests.
+# Different pair lists share the same per-pair files — no re-fetch on list change.
+#
+# Invalidation:
+#   • Bump CACHE_VERSION in strategy_config.py  → wipes all pairs/TFs at once
+#   • Delete ~/.cache/forge_backtester/         → manual wipe
+#   • Window extends beyond cached range        → only that pair/TF is re-fetched
+#
+# Default: ON (pass --no-cache to disable; --cache kept as no-op for compat)
+# ─────────────────────────────────────────────────────────────────────────────
+CACHE_DIR  = Path.home() / ".cache" / "forge_backtester"
+PRICE_TYPE = "M"   # OANDA mid (open/high/low/close)
+
+# Module-level API call counter — reset to 0 at the start of every fetch block.
+# After a full cache hit this stays 0; callers can assert on it.
+_api_call_count: int = 0
+
+def _cache_env() -> str:
+    """'live' or 'prac' — baked into cache filenames so account envs don't cross-contaminate."""
+    return "live" if "fxtrade" in _oanda_client.base else "prac"
+
+def _pair_slug(pair: str) -> str:
+    return pair.replace("/", "").replace("_", "")
+
+def _pair_cache_path(pair: str, tf: str) -> Path:
+    return CACHE_DIR / f"{_pair_slug(pair)}_{tf}_{PRICE_TYPE}_{_cache_env()}_{CACHE_VERSION}.pkl"
+
+def _pair_cache_load(pair: str, tf: str,
+                     need_start: datetime, need_end: datetime) -> Optional[pd.DataFrame]:
+    """
+    Load (pair, TF) from disk cache.
+    Returns the DataFrame if the cache exists, version matches, and data covers
+    [need_start, need_end].  Returns None on any miss/mismatch.
+    """
+    path = _pair_cache_path(pair, tf)
+    if not path.exists():
+        return None
+    try:
+        obj = pickle.load(open(path, "rb"))
+        if obj.get("version") != CACHE_VERSION:
+            return None
+        df: pd.DataFrame = obj["df"]
+        ns = need_start.replace(tzinfo=None) if need_start.tzinfo else need_start
+        ne = need_end.replace(tzinfo=None)   if need_end.tzinfo   else need_end
+        # Allow tolerance at both ends — OANDA bar timestamps don't land exactly
+        # on calendar boundaries (weekends, bank holidays, UTC-offset drift):
+        #   start: allow up to 7 days (first bar may be the next Monday after a weekend/holiday)
+        #   end:   allow up to 5 days (last bar may be a few days before computed runout_dt)
+        ns_ceil    = ns + pd.Timedelta(days=7)
+        ne_floor   = ne - pd.Timedelta(days=5)
+        if df.index.min() > ns_ceil or df.index.max() < ne_floor:
+            return None   # coverage gap — stale or shorter window cached
+        return df
+    except Exception:
+        return None
+
+def _pair_cache_save(pair: str, tf: str, df: pd.DataFrame) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _pair_cache_path(pair, tf)
+    with open(path, "wb") as f:
+        pickle.dump({
+            "df":          df,
+            "version":     CACHE_VERSION,
+            "saved_at":    datetime.now(timezone.utc).isoformat(),
+            "pair":        pair,
+            "tf":          tf,
+            "price_type":  PRICE_TYPE,
+            "bars":        len(df),
+            "range_start": str(df.index.min()),
+            "range_end":   str(df.index.max()),
+        }, f)
+
+# ── Counted fetch wrappers ────────────────────────────────────────────────────
+# Every call to these increments _api_call_count so callers can assert "0 API
+# calls on second run".  Raw _fetch / _fetch_range are unchanged.
+
+def _counted_fetch_range(pair: str, tf: str,
+                         from_dt: datetime, to_dt: datetime = None) -> Optional[pd.DataFrame]:
+    global _api_call_count
+    _api_call_count += 1
+    return _fetch_range(pair, tf, from_dt=from_dt, to_dt=to_dt)
+
+def _counted_fetch(pair: str, tf: str, count: int) -> Optional[pd.DataFrame]:
+    global _api_call_count
+    _api_call_count += 1
+    return _fetch(pair, tf, count)
+
+# ── Legacy monolithic cache (kept as no-op stubs for external callers) ────────
+_CACHE_PATH = Path("/tmp/backtest_candle_cache.pkl")   # old path — kept for reference
+
+def _save_cache(candle_data: dict, meta: dict) -> None:  # noqa: deprecated
+    """Deprecated — replaced by per-pair _pair_cache_save(). No-op."""
+    pass
+
+def _load_cache() -> Optional[tuple]:  # noqa: deprecated
+    """Deprecated — replaced by per-pair _pair_cache_load(). Always returns None."""
+    return None
+
 # ── Main backtest ─────────────────────────────────────────────────────────────
-def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, starting_bal: float = STARTING_BAL, notes: str = ""):
+def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
+                 starting_bal: float = STARTING_BAL, notes: str = "",
+                 trail_cfg: Optional[dict] = None,
+                 trail_arm_key: str = "",
+                 preloaded_candle_data: Optional[dict] = None,
+                 use_cache: bool = True,
+                 quiet: bool = False,
+                 adaptive_gates: bool = False,
+                 adaptive_threshold: float = 0.5,
+                 policy_tag: str = "",
+                 strict_protrend_htf: bool = False,
+                 dynamic_pip_equity: bool = False,
+                 wd_protrend_htf: bool = False,
+                 flat_risk_pct: Optional[float] = None,
+                 force_risk_mode: Optional[str] = None,
+                 streak_demotion_thresh: int = 1):
+    """Run a single backtest simulation.
+
+    quiet=True suppresses all stdout (useful when called from compare scripts).
+    The BacktestResult is always populated regardless of quiet mode.
+
+    trail_arm_key: label stored in model_tags and _result_record (e.g. "A", "B", "C").
+                   Auto-detected from trail_cfg if omitted.
+    force_risk_mode: pin risk mode for every entry ("LOW"|"MEDIUM"|"HIGH"|"EXTREME").
+                     None = AUTO (compute dynamically per entry — default).
+    """
+    import io, sys as _sys
+    # Resolve arm key ↔ trail_cfg (bidirectional)
+    if not trail_arm_key and trail_cfg:
+        # Auto-detect key from explicit cfg dict
+        for _k, _v in TRAIL_ARMS.items():
+            if all(trail_cfg.get(f) == _v.get(f)
+                   for f in ("TRAIL_ACTIVATE_R", "TRAIL_LOCK_R", "TRAIL_STAGE2_R")):
+                trail_arm_key = _k
+                break
+    if trail_arm_key in TRAIL_ARMS and not trail_cfg:
+        # Resolve cfg from key so callers can pass just trail_arm_key="C"
+        trail_cfg = TRAIL_ARMS[trail_arm_key]
+    _orig_stdout = _sys.stdout
+    if quiet:
+        _sys.stdout = io.StringIO()
+    try:
+        return _run_backtest_body(
+            start_dt=start_dt, end_dt=end_dt, starting_bal=starting_bal,
+            notes=notes, trail_cfg=trail_cfg, trail_arm_key=trail_arm_key,
+            preloaded_candle_data=preloaded_candle_data, use_cache=use_cache,
+            adaptive_gates=adaptive_gates, adaptive_threshold=adaptive_threshold,
+            policy_tag=policy_tag,
+            strict_protrend_htf=strict_protrend_htf,
+            dynamic_pip_equity=dynamic_pip_equity,
+            wd_protrend_htf=wd_protrend_htf,
+            flat_risk_pct=flat_risk_pct,
+            force_risk_mode=force_risk_mode,
+            streak_demotion_thresh=streak_demotion_thresh,
+        )
+    finally:
+        _sys.stdout = _orig_stdout
+
+
+def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
+                       starting_bal: float = STARTING_BAL, notes: str = "",
+                       trail_cfg: Optional[dict] = None,
+                       trail_arm_key: str = "",
+                       preloaded_candle_data: Optional[dict] = None,
+                       use_cache: bool = True,
+                       adaptive_gates: bool = False,
+                       adaptive_threshold: float = 0.5,
+                       policy_tag: str = "",
+                       strict_protrend_htf: bool = False,
+                       dynamic_pip_equity: bool = False,
+                       wd_protrend_htf: bool = False,
+                       flat_risk_pct: Optional[float] = None,
+                       force_risk_mode: Optional[str] = None,
+                       streak_demotion_thresh: int = 1):
+    # PROTREND_ONLY config flag → wd_protrend_htf gate.
+    # Config wins when True; explicit True caller arg also wins.
+    if getattr(_sc, "PROTREND_ONLY", False) and not wd_protrend_htf:
+        wd_protrend_htf = True
     end_naive = end_dt.replace(tzinfo=None) if end_dt else None
     # Extend data fetch so open positions can run to natural close after the entry window.
     # Entries stop at end_dt; monitoring continues up to end_dt + RUNOUT_DAYS.
     RUNOUT_DAYS = 180
     runout_dt  = (end_dt + pd.Timedelta(days=RUNOUT_DAYS)).replace(tzinfo=timezone.utc) if end_dt else None
 
+    # Resolve trail config: explicit cfg > key lookup > default arm
+    _tcfg  = trail_cfg or (TRAIL_ARMS[trail_arm_key] if trail_arm_key in TRAIL_ARMS else TRAIL_ARMS[_DEFAULT_ARM])
+    _tlabel = _tcfg.get("label", "")
+
     print(f"\n{'='*65}")
     print(f"OANDA 1H BACKTEST v2 — Real Strategy Code")
     print(f"Start: {start_dt.date()}  |  End: {end_dt.date() if end_dt else 'today'}  |  Capital: ${starting_bal:,.2f}")
+    if _tlabel:
+        print(f"Trail: {_tlabel}")
     print(f"{'='*65}")
 
-    # ── Fetch candle data ─────────────────────────────────────────────
-    print("\nFetching OANDA historical candles...")
-    candle_data = {}
-    # Use date-range fetch when start_dt is more than 200 days ago (beyond count=5000 H1 window)
-    # Always fetch 6 months of daily context before start for pattern/trend detection
-    data_start = (start_dt - pd.Timedelta(days=180)).replace(tzinfo=timezone.utc)
-    data_end   = end_naive   # may be None for live use
-    use_range  = (datetime.now(tz=timezone.utc) - start_dt).days > 200
+    # ── Parity header — stamped on every run ──────────────────────────
+    # Lets you verify at a glance that backtest mirrors live before trusting results.
+    # If MAX_CONCURRENT live ≠ backtest, results are NOT comparable to production.
+    try:
+        import hashlib as _hl, inspect as _ins
+        _cfg_src = _ins.getsource(_sc)
+        _cfg_hash = _hl.md5(_cfg_src.encode()).hexdigest()[:8]
+    except Exception:
+        _cfg_hash = "unknown"
+    try:
+        import subprocess as _sp
+        _sha = _sp.check_output(["git", "-C", str(Path(__file__).parent),
+                                  "rev-parse", "--short", "HEAD"],
+                                 stderr=_sp.DEVNULL).decode().strip()
+    except Exception:
+        _sha = "unknown"
 
-    for pair in WATCHLIST:
-        if use_range:
-            # Paginated date-range fetch — handles any historical window.
-            # Fetch to runout_dt so we can let positions close naturally after window end.
-            df_1h = _fetch_range(pair, "H1", from_dt=data_start, to_dt=runout_dt)
-            df_4h = _fetch_range(pair, "H4", from_dt=data_start, to_dt=runout_dt)
-            df_d  = _fetch_range(pair, "D",  from_dt=(start_dt - pd.Timedelta(days=730)).replace(tzinfo=timezone.utc), to_dt=runout_dt)
-        else:
-            df_1h = _fetch(pair, "H1", 5000)   # ~208 days of hourly bars
-            df_4h = _fetch(pair, "H4", 1500)   # ~250 days of 4H bars
-            df_d  = _fetch(pair, "D",  500)    # ~500 trading days (~2 years)
-        if df_1h is None or len(df_1h) < 50:
-            print(f"  ✗ {pair}: insufficient data, skipping")
-            continue
-        df_w = _resample_weekly(df_d) if df_d is not None else None
-        candle_data[pair] = {"1h": df_1h, "4h": df_4h, "d": df_d, "w": df_w}
-        time.sleep(0.3)   # OANDA rate limit
-        print(f"  ✓ {pair}: {len(df_1h)} 1H | {len(df_4h) if df_4h is not None else 0} 4H"
-              f" | {len(df_d) if df_d is not None else 0} D"
-              f" | {len(df_w) if df_w is not None else 0} W")
+    _parity_ok  = _sc.MAX_CONCURRENT_TRADES_LIVE == _sc.MAX_CONCURRENT_TRADES_BACKTEST
+    _parity_sym = "✓" if _parity_ok else "⚠ MISMATCH"
+    _exp_flag   = (_sc.MAX_CONCURRENT_TRADES_BACKTEST > 1)
+
+    print(f"┌─ Parity {'─'*54}┐")
+    print(f"│  engine SHA      : {_sha:<10}  config md5 : {_cfg_hash:<12}{'':>8}│")
+    print(f"│  concurrent LIVE : {_sc.MAX_CONCURRENT_TRADES_LIVE:<4}  "
+          f"concurrent BT : {_sc.MAX_CONCURRENT_TRADES_BACKTEST:<4}  "
+          f"parity: {_parity_sym:<14}│")
+    print(f"│  trigger mode    : {_sc.ENTRY_TRIGGER_MODE:<15}  "
+          f"spread model : {'ON' if _sc.SPREAD_MODEL_ENABLED else 'OFF'}{'':>16}│")
+    _pt_label = "ON (W+D gate, 4H exempt)" if wd_protrend_htf else "OFF (full counter-trend)"
+    _fm_label = f"FORCED:{force_risk_mode}" if force_risk_mode else "AUTO (dynamic per entry)"
+    print(f"│  protrend_only   : {_pt_label:<43}│")
+    print(f"│  risk_mode       : {_fm_label:<43}│")
+    if _exp_flag:
+        print(f"│  ⚠  EXPERIMENTAL RUN — BT concurrency > 1, not comparable to live{'':>3}│")
+    print(f"└{'─'*63}┘")
+
+    # ── Fetch candle data ─────────────────────────────────────────────
+    global _api_call_count
+    _api_call_count = 0   # reset for this run
+
+    if preloaded_candle_data is not None:
+        # In-memory bypass: caller already holds data (e.g. multi-mode comparison script).
+        # Skip all cache I/O — no disk reads, no API calls.
+        candle_data = preloaded_candle_data
+        print(f"\n  ⚡ Preloaded candle data ({len(candle_data)} pairs) — skipping cache")
+
+    else:
+        # Per-pair/TF cache-aware fetch.
+        # Each (pair, TF) is loaded from disk if cached + coverage OK; fetched otherwise.
+        env       = _cache_env()
+        need_end  = runout_dt or datetime.now(tz=timezone.utc)
+        use_range = (datetime.now(tz=timezone.utc) - start_dt).days > 200
+
+        # TF → (fetch_start, fetch_end) mapping
+        tf_ranges = {
+            "H1": ((start_dt - pd.Timedelta(days=180)).replace(tzinfo=timezone.utc), need_end),
+            "H4": ((start_dt - pd.Timedelta(days=180)).replace(tzinfo=timezone.utc), need_end),
+            "D":  ((start_dt - pd.Timedelta(days=730)).replace(tzinfo=timezone.utc), need_end),
+        }
+
+        # ── Cache header ──────────────────────────────────────────────
+        W = 72
+
+        def _box(text: str) -> str:
+            """Left-justify text inside a │ box of interior width W."""
+            return f"│  {text:<{W}}│"
+
+        pairs_str = ", ".join(WATCHLIST[:6]) + (f" +{len(WATCHLIST)-6}" if len(WATCHLIST) > 6 else "")
+        end_disp  = (end_dt or datetime.now(tz=timezone.utc)).date()
+
+        print(f"\n┌─ Candle cache {'─' * W}┐")
+        print(_box(f"cache_version : {CACHE_VERSION}   price_type : {PRICE_TYPE} (mid)   env : {env}"))
+        print(_box(f"cache_dir     : {CACHE_DIR}"))
+        print(_box(f"pairs ({len(WATCHLIST):2d})     : {pairs_str}"))
+        print(_box(f"TFs           : {', '.join(tf_ranges)}"))
+        print(_box(f"window        : {start_dt.date()} → {end_disp}  (+{RUNOUT_DAYS}d runout)"))
+        print(_box(f"cache         : {'ON' if use_cache else 'OFF (--no-cache)'}"))
+        print(f"├{'─' * (W + 2)}┤")
+
+        candle_data: dict = {}
+        n_hits = n_miss = 0
+        _miss_pairs: list = []
+
+        for pair in WATCHLIST:
+            pair_tfs: dict = {}
+            pair_failed = False
+
+            for tf, (fs, fe) in tf_ranges.items():
+                hit_df = _pair_cache_load(pair, tf, fs, fe) if use_cache else None
+                if hit_df is not None:
+                    n_hits += 1
+                    hit_info = (f"{pair:<10} {tf:<4} ✓ HIT   "
+                                f"({len(hit_df):5d} bars  "
+                                f"{hit_df.index.min().date()} → {hit_df.index.max().date()})")
+                    print(_box(hit_info))
+                    pair_tfs[tf] = hit_df
+                else:
+                    n_miss += 1
+                    _miss_pairs.append(f"{pair}/{tf}")
+                    print(_box(f"{pair:<10} {tf:<4} ✗ MISS  → fetching …"), flush=True)
+                    # Fetch from OANDA
+                    if use_range:
+                        df = _counted_fetch_range(pair, tf, from_dt=fs, to_dt=fe)
+                    else:
+                        count = {"H1": 5000, "H4": 1500, "D": 500}.get(tf, 500)
+                        df = _counted_fetch(pair, tf, count)
+
+                    if df is not None and len(df) >= (50 if tf == "H1" else 1):
+                        if use_cache:
+                            _pair_cache_save(pair, tf, df)
+                        pair_tfs[tf] = df
+                        fetch_info = (f"  └─ fetched {len(df)} bars  "
+                                      f"({df.index.min().date()} → {df.index.max().date()})"
+                                      f"  saved={'yes' if use_cache else 'no'}")
+                        print(_box(fetch_info))
+                        time.sleep(0.3)   # OANDA rate limit
+                    else:
+                        print(_box("  └─ ✗ FAILED or insufficient data"))
+                        if tf == "H1":
+                            pair_failed = True
+                            break
+
+            if pair_failed or "H1" not in pair_tfs or len(pair_tfs["H1"]) < 50:
+                print(_box(f"{pair:<10} ✗ skipped (insufficient H1 data)"))
+                continue
+
+            df_w = _resample_weekly(pair_tfs["D"]) if pair_tfs.get("D") is not None else None
+            candle_data[pair] = {
+                "1h": pair_tfs["H1"],
+                "4h": pair_tfs.get("H4"),
+                "d":  pair_tfs.get("D"),
+                "w":  df_w,
+            }
+
+        # ── Cache summary ─────────────────────────────────────────────
+        total_tfs = n_hits + n_miss
+        print(f"├{'─' * (W + 2)}┤")
+        summary = (f"{n_hits}/{total_tfs} TF slots cached  |  "
+                   f"{n_miss} MISS  |  API calls: {_api_call_count}  |  "
+                   f"{len(candle_data)}/{len(WATCHLIST)} pairs loaded")
+        print(_box(summary))
+        if _miss_pairs:
+            miss_str = ", ".join(_miss_pairs[:8]) + (f" +{len(_miss_pairs)-8}" if len(_miss_pairs) > 8 else "")
+            print(_box(f"Fetched: {miss_str}"))
+        print(f"└{'─' * (W + 2)}┘")
 
     if not candle_data:
         print("No data loaded. Exiting.")
@@ -435,6 +775,28 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         for ts in pdata["1h"].index
         if ts >= start_naive and (runout_naive is None or ts <= runout_naive)
     ))
+    # ── Backtest whitelist filter ─────────────────────────────────────
+    # Reads logs/whitelist_backtest.json when enabled — lets you run Alex-only
+    # or any subset without re-fetching data. Skipped pairs keep their cache.
+    if WHITELIST_BACKTEST_FILE.exists():
+        try:
+            _wl = json.load(open(WHITELIST_BACKTEST_FILE))
+            if _wl.get("enabled") and _wl.get("pairs"):
+                _wl_pairs = set(_wl["pairs"])
+                _before   = len(candle_data)
+                candle_data = {p: v for p, v in candle_data.items() if p in _wl_pairs}
+                _filtered  = _before - len(candle_data)
+                print(f"\n  🔒 Backtest whitelist ACTIVE ({len(candle_data)}/{_before} pairs, "
+                      f"{_filtered} filtered): {', '.join(sorted(candle_data))}")
+                # Recompute all_1h after filter
+                all_1h = sorted(set(
+                    ts for pdata in candle_data.values()
+                    for ts in pdata["1h"].index
+                    if ts >= start_naive and (runout_naive is None or ts <= runout_naive)
+                ))
+        except Exception as _e:
+            print(f"  ⚠ Could not load backtest whitelist: {_e}")
+
     print(f"\nPairs loaded: {len(candle_data)}")
     print(f"Backtesting {len(all_1h)} hourly bars: "
           f"{all_1h[0].date()} → {all_1h[-1].date()}")
@@ -448,18 +810,53 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         strategies[pair] = s
 
     # ── Risk manager ──────────────────────────────────────────────────
+    # backtest=True: disable all disk I/O (never write regroup_state.json /
+    # kill_switch.log / trade_journal.jsonl — backtest must not corrupt live state)
     journal = TradeJournal()
-    risk    = ForexRiskManager(journal=journal)
+    risk    = ForexRiskManager(journal=journal, backtest=True)
 
     # ── State ─────────────────────────────────────────────────────────
     balance       = starting_bal
+    peak_balance  = starting_bal    # tracks equity high-water mark for DD circuit breaker
     open_pos: Dict[str, dict] = {}   # pair → position dict
     trades        = []
     all_decisions = []
     v1_decisions  = _load_v1_decisions()
+    consecutive_losses: int = 0     # streak counter: reset on win, incremented on loss
+    dd_killswitch_blocks: int = 0   # count of entries blocked by 40% DD killswitch
+    _eval_calls: int = 0            # performance counter: evaluate() call count
+    _eval_ms:    float = 0.0        # total ms spent in evaluate()
+    # Regime mode at entry: instantaneous snapshot (no hysteresis state).
+    # Alex's ~1 trade/week cadence is too sparse for 2-bar consecutive
+    # accumulation across entries.  compute_risk_mode(instantaneous=True)
+    # grants HIGH/EXTREME immediately when ALL conditions are met at the
+    # entry bar — no consec/demote state carried between entries.
+    # 2-bar hysteresis runs only in the H4 time-sampling loop below.
+
+    # ── Alex small-account gate counters ───────────────────────────────────
+    _weekly_trade_counts:   dict = {}  # {(iso_year, iso_week): count} — opened trades
+    _weekly_limit_blocks:   int  = 0   # blocked by MAX_TRADES_PER_WEEK
+    _min_rr_small_blocks:   int  = 0   # blocked by MIN_RR_ALIGN (non-protrend)
+    _adaptive_time_blocks:  int  = 0   # blocked by adaptive Thu/Fri regime gate
+    _strict_htf_blocks:     int  = 0   # blocked by strict protrend HTF gate (all 3 must agree)
+    _wd_htf_blocks:         int  = 0   # blocked by W+D protrend gate (W==D required, 4H exempt)
+    _dyn_pip_eq_blocks:     int  = 0   # blocked by dynamic pip equity (stop_pips × MIN_RR)
+    _wd_aligned_entries:    int  = 0   # entered trades where W==D agreed with direction
+    _countertrend_htf_blocks: int = 0  # blocked by COUNTERTREND_HTF filter
+    _time_block_counts:     dict = {}  # {reason_code: count} — Sunday/Thu/Fri blocks
 
     def _risk_pct(bal):
-        return risk.get_risk_pct(bal)
+        """DD-aware risk. When flat_risk_pct is set, overrides tiers (killswitch still applies)."""
+        pct, _dd_flag = _risk_pct_with_flag(bal)
+        return pct
+
+    def _risk_pct_with_flag(bal):
+        """Returns (pct, dd_flag). flat_risk_pct overrides tier pct; killswitch wins."""
+        pct, dd_flag = risk.get_risk_pct_with_dd(
+            bal, peak_equity=peak_balance, consecutive_losses=consecutive_losses)
+        if flat_risk_pct is not None and dd_flag != "DD_KILLSWITCH":
+            pct = flat_risk_pct   # grid test: flat rate, no tier ramp
+        return pct, dd_flag
 
     def _calc_units(pair, bal, rpct, entry, stop):
         pip    = 0.01 if "JPY" in pair else 0.0001
@@ -467,6 +864,24 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         if dist == 0: return 0
         risk_usd = bal * rpct / 100
         return int(risk_usd / dist)
+
+    def _spread_deduction(pair: str, units: int) -> float:
+        """
+        Round-trip spread cost in dollars for one trade.
+
+        Formula: spread_pips × pip_mult × units
+          LONG:  buy at ask, sell at bid → pay spread on entry + spread on exit
+          SHORT: sell at bid, buy at ask → same cost
+          v1 simplification: apply full round-turn as a P&L deduction at close.
+
+        Returns 0.0 when SPREAD_MODEL_ENABLED is False.
+        """
+        if not _sc.SPREAD_MODEL_ENABLED:
+            return 0.0
+        pair_key  = pair.replace("_", "/")
+        spread_p  = _sc.SPREAD_PIPS.get(pair_key, _sc.SPREAD_DEFAULT_PIPS)
+        pip_mult  = 0.01 if "JPY" in pair else 0.0001
+        return spread_p * pip_mult * units
 
     def _daily_atr(pair) -> Optional[float]:
         """14-day ATR for the pair (in price terms, not pips)."""
@@ -565,7 +980,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             macro_theme is not None
             and pair in [p for p, _ in macro_theme.suggested_trades]
         )
-        max_concurrent = STACK_MAX if _is_theme else _sc.MAX_CONCURRENT_TRADES
+        max_concurrent = STACK_MAX if _is_theme else _sc.MAX_CONCURRENT_TRADES_BACKTEST
 
         # Layer 1: max concurrent
         if _is_theme:
@@ -577,7 +992,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 if open_pos[p].get("macro_theme") is None
                 and not open_pos[p].get("be_moved", False)
             )
-            if non_theme_count >= _sc.MAX_CONCURRENT_TRADES:
+            if non_theme_count >= _sc.MAX_CONCURRENT_TRADES_BACKTEST:
                 return False, "max_concurrent"
 
         # Layer 2: same-pair block
@@ -648,13 +1063,89 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             low   = float(bar["low"])
             close = float(bar["close"])
 
-            # Breakeven at 1:1
-            risk_dist = abs(entry - stop)
-            if not pos.get("be_moved"):
-                if direction == "long"  and high  >= entry + risk_dist:
-                    stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
-                if direction == "short" and low   <= entry - risk_dist:
-                    stop = entry; pos["stop_loss"] = stop; pos["be_moved"] = True
+            # ── Parameterized trailing stop ───────────────────────────────────
+            # Trail behaviour is controlled by _tcfg (trail arm config dict).
+            #
+            # Two-stage trail (Arm C):
+            #   Stage 1 at TRAIL_ACTIVATE_R: lock stop to entry + TRAIL_LOCK_R once
+            #   Stage 2 at TRAIL_STAGE2_R:   trail continuously at trail_max ± TRAIL_STAGE2_DIST_R
+            #
+            # Standard trail (Arms A/B):
+            #   At TRAIL_ACTIVATE_R: trail at trail_max ± TRAIL_LOCK_R, floor at entry+TRAIL_LOCK_R
+            #   (TRAIL_STAGE2_R is None → stage 2 disabled)
+            risk_dist        = pos.get("initial_risk") or abs(entry - stop)
+            _act_r           = _tcfg.get("TRAIL_ACTIVATE_R", 1.0)
+            _lock_r          = _tcfg.get("TRAIL_LOCK_R",     0.5)
+            _stage2_r        = _tcfg.get("TRAIL_STAGE2_R")        # None → one-stage
+            _stage2_dist_r   = _tcfg.get("TRAIL_STAGE2_DIST_R",  _lock_r)
+
+            _act_dist        = _act_r    * risk_dist
+            _lock_dist       = _lock_r   * risk_dist
+            _stage2_dist     = _stage2_dist_r * risk_dist if _stage2_r else None
+
+            if direction == "long":
+                if high > pos.get("trail_max", entry):
+                    pos["trail_max"] = high
+                _mfe = pos["trail_max"] - entry
+
+                if _mfe >= _act_dist:
+                    if _stage2_r is None:
+                        # Standard trail: trail continuously (Arms A/B)
+                        _new_stop = pos["trail_max"] - _lock_dist
+                        _new_stop = max(_new_stop, entry + _lock_dist)  # floor at +lock_r
+                        if _new_stop > stop:
+                            stop = _new_stop
+                            pos["stop_loss"] = stop
+                            pos["ratchet_moved"] = True
+                    else:
+                        # Two-stage trail (Arm C)
+                        # Stage 1: lock stop once at entry + TRAIL_LOCK_R
+                        if not pos.get("trail_locked"):
+                            _lock_stop = entry + _lock_dist
+                            if _lock_stop > stop:
+                                stop = _lock_stop
+                                pos["stop_loss"] = stop
+                                pos["ratchet_moved"] = True
+                            pos["trail_locked"] = True
+                        # Stage 2: trail from trail_max − TRAIL_STAGE2_DIST_R
+                        if _mfe >= _stage2_r * risk_dist:
+                            _new_stop = pos["trail_max"] - _stage2_dist
+                            _new_stop = max(_new_stop, stop)  # never go backward
+                            if _new_stop > stop:
+                                stop = _new_stop
+                                pos["stop_loss"] = stop
+                                pos["ratchet_moved"] = True
+
+            else:  # short
+                if low < pos.get("trail_max", entry):
+                    pos["trail_max"] = low
+                _mfe = entry - pos["trail_max"]
+
+                if _mfe >= _act_dist:
+                    if _stage2_r is None:
+                        # Standard trail: trail continuously (Arms A/B)
+                        _new_stop = pos["trail_max"] + _lock_dist
+                        _new_stop = min(_new_stop, entry - _lock_dist)  # ceiling at −lock_r
+                        if _new_stop < stop:
+                            stop = _new_stop
+                            pos["stop_loss"] = stop
+                            pos["ratchet_moved"] = True
+                    else:
+                        # Two-stage trail (Arm C)
+                        if not pos.get("trail_locked"):
+                            _lock_stop = entry - _lock_dist
+                            if _lock_stop < stop:
+                                stop = _lock_stop
+                                pos["stop_loss"] = stop
+                                pos["ratchet_moved"] = True
+                            pos["trail_locked"] = True
+                        if _mfe >= _stage2_r * risk_dist:
+                            _new_stop = pos["trail_max"] + _stage2_dist
+                            _new_stop = min(_new_stop, stop)  # never go backward
+                            if _new_stop < stop:
+                                stop = _new_stop
+                                pos["stop_loss"] = stop
+                                pos["ratchet_moved"] = True
 
             # ── Target-price exit (Alex's manual close) ───────────────────────
             # Alex closes when price reaches his "next 4H structure low/high"
@@ -686,15 +1177,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     close_price  = target if not is_late_week else close
                     delta        = ((entry - close_price) if direction == "short"
                                     else (close_price - entry))
-                    pnl = delta * units
+                    spread_cost  = _spread_deduction(pair, units)
+                    pnl = delta * units - spread_cost
                     balance += pnl
+                    peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
                     close_reason = ("weekend_proximity" if is_late_week
                                     else "target_reached")
-                    risk_r = delta / risk_dist if risk_dist else 0
+                    risk_r = (pnl / pos.get("entry_risk_dollars", 1)
+                              if pos.get("entry_risk_dollars") else delta / risk_dist if risk_dist else 0)
+                    consecutive_losses = 0   # target/weekend win resets streak
                     trades.append({
                         "pair":        pair,   "direction": direction,
                         "entry":       entry,  "exit":      close_price,
                         "pnl":         round(pnl, 2),
+                        "spread_cost": round(spread_cost, 2),
                         "r":           risk_r,
                         "reason":      close_reason,
                         "entry_ts":    pos["entry_ts"].isoformat(),
@@ -703,7 +1199,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                         "pattern":     pos.get("pattern", "?"),
                         "notes":       pos.get("notes", ""),
                         "macro_theme": pos.get("macro_theme"),
-                        "target_1":    target,
+                        "signal_type":  pos.get("signal_type", "unknown"),
+                        "planned_rr":   pos.get("planned_rr", 0.0),
+                        "stop_type":    pos.get("stop_type", "unknown"),
+                        "initial_stop_pips": pos.get("initial_stop_pips", 0),
+                        "mfe_r":        pos.get("mfe_r", 0.0),
+                        "mae_r":        pos.get("mae_r", 0.0),
+                        "dd_flag":      pos.get("dd_flag", ""),
+                        "streak_at_entry":    pos.get("streak_at_entry", 0),
+                        "entry_equity":       pos.get("entry_equity", 0),
+                        "final_risk_pct":     pos.get("final_risk_pct", 0),
+                        "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
+                        "target_1":     target,
+                        "regime_score_at_entry": pos.get("regime_score", 0.0),
+                        "risk_mode_at_entry": pos.get("risk_mode_at_entry", "MEDIUM"),
                     })
                     r_sign   = "+" if risk_r >= 0 else ""
                     pnl_sign = "+" if pnl >= 0 else ""
@@ -715,29 +1224,119 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     del open_pos[pair]
                     continue
 
+            # Track MFE / MAE every bar (in R units)
+            _init_r = pos.get("initial_risk") or 1e-9
+            _fav  = ((high - entry) if direction == "long" else (entry - low))  / _init_r
+            _adv  = ((entry - low)  if direction == "long" else (high - entry)) / _init_r
+            pos["mfe_r"] = max(pos.get("mfe_r", 0.0), _fav)
+            pos["mae_r"] = min(pos.get("mae_r", 0.0), -abs(_adv))
+
+            # ── Stall exit (Arm C3) ───────────────────────────────────
+            # If trail config specifies STALL_EXIT_BARS, check at exactly that
+            # bar-count whether MFE has reached the minimum threshold.
+            # Purpose: free capital from stagnant trades early.
+            _stall_bars = _tcfg.get("STALL_EXIT_BARS")
+            if _stall_bars and bars_held == _stall_bars:
+                _stall_mfe_r   = _tcfg.get("STALL_EXIT_MFE_R", 0.5)
+                _cur_mfe       = pos.get("mfe_r", 0.0)
+                if _cur_mfe < _stall_mfe_r and not pos.get("trail_locked"):
+                    exit_p      = close
+                    delta       = (exit_p - entry) if direction == "long" else (entry - exit_p)
+                    spread_cost = _spread_deduction(pair, units)
+                    pnl         = delta * units - spread_cost
+                    balance    += pnl
+                    peak_balance = max(peak_balance, balance)
+                    risk_r = (pnl / pos.get("entry_risk_dollars", 1)
+                              if pos.get("entry_risk_dollars") else
+                              delta / risk_dist if risk_dist else 0)
+                    if risk_r < -0.10:
+                        consecutive_losses += 1
+                    else:
+                        consecutive_losses = 0
+                    trades.append({
+                        "pair": pair, "direction": direction,
+                        "entry": entry, "exit": exit_p,
+                        "pnl": pnl, "r": risk_r, "reason": "stall_exit",
+                        "spread_cost": round(spread_cost, 2),
+                        "entry_ts": pos["entry_ts"].isoformat(),
+                        "exit_ts": ts_utc.isoformat(),
+                        "bars_held": bars_held,
+                        "pattern": pos.get("pattern", "?"),
+                        "notes": pos.get("notes", ""),
+                        "macro_theme": pos.get("macro_theme"),
+                        "signal_type":  pos.get("signal_type", "unknown"),
+                        "planned_rr":   pos.get("planned_rr", 0.0),
+                        "stop_type":    pos.get("stop_type", "unknown"),
+                        "initial_stop_pips": pos.get("initial_stop_pips", 0),
+                        "mfe_r": _cur_mfe, "mae_r": pos.get("mae_r", 0.0),
+                        "dd_flag": pos.get("dd_flag", ""),
+                        "streak_at_entry":    pos.get("streak_at_entry", 0),
+                        "entry_equity":       pos.get("entry_equity", 0),
+                        "final_risk_pct":     pos.get("final_risk_pct", 0),
+                        "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
+                        "target_1": pos.get("target_price"),
+                        "regime_score_at_entry": pos.get("regime_score", 0.0),
+                        "risk_mode_at_entry": pos.get("risk_mode_at_entry", "MEDIUM"),
+                    })
+                    print(f"  ⏹ {ts_utc.strftime('%Y-%m-%d')} "
+                          f"| STALL {pair} {direction.upper()} "
+                          f"@ {exit_p:.5f}  {'+' if risk_r>=0 else ''}{risk_r:.1f}R  "
+                          f"(MFE={_cur_mfe:.2f}R < {_stall_mfe_r}R at bar {_stall_bars})")
+                    strategies[pair].close_position(pair, exit_p)
+                    del open_pos[pair]
+                    continue
+
             # Stop hit?
             stopped = (direction == "long"  and low  <= stop) or \
                       (direction == "short" and high >= stop)
             max_hold = bars_held >= MAX_HOLD_BARS
 
             if stopped or max_hold:
-                exit_p   = stop if stopped else close
-                delta    = (exit_p - entry) if direction == "long" else (entry - exit_p)
-                pnl      = delta * units
-                balance += pnl
-                reason   = "stop_hit" if stopped else "max_hold"
-                risk_r   = delta / risk_dist if risk_dist else 0
+                exit_p      = stop if stopped else close
+                delta       = (exit_p - entry) if direction == "long" else (entry - exit_p)
+                spread_cost = _spread_deduction(pair, units)
+                pnl         = delta * units - spread_cost
+                balance    += pnl
+                peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
+                if stopped and pos.get("ratchet_moved"):
+                    reason = "ratchet_stop_hit"
+                elif stopped:
+                    reason = "stop_hit"
+                else:
+                    reason = "max_hold"
+                risk_r = (pnl / pos.get("entry_risk_dollars", 1)
+                          if pos.get("entry_risk_dollars") else delta / risk_dist if risk_dist else 0)
+
+                # ── Streak tracking ───────────────────────────────────
+                if risk_r < -0.10:   # definite loss
+                    consecutive_losses += 1
+                else:                # win or scratch → reset streak
+                    consecutive_losses = 0
 
                 trades.append({
                     "pair": pair, "direction": direction,
                     "entry": entry, "exit": exit_p,
                     "pnl": pnl, "r": risk_r, "reason": reason,
+                    "spread_cost": round(spread_cost, 2),
                     "entry_ts": pos["entry_ts"].isoformat(),
                     "exit_ts": ts_utc.isoformat(),
                     "bars_held": bars_held,
                     "pattern": pos.get("pattern", "?"),
                     "notes": pos.get("notes", ""),
                     "macro_theme": pos.get("macro_theme"),
+                    "signal_type":  pos.get("signal_type", "unknown"),
+                    "planned_rr":   pos.get("planned_rr", 0.0),
+                    "stop_type":    pos.get("stop_type", "unknown"),
+                    "initial_stop_pips": pos.get("initial_stop_pips", 0),
+                    "mfe_r":        pos.get("mfe_r", 0.0),
+                    "mae_r":        pos.get("mae_r", 0.0),
+                    "dd_flag":      pos.get("dd_flag", ""),
+                    "streak_at_entry":    pos.get("streak_at_entry", 0),
+                    "entry_equity":       pos.get("entry_equity", 0),
+                    "final_risk_pct":     pos.get("final_risk_pct", 0),
+                    "entry_risk_dollars": pos.get("entry_risk_dollars", 0),
+                    "regime_score_at_entry": pos.get("regime_score", 0.0),
+                        "risk_mode_at_entry": pos.get("risk_mode_at_entry", "MEDIUM"),
                 })
 
                 r_sign = "+" if risk_r >= 0 else ""
@@ -831,6 +1430,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             strat.risk_pct = _risk_pct(balance)
 
             try:
+                _t0 = time.perf_counter()
                 decision = strat.evaluate(
                     pair        = pair,
                     df_weekly   = hist_w  if len(hist_w)  >= 4  else pd.DataFrame(),
@@ -840,6 +1440,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                     current_dt  = ts_utc,
                     macro_theme = active_theme if _is_theme_pair else None,
                 )
+                _eval_calls += 1
+                _eval_ms    += (time.perf_counter() - _t0) * 1000
             except Exception:
                 continue
 
@@ -853,7 +1455,10 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "direction":     decision.direction,
                 "entry_price":   decision.entry_price,
                 "stop_loss":     decision.stop_loss,
-                "filters_failed": decision.failed_filters,
+                "stop_type":     getattr(decision, "stop_type", ""),
+                "initial_stop_pips": getattr(decision, "initial_stop_pips", 0),
+                "exec_rr":       getattr(decision, "exec_rr", 0),
+                "failed_filters": decision.failed_filters,
                 "balance":       balance,
             })
 
@@ -947,11 +1552,30 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             # sufficient quality gating without a pip equity floor.
             _is_cb_pattern = 'consolidation_breakout' in (
                 decision.pattern.pattern_type if decision.pattern else '')
-            if not _is_theme_pair and not _is_cb_pattern and pe < _sc.MIN_PIP_EQUITY:
-                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "low_pip_equity",
-                        f"Pip equity {pe:.0f}p < min {_sc.MIN_PIP_EQUITY:.0f}p — "
-                        f"setup too small to consume a slot")
-                continue
+            # Dynamic pip equity gate (always-on, replaces fixed 100p floor).
+            # Threshold = stop_pips × MIN_RR_EFFECTIVE:
+            #   pro-trend (W+D+4H agree)   → stop_pips × MIN_RR_STANDARD   (2.5R)
+            #   non-protrend / mixed / ?   → stop_pips × MIN_RR_COUNTERTREND (3.0R)
+            # Ensures reward potential in pips ≥ required R multiple of actual risk.
+            # Falls back to 10p absolute minimum if stop_pips unavailable.
+            if not _is_theme_pair and not _is_cb_pattern:
+                _stop_pips_pe = getattr(decision, "initial_stop_pips", 0.0) or 0.0
+                if _stop_pips_pe > 0:
+                    _htf_pe = alex_policy.htf_aligned(
+                        decision.direction or "",
+                        decision.trend_weekly, decision.trend_daily, decision.trend_4h,
+                    )
+                    _rr_pe    = (_sc.MIN_RR_STANDARD
+                                 if _htf_pe is True else _sc.MIN_RR_COUNTERTREND)
+                    _pe_min   = _stop_pips_pe * _rr_pe
+                else:
+                    _pe_min   = _sc.MIN_PIP_EQUITY   # fallback: no stop data (rare)
+                if pe < _pe_min:
+                    _dyn_pip_eq_blocks += 1
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "DYN_PIP_EQUITY",
+                            f"Pip equity {pe:.0f}p < stop({_stop_pips_pe:.0f}p)"
+                            f" × {_rr_pe:.1f}R = {_pe_min:.0f}p min")
+                    continue
 
             # Re-check eligibility — earlier entries this bar may have changed
             # slot counts; also runs theme contradiction gate (needs direction)
@@ -965,7 +1589,57 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                             f"{elig_reason2}")
                 continue
 
-            rpct = _risk_pct(balance)
+            # ── Risk mode: compute dynamically at each entry ─────────────
+            # Mirrors live orchestrator: ALL-4 conditions required for HIGH,
+            # plus 2-bar hysteresis.  force_risk_mode pins mode (comparison runs).
+            _dd_pct_entry = (
+                (peak_balance - balance) / peak_balance * 100
+                if peak_balance > 0 else 0.0
+            )
+            try:
+                _rms_entry = compute_risk_mode(
+                    trend_weekly            = (decision.trend_weekly.value
+                                               if hasattr(decision.trend_weekly, "value")
+                                               else str(decision.trend_weekly or "")),
+                    trend_daily             = (decision.trend_daily.value
+                                               if hasattr(decision.trend_daily, "value")
+                                               else str(decision.trend_daily or "")),
+                    df_h4                   = hist_4h,
+                    recent_trades           = trades,      # closed trades so far
+                    loss_streak             = consecutive_losses,
+                    dd_pct                  = _dd_pct_entry,
+                    # Instantaneous evaluation: Alex's ~1 trade/week cadence is too
+                    # sparse for 2-bar consecutive accumulation across entries.
+                    # HIGH/EXTREME granted immediately when ALL conditions are met at
+                    # this exact bar — no state carried between entries.
+                    # 2-bar hysteresis runs only in the H4 time-sampling loop.
+                    instantaneous           = True,
+                    streak_demotion_thresh  = streak_demotion_thresh,
+                )
+                # Debug: log every HIGH/EXTREME promotion with full inputs.
+                if _rms_entry.promotion_note:
+                    print(f"  🔺 {ts_utc.strftime('%Y-%m-%d')} {pair} → {_rms_entry.mode.value}"
+                          f" | {_rms_entry.promotion_note}")
+                # force_risk_mode pins mode for every entry (used in comparison runs).
+                risk.set_regime_mode(force_risk_mode or _rms_entry.mode.value)
+            except Exception:
+                _rms_entry = None
+                risk.set_regime_mode(force_risk_mode or None)
+
+            _base_rpct, _dd_flag = _risk_pct_with_flag(balance)
+
+            # ── DD kill-switch: hard block at ≥ 40% DD ────────────────
+            if _dd_flag == "DD_KILLSWITCH":
+                dd_killswitch_blocks += 1
+                _dd_pct = (peak_balance - balance) / peak_balance * 100 if peak_balance else 0
+                log_gap(ts_utc, pair, decision.direction.upper(), "BLOCKED",
+                        "dd_killswitch",
+                        f"DD {_dd_pct:.1f}% ≥ {_sc.DD_KILLSWITCH_PCT:.0f}% kill-switch — "
+                        f"no new entries until equity recovers above "
+                        f"{_sc.DD_RESUME_PCT*100:.0f}% of peak (${peak_balance:,.0f})")
+                continue
+
+            rpct = _base_rpct
             if _is_theme_pair and active_theme:
                 rpct = rpct * active_theme.position_fraction
             units = _calc_units(pair, balance, rpct,
@@ -973,25 +1647,165 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             if units <= 0:
                 continue
 
+            # ── Alex small-account gates (via shared alex_policy module) ──
+            # Parity note: live orchestrator calls the same functions from
+            # src/strategy/forex/alex_policy.py — single source of truth.
+
+            # Gate 1: Alignment-based MIN_RR
+            # Pro-trend (W+D+4H all agree) → 2.5R; non-protrend/mixed → 3.0R
+            _htf_aligned_flag = alex_policy.htf_aligned(
+                decision.direction or "",
+                decision.trend_weekly,
+                decision.trend_daily,
+                decision.trend_4h,
+            )
+            _rr_blocked, _rr_reason = alex_policy.check_dynamic_min_rr(
+                decision.exec_rr,
+                htf_aligned_flag=_htf_aligned_flag,
+                balance=balance,
+            )
+            if _rr_blocked:
+                _min_rr_small_blocks += 1
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "MIN_RR_ALIGN",
+                        _rr_reason)
+                continue
+
+            # Gate 2: Weekly punch-card limit (ISO week)
+            _iso_key = ts_utc.isocalendar()[:2]   # (year, week)
+            _wk_blocked, _wk_reason = alex_policy.check_weekly_trade_limit(
+                _weekly_trade_counts.get(_iso_key, 0), balance
+            )
+            if _wk_blocked:
+                _weekly_limit_blocks += 1
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "WEEKLY_TRADE_LIMIT",
+                        _wk_reason + f" (ISO {_iso_key[0]}-W{_iso_key[1]:02d})")
+                continue
+
+            # ── Gate 3 (adaptive): regime-gated Thu/Fri block + weekly cap ──
+            # When adaptive_gates=True the session filter does NOT block Thu PM / Fri
+            # at strategy eval time (NO_THU_FRI_TRADES_ENABLED=False).  Instead we
+            # compute regime_score here and apply the time/weekly gate conditionally:
+            #   • Thu PM or Fri AND regime_score < adaptive_threshold  →  block
+            #   • Weekly cap = 2 if regime_score ≥ 0.65, else 1 (regardless of balance)
+            # This skips poor-regime entries at the end of the week, but allows
+            # high-conviction setups through even on Thursday/Friday.
+            _rs_early = None   # will hold early RegimeScore when adaptive_gates=True
+            if adaptive_gates:
+                _h4_sl = {
+                    _p: candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]
+                    for _p in candle_data
+                    if candle_data[_p].get("4h") is not None
+                    and len(candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]) >= 20
+                }
+                _rs_early = compute_regime_score(
+                    df_h4=hist_4h, recent_trades=trades, h4_slices=_h4_sl,
+                )
+                _et_bar = ts_utc.astimezone(_ET_TZ)
+                _is_thu_pm = _et_bar.weekday() == 3 and _et_bar.hour > 9
+                _is_fri    = _et_bar.weekday() == 4
+                if (_is_thu_pm or _is_fri) and _rs_early.total < adaptive_threshold:
+                    _adaptive_time_blocks += 1
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "ADAPTIVE_TIME_GATE",
+                            f"Thu PM/Fri AND regime_score={_rs_early.total:.2f} < "
+                            f"{adaptive_threshold:.2f} — below quality threshold")
+                    continue
+                # Adaptive weekly cap: relax to 2/wk when regime is strong
+                _adaptive_wk_cap = 2 if _rs_early.total >= 0.65 else 1
+                _iso_key_adp = ts_utc.isocalendar()[:2]
+                if _weekly_trade_counts.get(_iso_key_adp, 0) >= _adaptive_wk_cap:
+                    _weekly_limit_blocks += 1
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "ADAPTIVE_WEEKLY_CAP",
+                            f"weekly cap={_adaptive_wk_cap} (regime={_rs_early.total:.2f}) "
+                            f"already used ISO {_iso_key_adp[0]}-W{_iso_key_adp[1]:02d}")
+                    continue
+
+            # ── Gate 4a (strict_protrend): ALL three HTFs must agree with direction ──
+            # Requires W+D+4H all agree.  Usually overconstrained at entry since 4H
+            # is often mid-retracement — prefer Gate 4b (wd_protrend_htf) instead.
+            if strict_protrend_htf:
+                _sp_htf = alex_policy.htf_aligned(
+                    decision.direction or "",
+                    decision.trend_weekly,
+                    decision.trend_daily,
+                    decision.trend_4h,
+                )
+                if _sp_htf is not True:
+                    _strict_htf_blocks += 1
+                    _sp_reason = (
+                        "HTF unknown (missing trend data)"
+                        if _sp_htf is None
+                        else f"W/D/4H not all {decision.direction} — strict protrend required"
+                    )
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "STRICT_PROTREND_HTF",
+                            f"{_sp_reason} (direction={decision.direction})")
+                    continue
+
+            # ── Gate 4b (wd_protrend_htf): Weekly AND Daily must agree, 4H exempt ──
+            # Alex enters during 4H retracements; W+D bias sets the macro direction.
+            # The 1H engulfing at a key level IS the 4H flip/confirmation — requiring
+            # 4H to already agree means you miss the entry entirely.
+            # Gate: block if W or D opposes direction; allow 4H mixed/neutral/counter.
+            if wd_protrend_htf:
+                _wd_flag = alex_policy.htf_aligned_wd(
+                    decision.direction or "",
+                    decision.trend_weekly,
+                    decision.trend_daily,
+                )
+                if _wd_flag is not True:
+                    _wd_htf_blocks += 1
+                    _wd_reason = (
+                        "W/D trend data missing"
+                        if _wd_flag is None
+                        else f"W/D not both {decision.direction} (4H exempt)"
+                    )
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "WD_PROTREND_HTF",
+                            f"{_wd_reason} (direction={decision.direction})")
+                    continue
+
+            # ── W==D alignment tracker (always, for all entered trades) ──────────
+            # Tracks % of entered trades that had W+D protrend — useful diagnostic
+            # independent of whether any gate is active.
+            _wd_check = alex_policy.htf_aligned_wd(
+                decision.direction or "",
+                decision.trend_weekly,
+                decision.trend_daily,
+            )
+            if _wd_check is True:
+                _wd_aligned_entries += 1
+
             strat = strategies[pair]
 
-            # ── Target: next 4H structure level (Alex's actual method) ────────
-            # Alex says "take profit was very strategically placed at this next
-            # 4-hour low" — he looks at prior 4H swing structure, not a geometric
-            # measured move. Find nearest swing low/high beyond the neckline.
-            # Fall back to pattern.target_1 (measured move) if no swing found.
-            # NOTE: recompute hist_4h for THIS pair — Phase 1 left a stale value.
-            _pat       = decision.pattern
-            _neckline  = getattr(decision, "neckline_ref", None) or decision.entry_price
-            _df4h_entry = candle_data[pair].get("4h")
-            _hist4h_entry = (
-                _df4h_entry[_df4h_entry.index < ts]
-                if _df4h_entry is not None else pd.DataFrame()
-            )
-            _target    = _find_next_structure_level(_hist4h_entry, decision.direction, _neckline)
+            # ── Target: use exec_target from strategy (single source of truth) ──
+            # The strategy's select_target() already chose the best qualifying
+            # target (4H structure → measured_move → T2) and gated on MIN_RR.
+            # We use decision.exec_target verbatim — no override, no divergence.
+            # If exec_target is missing (legacy path), this is a hard bug, not a
+            # graceful fallback — log it and skip so we don't enter at 0.3R.
+            _target = decision.exec_target
             if _target is None:
-                _target = (_pat.target_1 if _pat and _pat.target_1 else
-                           _pat.target_2 if _pat and _pat.target_2 else None)
+                log_gap(ts_utc, pair, "ENTER", "BLOCKED", "no_exec_target",
+                        f"decision.exec_target is None — strategy should have blocked this. "
+                        f"Skipping to avoid uncontrolled RR. pattern={decision.pattern.pattern_type if decision.pattern else '?'}")
+                continue
+
+            # ── Regime score at entry ─────────────────────────────────────
+            # Compute once at entry (cheap: ~17 times in Alex window).
+            # All 4 components use data already loaded; no new OANDA calls.
+            # If adaptive_gates=True we already computed _rs_early above — reuse it.
+            if _rs_early is not None:
+                _rs = _rs_early   # reuse from adaptive gate (avoid double compute)
+            else:
+                _h4_slices_rs = {
+                    _p: candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]
+                    for _p in candle_data
+                    if candle_data[_p].get("4h") is not None
+                    and len(candle_data[_p]["4h"][candle_data[_p]["4h"].index < ts]) >= 20
+                }
+                _rs = compute_regime_score(
+                    df_h4        = hist_4h,
+                    recent_trades = trades,      # closed trades so far
+                    h4_slices    = _h4_slices_rs,
+                )
 
             open_pos[pair] = {
                 "entry_price":  decision.entry_price,
@@ -1003,10 +1817,31 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                 "pattern":      decision.pattern.pattern_type if decision.pattern else "?",
                 "notes":        decision.reason[:80],
                 "be_moved":     False,
+                "trail_max":    decision.entry_price,   # running max-favourable price for ratchet
+                "trail_locked": False,                  # True after stage-1 lock fires (Arm C)
+                "streak_at_entry": consecutive_losses,  # for per-trade risk audit
                 "macro_theme":  f"{active_theme.currency}_{active_theme.direction}" if _is_theme_pair and active_theme else None,
-                "target_price": _target,   # measured move close target
+                "regime_score": _rs.total,              # RegimeScore at entry
+                "risk_mode_at_entry": (force_risk_mode or (_rms_entry.mode.value if _rms_entry else "MEDIUM")),
+                "target_price": _target,
+                "target_type":  decision.exec_target_type,
+                "stop_type":    decision.stop_type,
                 "initial_risk": abs(decision.entry_price - decision.stop_loss),
+                "initial_stop_pips": decision.initial_stop_pips,
+                "base_risk_pct":     _base_rpct,
+                "final_risk_pct":    rpct,
+                "entry_equity":      balance,
+                "entry_risk_dollars": balance * rpct / 100,
+                "dd_flag":           _dd_flag,
+                "signal_type":   (decision.entry_signal.signal_type
+                                  if decision.entry_signal else "unknown"),
+                "planned_rr":    decision.exec_rr,
+                "mfe_r":  0.0,
+                "mae_r":  0.0,
             }
+            # Record this week's trade (ISO week key)
+            _weekly_trade_counts[_iso_key] = _weekly_trade_counts.get(_iso_key, 0) + 1
+
             strat.register_open_position(
                 pair=pair,
                 entry_price=decision.entry_price,
@@ -1028,6 +1863,20 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
                   f" @ {decision.entry_price:.5f}  SL={decision.stop_loss:.5f}"
                   f"  conf={decision.confidence:.0%}  [{decision.reason[:55]}]"
                   f"  📊{pe:.0f}p{theme_tag}")
+            # ── Risk mode audit print (every trade — proves multiplier wired) ──
+            _pos_now = open_pos[pair]
+            _mode_label = _pos_now.get("risk_mode_at_entry", "MEDIUM")
+            _base_pct_now = _pos_now.get("base_risk_pct", 0)
+            _eff_pct_now  = _pos_now.get("final_risk_pct", 0)
+            _risk_usd_now = _pos_now.get("entry_risk_dollars", 0)
+            _mode_mult_now = (_eff_pct_now / _base_pct_now) if _base_pct_now else 1.0
+            _mode_icon = {"LOW": "🔵", "HIGH": "🟠", "EXTREME": "🔴"}.get(_mode_label, "⚪")
+            print(f"       {_mode_icon} mode={_mode_label:<8}"
+                  f"  base={_base_pct_now:.2f}%  eff={_eff_pct_now:.2f}%"
+                  f"  mult≈{_mode_mult_now:.2f}×"
+                  f"  risk=${_risk_usd_now:,.0f}"
+                  f"  streak={consecutive_losses}"
+                  f"  dd={_dd_pct_entry:.1f}%")
 
     # ── Last-resort close (runout period exhausted) ───────────────────
     # Normally positions close via target or stop during the runout window.
@@ -1044,14 +1893,26 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         stop    = pos["stop_loss"]
         direction = pos["direction"]
         units   = pos["units"]
-        delta   = (close_p - entry) if direction == "long" else (entry - close_p)
-        pnl     = delta * units
-        r       = delta / abs(entry - stop) if abs(entry - stop) else 0
-        balance += pnl
+        delta       = (close_p - entry) if direction == "long" else (entry - close_p)
+        spread_cost = _spread_deduction(pair, units)
+        pnl         = delta * units - spread_cost
+        r = (pnl / pos.get("entry_risk_dollars", 1)
+             if pos.get("entry_risk_dollars") else
+             delta / abs(entry - stop) if abs(entry - stop) else 0)
+        balance    += pnl
+        peak_balance = max(peak_balance, balance)  # DD circuit breaker HWM
         trades.append({
             "pair": pair, "direction": direction,
             "entry": entry, "exit": close_p,
             "pnl": pnl, "r": r, "reason": "runout_expired",
+            "spread_cost": round(spread_cost, 2),
+            "signal_type":  pos.get("signal_type", "unknown"),
+            "planned_rr":   pos.get("planned_rr", 0.0),
+            "stop_type":    pos.get("stop_type", "unknown"),
+            "initial_stop_pips": pos.get("initial_stop_pips", 0),
+            "mfe_r":        pos.get("mfe_r", 0.0),
+            "mae_r":        pos.get("mae_r", 0.0),
+            "dd_flag":      pos.get("dd_flag", ""),
             "entry_ts": pos["entry_ts"].isoformat(),
             "exit_ts":  last_ts.isoformat() if last_ts else "",
             "bars_held": len(all_1h) - pos["bar_idx"],
@@ -1059,24 +1920,464 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             "notes": pos.get("notes", ""),
             "macro_theme": pos.get("macro_theme"),
             "target_1": pos.get("target_price"),
+            "regime_score_at_entry": pos.get("regime_score", 0.0),
+                        "risk_mode_at_entry": pos.get("risk_mode_at_entry", "MEDIUM"),
         })
 
     # ── Results ───────────────────────────────────────────────────────
     net_pnl  = balance - starting_bal
     ret_pct  = net_pnl / starting_bal * 100
-    wins     = [t for t in trades if t["pnl"] > 0]
-    losses   = [t for t in trades if t["pnl"] <= 0]
-    wr       = len(wins) / len(trades) * 100 if trades else 0
+    # ── 3-bucket classification: Win / Loss / Scratch ─────────────────────
+    # Scratch = |R| < SCRATCH_THRESHOLD (BE exits, tiny weekend partials).
+    # Win/Loss buckets exclude scratches for conditional WR reporting.
+    SCRATCH_R = 0.10   # ≤0.10R in either direction = scratch
+    wins      = [t for t in trades if t["r"] >  SCRATCH_R]
+    losses    = [t for t in trades if t["r"] < -SCRATCH_R]
+    scratches = [t for t in trades if abs(t["r"]) <= SCRATCH_R]
+    directional = wins + losses      # excludes scratches
+    wr       = len(wins) / len(trades)       * 100 if trades     else 0
+    cond_wr  = len(wins) / len(directional)  * 100 if directional else 0
+    avg_r    = (sum(t["r"] for t in trades)   / len(trades))      if trades else 0.0
+    avg_r_w  = (sum(t["r"] for t in wins)     / len(wins))        if wins   else 0.0
+    avg_r_l  = (sum(t["r"] for t in losses)   / len(losses))      if losses else 0.0
+    avg_r_s  = (sum(t["r"] for t in scratches)/ len(scratches))   if scratches else 0.0
+    max_r    = max((t["r"] for t in trades), default=0.0)
+    # Max drawdown: track running equity peak and worst trough
+    _eq = starting_bal
+    _pk = starting_bal
+    _max_dd_pct = 0.0
+    for t in trades:
+        _eq += t["pnl"]
+        _pk  = max(_pk, _eq)
+        _dd  = (_pk - _eq) / _pk * 100 if _pk > 0 else 0
+        _max_dd_pct = max(_max_dd_pct, _dd)
+    # Trigger type counts
+    from collections import Counter
+    _trigger_counts = Counter(
+        t.get("signal_type", "unknown") for t in trades
+    )
+    # DD cap usage
+    _dd_cap_trades = [t for t in trades if t.get("dd_flag")]
+
+    # ── Time-in-mode: H4 bar sampling (computed once, used in print + result) ─
+    # Samples compute_risk_mode() at every H4 bar in the window.
+    # Gives % of CALENDAR TIME in each mode — independent of entry frequency.
+    #
+    # Real W/D bias: uses actual daily ("d") and weekly ("w") candle series from
+    # the representative pair.  Daily trend cached per calendar date; weekly trend
+    # cached per ISO week.  This eliminates the "H4 proxy = wd_aligned always True"
+    # artifact that inflated HIGH/EXTREME time in previous runs.
+    _tim_counts = Counter({"LOW": 0, "MEDIUM": 0, "HIGH": 0, "EXTREME": 0})
+    try:
+        from src.strategy.forex.pattern_detector import PatternDetector as _PD
+        _pd_inst  = _PD()
+        _rep_pair = next(iter(candle_data.keys()), None)
+        _rep_h4   = candle_data[_rep_pair].get("4h") if _rep_pair else None
+        _rep_d    = candle_data[_rep_pair].get("d")  if _rep_pair else None
+        _rep_w    = candle_data[_rep_pair].get("w")  if _rep_pair else None
+        if _rep_h4 is not None and len(_rep_h4) > 0:
+            _start_ts = pd.Timestamp(start_dt).replace(tzinfo=None)
+            _end_ts   = (pd.Timestamp(end_dt).replace(tzinfo=None)
+                         if end_dt else _rep_h4.index[-1])
+            _h4_window = _rep_h4[(_rep_h4.index >= _start_ts) &
+                                  (_rep_h4.index <  _end_ts)]
+
+            # ── Bias caches: compute once per day/week, not once per H4 bar ─
+            _daily_bias_cache:  dict = {}   # date_str  → trend str
+            _weekly_bias_cache: dict = {}   # week_str  → trend str
+
+            def _get_daily_bias(ts: "pd.Timestamp") -> str:
+                """Daily trend from D candles sliced to < ts; cached per date."""
+                key = str(ts.date())
+                if key not in _daily_bias_cache:
+                    if _rep_d is not None:
+                        _d_sl = _rep_d[_rep_d.index < ts]
+                        if len(_d_sl) >= 21:
+                            try:
+                                _daily_bias_cache[key] = _pd_inst.detect_trend(_d_sl).value
+                                return _daily_bias_cache[key]
+                            except Exception:
+                                pass
+                    _daily_bias_cache[key] = "neutral"
+                return _daily_bias_cache[key]
+
+            def _get_weekly_bias(ts: "pd.Timestamp") -> str:
+                """Weekly trend from W candles sliced to < ts; cached per ISO week."""
+                iso = ts.isocalendar()
+                key = f"{iso[0]}-W{iso[1]:02d}"
+                if key not in _weekly_bias_cache:
+                    if _rep_w is not None:
+                        _w_sl = _rep_w[_rep_w.index < ts]
+                        if len(_w_sl) >= 21:
+                            try:
+                                _weekly_bias_cache[key] = _pd_inst.detect_trend(_w_sl).value
+                                return _weekly_bias_cache[key]
+                            except Exception:
+                                pass
+                    _weekly_bias_cache[key] = "neutral"
+                return _weekly_bias_cache[key]
+
+            _tim_consec  = 0   # consecutive qualifying H4 bars
+            _tim_demote  = 0   # consecutive failing bars while in HIGH zone
+            for _hi, (_h4_ts, _) in enumerate(_h4_window.iterrows()):
+                _h4_slice = _h4_window.iloc[max(0, _hi - 80): _hi + 1]
+                if len(_h4_slice) < 21:
+                    continue
+
+                # Real W/D trends (accurate wd_aligned — no H4 proxy)
+                _trend_w_str = _get_weekly_bias(_h4_ts)
+                _trend_d_str = _get_daily_bias(_h4_ts)
+
+                _h4_ts_str = str(_h4_ts)
+                _recent_closed = [t for t in trades
+                                  if (t.get("exit_ts") or "0") < _h4_ts_str]
+                _recent5 = _recent_closed[-5:]
+
+                # Loss streak at this H4 bar from most recent closed trades
+                _tim_streak = 0
+                for _rt in reversed(_recent_closed):
+                    if _rt.get("r", 0.0) < 0:
+                        _tim_streak += 1
+                    else:
+                        break
+                try:
+                    _rms_h4 = compute_risk_mode(
+                        trend_weekly            = _trend_w_str,
+                        trend_daily             = _trend_d_str,
+                        df_h4                   = _h4_slice,
+                        recent_trades           = _recent5,
+                        loss_streak             = _tim_streak,
+                        dd_pct                  = 0.0,   # no per-bar balance in sampling
+                        consecutive_high_bars   = _tim_consec,
+                        demotion_streak         = _tim_demote,
+                        streak_demotion_thresh  = streak_demotion_thresh,
+                    )
+                    _tim_consec = _rms_h4.consecutive_high_bars
+                    _tim_demote = _rms_h4.demotion_streak
+                    _tim_counts[_rms_h4.mode.value] += 1
+                except Exception:
+                    _tim_consec = 0
+                    _tim_demote = 0
+                    _tim_counts["MEDIUM"] += 1
+    except Exception:
+        pass   # time-in-mode is diagnostic — never crash the backtest
+
+    _tim_total       = sum(_tim_counts.values()) or 1
+    _tim_pct_low     = _tim_counts["LOW"]     / _tim_total * 100
+    _tim_pct_medium  = _tim_counts["MEDIUM"]  / _tim_total * 100
+    _tim_pct_high    = _tim_counts["HIGH"]    / _tim_total * 100
+    _tim_pct_extreme = _tim_counts["EXTREME"] / _tim_total * 100
 
     print(f"\n{'='*65}")
     print(f"RESULTS — v2 (Real Strategy Code)")
     print(f"{'='*65}")
-    print(f"  Trades:       {len(trades)}  ({len(wins)} wins / {len(losses)} losses)")
-    print(f"  Win rate:     {wr:.0f}%")
+    print(f"  Trades:       {len(trades)}  "
+          f"({len(wins)}W / {len(losses)}L / {len(scratches)}S)")
+    print(f"  Win rate:     {wr:.0f}%  (all)    "
+          f"Conditional (excl scratch): {cond_wr:.0f}%")
+    _scratch_pct = len(scratches) / len(trades) * 100 if trades else 0.0
+    print(f"  Scratch rate: {_scratch_pct:.0f}%  "
+          f"({len(scratches)} of {len(trades)} trades)")
+    print(f"  Avg R:        {avg_r:>+.2f}R  "
+          f"(W: {avg_r_w:>+.1f}R  L: {avg_r_l:>+.1f}R  S: {avg_r_s:>+.1f}R)")
+    print(f"  Best R:       {max_r:>+.1f}R")
+    print(f"  Max DD:       {_max_dd_pct:.1f}%")
     print(f"  Starting:     ${starting_bal:>10,.2f}")
     print(f"  Net P&L:      ${net_pnl:>+10,.2f}")
     print(f"  Final:        ${balance:>10,.2f}")
     print(f"  Return:       {ret_pct:>+.1f}%")
+
+    # ── Per-trade postmortem ──────────────────────────────────────────
+    _low_rr    = [t for t in trades if t.get("planned_rr", 0) < 2.8 and t.get("planned_rr", 0) > 0]
+    _zero_rr   = [t for t in trades if t.get("planned_rr", 0) == 0]
+    _exit_counts = Counter(t["reason"] for t in trades)
+    _avg_mfe   = sum(t.get("mfe_r", 0) for t in trades) / len(trades) if trades else 0
+    _avg_mae   = sum(t.get("mae_r", 0) for t in trades) / len(trades) if trades else 0
+    _avg_plan_rr = sum(t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0)
+    _plan_rr_n   = sum(1 for t in trades if t.get("planned_rr", 0) > 0)
+    _avg_plan_rr = _avg_plan_rr / _plan_rr_n if _plan_rr_n else 0
+
+    # exec_rr distribution
+    _rr_vals = sorted(t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0)
+    _rr_p50  = _rr_vals[len(_rr_vals)//2] if _rr_vals else 0
+    _rr_p95  = _rr_vals[int(len(_rr_vals)*0.95)] if _rr_vals else 0
+
+    print(f"\n  ── Per-trade postmortem ───────────────────────────────────")
+    if trades:
+        print(f"    Exec RR avg:          {_avg_plan_rr:.2f}R  (n={_plan_rr_n})")
+        print(f"    Exec RR p50/p95:      {_rr_p50:.2f}R / {_rr_p95:.2f}R")
+        print(f"    Exec RR < 2.8:        {len(_low_rr)} trades ({len(_low_rr)/len(trades)*100:.0f}%)  ← should be ~0 after fix")
+        print(f"    Exec RR = 0 (N/A):    {len(_zero_rr)} trades  ← no qualifying target at entry")
+        print(f"    Avg MFE:              {_avg_mfe:+.2f}R")
+        print(f"    Avg MAE:              {_avg_mae:+.2f}R")
+    else:
+        print("    (no trades — all entries blocked by active gates)")
+    print(f"\n  ── Exit reason counts ────────────────────────────────────")
+    _reason_order = ["target_reached", "weekend_proximity",
+                     "ratchet_stop_hit", "stop_hit", "stall_exit", "max_hold", "runout_expired"]
+    _all_reasons  = set(_exit_counts.keys())
+    _sorted_reasons = ([r for r in _reason_order if r in _all_reasons] +
+                       sorted(_all_reasons - set(_reason_order)))
+    for reason in _sorted_reasons:
+        cnt = _exit_counts[reason]
+        avg_r = (sum(t["r"] for t in trades if t["reason"] == reason) / cnt
+                 if cnt else 0.0)
+        _epct = cnt / len(trades) * 100 if trades else 0.0
+        print(f"    {reason:<30} {cnt:>3}  ({_epct:.0f}%)  "
+              f"avg {avg_r:+.2f}R")
+
+    if _trigger_counts:
+        print(f"\n  ── Trigger types ──────────────────────────────────────")
+        for sig_type, count in sorted(_trigger_counts.items(), key=lambda x: -x[1]):
+            pct = count / len(trades) * 100 if trades else 0
+            print(f"    {sig_type:<30} {count:>3}  ({pct:.0f}%)")
+
+    # Stop type distribution — tracks structural vs atr_fallback usage
+    _stop_types    = Counter(pos.get("stop_type", "unknown") for pos in trades)
+    _st_total      = sum(_stop_types.values())
+    _atr_fb_count  = _stop_types.get("atr_fallback", 0)
+    _atr_fb_pct    = _atr_fb_count / _st_total * 100 if _st_total else 0.0
+    _sp_vals       = sorted(t.get("initial_stop_pips", 0) for t in trades
+                            if t.get("initial_stop_pips", 0) > 0)
+    _sp_p50        = _sp_vals[len(_sp_vals) // 2] if _sp_vals else 0.0
+    _sp_p90        = _sp_vals[int(len(_sp_vals) * 0.9)] if _sp_vals else 0.0
+
+    _FLAG_ATR = "  ⚠ >40% atr_fallback — structural stop regression!" if _atr_fb_pct > 40 else ""
+    print(f"\n  ── Stop type distribution{_FLAG_ATR} ────────────────────────")
+    if _stop_types:
+        for stype, cnt in _stop_types.most_common():
+            pct = cnt / len(trades) * 100 if trades else 0
+            _sp_by_type = sorted(t.get("initial_stop_pips", 0) for t in trades
+                                 if t.get("stop_type") == stype and t.get("initial_stop_pips", 0) > 0)
+            _p50_t = _sp_by_type[len(_sp_by_type)//2] if _sp_by_type else 0
+            print(f"    {stype:<35} {cnt:>3}  ({pct:.0f}%)  p50={_p50_t:.0f}p")
+        if _sp_vals:
+            print(f"    Overall stop pips:  p50={_sp_p50:.0f}p  p90={_sp_p90:.0f}p  "
+                  f"min={_sp_vals[0]:.0f}p  max={_sp_vals[-1]:.0f}p")
+        print(f"    atr_fallback rate: {_atr_fb_pct:.0f}%{_FLAG_ATR}")
+    else:
+        print("    (no trades)")
+
+    # ── Regime score distribution ─────────────────────────────────────────
+    _rs_vals = [t.get("regime_score_at_entry", 0.0) for t in trades]
+    if _rs_vals:
+        _rs_by_band = {"LOW(<2)": 0, "MED(2-3)": 0, "HIGH(3-3.5)": 0, "EXTREME(3.5+)": 0}
+        for _rsv in _rs_vals:
+            if _rsv >= 3.5:   _rs_by_band["EXTREME(3.5+)"] += 1
+            elif _rsv >= 3.0: _rs_by_band["HIGH(3-3.5)"] += 1
+            elif _rsv >= 2.0: _rs_by_band["MED(2-3)"] += 1
+            else:              _rs_by_band["LOW(<2)"] += 1
+        _rs_high_pct  = sum(1 for v in _rs_vals if v >= 3.0) / len(_rs_vals) * 100
+        _rs_ext_pct   = sum(1 for v in _rs_vals if v >= 3.5) / len(_rs_vals) * 100
+        _rs_avg       = sum(_rs_vals) / len(_rs_vals)
+        print(f"\n  ── Regime score @ entry ──────────────────────────────────")
+        print(f"    Avg score:            {_rs_avg:.2f}")
+        print(f"    % score ≥ 3.0 (HIGH): {_rs_high_pct:.0f}%")
+        print(f"    % score ≥ 3.5 (EXTR): {_rs_ext_pct:.0f}%")
+        _band_bounds = {"LOW(<2)": (0,2), "MED(2-3)": (2,3), "HIGH(3-3.5)": (3,3.5), "EXTREME(3.5+)": (3.5,99)}
+        for _band, _cnt in _rs_by_band.items():
+            if _cnt == 0: continue
+            _lo, _hi = _band_bounds[_band]
+            _brs    = [t["r"] for t in trades if _lo <= t.get("regime_score_at_entry", 0) < _hi]
+            _avg_r  = sum(_brs) / len(_brs) if _brs else 0
+            print(f"    {_band:<18}  {_cnt:>2} trades  avg R={_avg_r:+.2f}")
+
+    # ── Risk mode distribution ────────────────────────────────────────────
+    _rm_at_entry = [t.get("risk_mode_at_entry", "MEDIUM") for t in trades]
+    if _rm_at_entry:
+        # Build time-in-mode from local Counter for display
+        _local_tim = Counter({"LOW": 0, "MEDIUM": 0, "HIGH": 0, "EXTREME": 0})
+        _local_tim.update(_tim_counts)   # already computed above
+        _local_tim_total = sum(_local_tim.values()) or 1
+
+        print(f"\n  ── Risk Mode distribution ───────────────────────────────")
+        print(f"    {'Mode':<10}  {'N':>4}  {'%entries':>9}  {'%h4time':>8}  "
+              f"{'AvgR':>6}  {'BestR':>6}  config")
+        print(f"    {'─'*10}  {'─'*4}  {'─'*9}  {'─'*8}  {'─'*6}  {'─'*6}  {'─'*30}")
+        for _rm in ["LOW", "MEDIUM", "HIGH", "EXTREME"]:
+            _rm_trades = [t for t in trades if t.get("risk_mode_at_entry") == _rm]
+            _h4_pct    = _local_tim[_rm] / _local_tim_total * 100
+            _mult      = RISK_MODE_PARAMS.get(_rm, {}).get("risk_mult", 1.0)
+            _wk_cap    = RISK_MODE_PARAMS.get(_rm, {}).get("weekly_cap_std", 2)
+            _dd_l1     = RISK_MODE_PARAMS.get(_rm, {}).get("dd_l1_cap", 10)
+            _dd_l2     = RISK_MODE_PARAMS.get(_rm, {}).get("dd_l2_cap", 6)
+            if not _rm_trades and _h4_pct < 1:
+                continue
+            if _rm_trades:
+                _cnt  = len(_rm_trades)
+                _pct  = _cnt / len(trades) * 100
+                _avgr = sum(t["r"] for t in _rm_trades) / _cnt
+                _bestr= max(t["r"] for t in _rm_trades)
+                print(f"    {_rm:<10}  {_cnt:>4}  {_pct:>8.0f}%  {_h4_pct:>7.0f}%  "
+                      f"{_avgr:>+5.2f}R  {_bestr:>+5.2f}R  "
+                      f"mult={_mult}×  wk_cap={_wk_cap}  dd={_dd_l1}/{_dd_l2}%")
+            else:
+                print(f"    {_rm:<10}  {'—':>4}  {'—':>8}   {_h4_pct:>7.0f}%  "
+                      f"{'—':>6}  {'—':>6}  "
+                      f"mult={_mult}×  wk_cap={_wk_cap}  dd={_dd_l1}/{_dd_l2}%")
+
+    # ── Spread model summary ──────────────────────────────────────────────
+    import src.strategy.forex.strategy_config as _sc_ref
+    if _sc_ref.SPREAD_MODEL_ENABLED and trades:
+        _total_spread  = sum(t.get("spread_cost", 0.0) for t in trades)
+        _avg_spread    = _total_spread / len(trades)
+        _spread_pct_pnl = (_total_spread / abs(net_pnl) * 100) if net_pnl != 0 else 0
+        print(f"\n  ── Spread model (bid/ask round-trip) ──────────────────")
+        print(f"    Total spread drag:  ${_total_spread:>+9,.2f}  ({_spread_pct_pnl:.1f}% of gross P&L)")
+        print(f"    Avg per trade:      ${_avg_spread:>+9,.2f}")
+        _spread_by_pair = {}
+        for t in trades:
+            p = t["pair"]
+            _spread_by_pair[p] = _spread_by_pair.get(p, 0.0) + t.get("spread_cost", 0.0)
+        for _p, _sc_val in sorted(_spread_by_pair.items(), key=lambda x: -x[1]):
+            print(f"    {_p:<12}  ${_sc_val:>+7,.2f}")
+
+    print(f"\n  ── Risk controls summary ──────────────────────────────")
+    # Dollar loss range
+    _losses_dollar = sorted([t["pnl"] for t in trades if t["pnl"] < 0])
+    _max_dollar_loss = _losses_dollar[0] if _losses_dollar else 0.0
+    print(f"    Max single-trade $ loss: ${_max_dollar_loss:,.2f}")
+    print(f"    Avg loss $:              ${sum(_losses_dollar)/len(_losses_dollar):,.2f}"
+          if _losses_dollar else "    Avg loss $:              n/a")
+
+    # Worst-3-losses DD — sum of 3 biggest individual losses as % of starting balance.
+    # Answers "if these 3 hit back-to-back from start, what DD?". Useful for comparing
+    # LOW_mult variants: higher mult → bigger individual losses → higher Worst3L DD.
+    _w3 = _losses_dollar[:3]   # already sorted most-negative first
+    _w3_sum_pct = abs(sum(_w3)) / starting_bal * 100 if _w3 else 0.0
+    _w3_pnl_str = "  ".join(f"${p:,.0f}" for p in _w3) if _w3 else "n/a"
+    print(f"    Worst-3-losses DD (vs start): {_w3_sum_pct:.1f}%  [{_w3_pnl_str}]")
+
+    # DD killswitch
+    if dd_killswitch_blocks > 0:
+        print(f"    DD_KILLSWITCH blocks:    {dd_killswitch_blocks}  "
+              f"(≥{_sc.DD_KILLSWITCH_PCT:.0f}% DD — entries hard-blocked)")
+    else:
+        print(f"    DD_KILLSWITCH blocks:    0  (40% threshold never breached)")
+
+    # DD caps on entered trades
+    if _dd_cap_trades:
+        _cap_counts = Counter(t["dd_flag"] for t in _dd_cap_trades)
+        for flag, cnt in sorted(_cap_counts.items()):
+            print(f"    {flag}: {cnt} trade(s) entered at reduced risk")
+
+    # Loss streak at entry distribution
+    _streak_vals = [t.get("streak_at_entry", 0) for t in trades]
+    _streak_counts = Counter(_streak_vals)
+    _streak_capped = sum(1 for v in _streak_vals if v >= 2)
+    if max(_streak_vals, default=0) > 0:
+        print(f"    Loss-streak distribution at entry:")
+        for s in sorted(_streak_counts):
+            label = "" if s < 2 else f" ← streak cap {'6%' if s < 3 else '3%'}"
+            print(f"      streak={s}: {_streak_counts[s]} trade(s){label}")
+        if _streak_capped:
+            print(f"    Entries affected by streak brake: {_streak_capped}")
+
+    # ── 1R audit: stop_hit trades ── prove abs(pnl) ≈ entry_risk_dollars ─────
+    # Mathematical proof (JPY included): units = risk_usd/dist, pnl = dist×units = risk_usd
+    # Sizing errors and P&L conversion errors cancel exactly for all pair types.
+    # Any overrun > 1% indicates a sizing/P&L mismatch in the code.
+    _sh_trades = [t for t in trades if t.get("reason") in ("stop_hit",)
+                  and t.get("entry_risk_dollars", 0) > 0]
+    if _sh_trades:
+        print(f"\n  ── 1R audit (stop_hit trades) ──────────────────────────")
+        _overruns = []
+        for t in _sh_trades:
+            expected    = t["entry_risk_dollars"]
+            actual      = abs(t["pnl"])
+            # Spread is a legitimate cost on top of 1R — subtract it before checking
+            _sc_cost    = t.get("spread_cost", 0.0)
+            overrun     = actual - expected - _sc_cost   # residual after spread
+            overrun_pct = overrun / expected * 100 if expected else 0
+            _overruns.append((overrun_pct, t))
+        _max_op, _max_ot = max(_overruns, key=lambda x: abs(x[0]))
+        _clean = all(abs(op) < 2.0 for op, _ in _overruns)
+        print(f"    Stop-hit count:    {len(_sh_trades)}")
+        print(f"    All within ±2%:    {'✅ YES' if _clean else '❌ NO — check sizing!'}")
+        if not _clean:
+            for op, t in sorted(_overruns, key=lambda x: -abs(x[0]))[:5]:
+                print(f"      {t['pair']} {t['direction']} {t['entry_ts'][:10]}: "
+                      f"expected ${t['entry_risk_dollars']:,.0f}  "
+                      f"actual ${abs(t['pnl']):,.0f}  overrun={op:+.1f}%")
+        print(f"    Max overrun:       {_max_op:+.1f}%  "
+              f"({_max_ot['pair']} {_max_ot['entry_ts'][:10]}: "
+              f"expected ${_max_ot['entry_risk_dollars']:,.0f}  "
+              f"actual ${abs(_max_ot['pnl']):,.0f}  "
+              f"equity@entry ${_max_ot.get('entry_equity',0):,.0f}  "
+              f"rpct={_max_ot.get('final_risk_pct',0):.2f}%  "
+              f"dd_flag={_max_ot.get('dd_flag','')!r})")
+
+    # ── Alex small-account rules summary ──────────────────────────────────
+    print(f"\n  ── Alex small-account rules ─────────────────────────────────")
+    print(f"    MIN_RR_ALIGN blocks (non-protrend/mixed → 3.0R, protrend → 2.5R): {_min_rr_small_blocks}x")
+    print(f"    Weekly limit blocks (punch-card):                {_weekly_limit_blocks}x")
+    # Extract time blocks and HTF blocks from all_decisions
+    _all_blocked  = [d for d in all_decisions if d.get("decision") == "BLOCKED"]
+    _all_filters  = [f for d in all_decisions
+                     for f in (d.get("failed_filters") or []) + [d.get("event","")]]
+    _time_block_n  = sum(1 for d in all_decisions
+                         for f in (d.get("failed_filters") or [])
+                         if f in ("NO_SUNDAY_TRADES", "NO_THU_FRI_TRADES", "MONDAY_WICK_GUARD"))
+    _htf_block_n   = sum(1 for d in all_decisions
+                         for f in (d.get("failed_filters") or [])
+                         if f == "COUNTERTREND_HTF")
+    _indes_block_n = sum(1 for d in all_decisions
+                         for f in (d.get("failed_filters") or [])
+                         if f == "INDECISION_DOJI")
+    _gap_blocks    = [d for d in all_decisions if d.get("event") == "GAP"]
+    _gap_weekly    = sum(1 for d in _gap_blocks if d.get("gap_type","") == "WEEKLY_TRADE_LIMIT")
+    _gap_rr_sm     = sum(1 for d in _gap_blocks if d.get("gap_type","") == "MIN_RR_ALIGN")
+    print(f"    Time blocks (NO_SUNDAY/NO_THU_FRI):              {_time_block_n}x")
+    print(f"    HTF alignment blocks (COUNTERTREND_HTF):         {_htf_block_n}x")
+    print(f"    Indecision doji blocks (INDECISION_DOJI):        {_indes_block_n}x")
+    # Trades per week distribution
+    if _weekly_trade_counts:
+        _week_vals = sorted(_weekly_trade_counts.values())
+        _week_hist: dict = {}
+        for v in _week_vals:
+            _week_hist[v] = _week_hist.get(v, 0) + 1
+        _hist_str = "  ".join(f"{cnt}trade×{wks}wk" for cnt, wks in sorted(_week_hist.items()))
+        print(f"    Trades/week distribution:  {_hist_str}"
+              f"  (avg {sum(_week_vals)/len(_week_vals):.1f}/week  max {max(_week_vals)})")
+    # HTF alignment pass rate
+    _htf_checked = sum(1 for d in all_decisions
+                       if any(f in ("COUNTERTREND_HTF", "no_pattern", "trend_alignment")
+                              for f in (d.get("failed_filters") or [])))
+    _n_enter_raw = len([d for d in all_decisions if d.get("decision") == "ENTER"])
+    if (_n_enter_raw + _htf_block_n) > 0:
+        _htf_pass_rate = _n_enter_raw / (_n_enter_raw + _htf_block_n) * 100
+        print(f"    HTF alignment pass rate:   {_htf_pass_rate:.0f}%"
+              f"  ({_n_enter_raw} passed / {_htf_block_n} blocked by HTF gate)")
+
+    # ── Funnel: rejection reasons from WAIT decisions ─────────────────
+    _wait_decisions = [d for d in all_decisions if d.get("decision") == "WAIT"]
+    _wait_reasons   = [
+        f for d in _wait_decisions
+        for f in d.get("failed_filters", [])
+        if f
+    ]
+    _n_wait = len(set((d["ts"], d["pair"]) for d in _wait_decisions))
+    _n_enter = len([d for d in all_decisions if d.get("decision") == "ENTER"])
+    print(f"\n  ── Entry funnel ({_n_enter} entered / {_n_wait} unique setups blocked) ─────")
+    if _wait_reasons:
+        for reason, count in Counter(_wait_reasons).most_common(15):
+            print(f"    {reason:<45} {count:>5}x")
+    else:
+        print("    (no WAIT reasons recorded — check failed_filters population)")
+
+    # exec_rr_min breakdown: which candidate type was the bottleneck
+    _rr_blocked = [d for d in _wait_decisions if "exec_rr_min" in d.get("failed_filters", [])]
+    if _rr_blocked:
+        import re as _re
+        _cand_fail_types: list = []
+        for d in _rr_blocked:
+            # Parse "Tried: 4h_structure=1.20R (rr_too_low); measured_move=0.80R (rr_too_low)"
+            for m in _re.finditer(r'(\w+)=([\d.]+)R \((\w+)\)', d.get("reason", "")):
+                _cand_fail_types.append(f"{m.group(1)}:{m.group(3)}")
+        if _cand_fail_types:
+            print(f"\n  ── exec_rr_min detail ({len(_rr_blocked)} blocks, MIN_RR={_sc.MIN_RR}) ──────────")
+            for ct, cnt in Counter(_cand_fail_types).most_common():
+                print(f"    {ct:<40} {cnt:>5}x")
 
     print(f"\n  Trade log:")
     for t in trades:
@@ -1143,11 +2444,26 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
     except Exception:
         _commit, _dirty = "unknown", False
 
+    # ── Pairs hash — reproducibility fingerprint ──────────────────────────
+    import hashlib as _hl
+    _active_pairs  = sorted(candle_data.keys())
+    _pairs_hash    = _hl.md5(",".join(_active_pairs).encode()).hexdigest()[:6]
+
     _result_record = {
         "run_dt":       datetime.now(timezone.utc).isoformat(),
         "commit":       _commit + ("-dirty" if _dirty else ""),
         "notes":        notes,
-        "model_tags":   _sc.get_model_tags(),   # reads live module state → captures lever overrides
+        # model_tags: all active levers + trail arm + pairs fingerprint.
+        # Always a list[str] — never contains dicts or None (defensive str() cast
+        # inside get_model_tags guarantees this).
+        "model_tags":   _sc.get_model_tags(trail_arm=trail_arm_key or "?",
+                                           pairs_hash=_pairs_hash)
+                        + ([f"policy={policy_tag}"]       if policy_tag else [])
+                        + ([f"risk={flat_risk_pct:.0f}pct"] if flat_risk_pct else [])
+                        + ([f"forced_mode={force_risk_mode}"] if force_risk_mode else []),
+        "trail_arm":    trail_arm_key or "?",
+        "pairs":        _active_pairs,
+        "pairs_hash":   _pairs_hash,
         "window_start": start_dt.isoformat(),
         "window_end":   (end_dt or datetime.now(timezone.utc)).isoformat(),
         "config": {
@@ -1156,10 +2472,11 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             "ATR_STOP_MULTIPLIER":               _sc.ATR_STOP_MULTIPLIER,
             "MIN_CONFIDENCE":                    _sc.MIN_CONFIDENCE,
             "MIN_RR":                            _sc.MIN_RR,
-            "MAX_CONCURRENT_TRADES":             _sc.MAX_CONCURRENT_TRADES,
+            "MAX_CONCURRENT_TRADES_BACKTEST":    _sc.MAX_CONCURRENT_TRADES_BACKTEST,
+            "MAX_CONCURRENT_TRADES_LIVE":        _sc.MAX_CONCURRENT_TRADES_LIVE,
             "BLOCK_ENTRY_WHILE_WINNER_RUNNING":  _sc.BLOCK_ENTRY_WHILE_WINNER_RUNNING,
             "WINNER_THRESHOLD_R":                _sc.WINNER_THRESHOLD_R,
-            "ENGULFING_ONLY":                    _sc.ENGULFING_ONLY,
+            "ENTRY_TRIGGER_MODE":                _sc.ENTRY_TRIGGER_MODE,
             "LEVEL_ALLOW_FINE_INCREMENT":        _sc.LEVEL_ALLOW_FINE_INCREMENT,
             "STRUCTURAL_LEVEL_MIN_SCORE":        _sc.STRUCTURAL_LEVEL_MIN_SCORE,
             "ALLOW_BREAK_RETEST":                _sc.ALLOW_BREAK_RETEST,
@@ -1167,6 +2484,24 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
             "OVEREXTENSION_THRESHOLD":           _sc.OVEREXTENSION_THRESHOLD,
             "ALLOW_TIER3_REVERSALS":             _sc.ALLOW_TIER3_REVERSALS,
             "REQUIRE_THEME_GATE":                _sc.REQUIRE_THEME_GATE,
+            # Alex small-account gates
+            "NO_SUNDAY_TRADES_ENABLED":          _sc.NO_SUNDAY_TRADES_ENABLED,
+            "NO_THU_FRI_TRADES_ENABLED":         _sc.NO_THU_FRI_TRADES_ENABLED,
+            "REQUIRE_HTF_TREND_ALIGNMENT":       _sc.REQUIRE_HTF_TREND_ALIGNMENT,
+            "MAX_TRADES_PER_WEEK_SMALL":         _sc.MAX_TRADES_PER_WEEK_SMALL,
+            "MAX_TRADES_PER_WEEK_STANDARD":      _sc.MAX_TRADES_PER_WEEK_STANDARD,
+            "MIN_RR_ALIGN":              _sc.MIN_RR_SMALL_ACCOUNT,
+            "MIN_RR_STANDARD":                   _sc.MIN_RR_STANDARD,
+            "INDECISION_FILTER_ENABLED":         _sc.INDECISION_FILTER_ENABLED,
+            # Extra run_backtest param gates (not in strategy_config)
+            "adaptive_gates":                    adaptive_gates,
+            "adaptive_threshold":                adaptive_threshold,
+            "strict_protrend_htf":               strict_protrend_htf,
+            "wd_protrend_htf":                   wd_protrend_htf,
+            "dynamic_pip_equity":                dynamic_pip_equity,
+            "policy_tag":                        policy_tag,
+            "force_risk_mode":                   force_risk_mode,
+            "streak_demotion_thresh":             streak_demotion_thresh,
         },
         "results": {
             "n_trades":   len(trades),
@@ -1179,17 +2514,24 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         },
         "trades": [
             {
-                "pair":        t["pair"],
-                "direction":   t["direction"],
-                "entry":       t["entry"],
-                "exit":        t["exit"],
-                "r":           round(t["r"], 2),
-                "pnl":         round(t["pnl"], 2),
-                "reason":      t["reason"],
-                "pattern":     t.get("pattern", ""),
-                "macro_theme": t.get("macro_theme", ""),
-                "entry_ts":    t.get("entry_ts", ""),
-                "exit_ts":     t.get("exit_ts", ""),
+                "pair":                  t["pair"],
+                "direction":             t["direction"],
+                "entry":                 t["entry"],
+                "exit":                  t["exit"],
+                "r":                     round(t["r"], 2),
+                "pnl":                   round(t["pnl"], 2),
+                "reason":                t["reason"],
+                "pattern":               t.get("pattern", ""),
+                "macro_theme":           t.get("macro_theme", ""),
+                "entry_ts":              t.get("entry_ts", ""),
+                "exit_ts":               t.get("exit_ts", ""),
+                # Risk mode audit (added 2026-02-28 — always present from now on)
+                "risk_mode_at_entry":    t.get("risk_mode_at_entry", "MEDIUM"),
+                "entry_risk_dollars":    round(t.get("entry_risk_dollars", 0), 2),
+                "base_risk_pct":         round(t.get("base_risk_pct", 0), 4),
+                "final_risk_pct":        round(t.get("final_risk_pct", 0), 4),
+                "entry_equity":          round(t.get("entry_equity", 0), 2),
+                "streak_at_entry":       t.get("streak_at_entry", 0),
             }
             for t in trades
         ],
@@ -1209,11 +2551,28 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
 
     print(f"  Results log:  {_results_log}  [{_commit}{'-dirty' if _dirty else ''}]")
 
+    # ── Compact comparison line (useful when diffing mult variants) ────────
+    try:
+        _cmp_low_n  = sum(1 for m in _rm_at_entry if m == "LOW")
+        _cmp_med_n  = sum(1 for m in _rm_at_entry if m == "MEDIUM")
+        _cmp_high_n = sum(1 for m in _rm_at_entry if m == "HIGH")
+        _cmp_ext_n  = sum(1 for m in _rm_at_entry if m == "EXTREME")
+        _low_m = RISK_MODE_PARAMS["LOW"]["risk_mult"]
+        print(f"\n  ▶ SUMMARY  low_mult={_low_m}×"
+              f"  ret={ret_pct:+.1f}%  maxDD={_max_dd_pct:.1f}%"
+              f"  worst3L={_w3_sum_pct:.1f}%"
+              f"  LOW={_cmp_low_n}  MED={_cmp_med_n}"
+              f"  HIGH={_cmp_high_n}  EXT={_cmp_ext_n}")
+    except Exception:
+        pass  # compact summary is optional — never crash the run
+
     # ── Auto-run miss analyzer on Alex window ─────────────────────────
     # Only fires when running the Jul 15 – Oct 31 2024 window so we
     # always get an up-to-date Alex vs bot scorecard.
     _is_alex_window = (
-        str(args.start)[:7] == "2024-07" and str(args.end)[:7] == "2024-10"
+        start_dt.strftime("%Y-%m")[:7] == "2024-07"
+        and end_dt is not None
+        and end_dt.strftime("%Y-%m")[:7] == "2024-10"
     )
     if _is_alex_window:
         try:
@@ -1223,7 +2582,85 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None, s
         except Exception as _me:
             print(f"  [miss analyzer error: {_me}]")
 
-    return trades, balance, gap_log
+    # ── Return result dict (used by multi-arm comparison) ─────────────
+    _wins   = [t for t in trades if t["r"] >  0.10]
+    _losses = [t for t in trades if t["r"] < -0.10]
+    _ec     = Counter(t["reason"] for t in trades)
+    _rrs    = sorted([t.get("planned_rr", 0) for t in trades if t.get("planned_rr", 0) > 0])
+
+    _regime_scores = [t.get("regime_score_at_entry", 0.0) for t in trades]
+
+    # ── Risk mode distribution (% of TRADES entered in each mode) ────────
+    # _tim_counts / _tim_pct_* already computed above in the print section
+    _rm_vals = [t.get("risk_mode_at_entry", "MEDIUM") for t in trades]
+    _n = len(trades) or 1
+    _rm_pct_low     = sum(1 for m in _rm_vals if m == "LOW")     / _n * 100
+    _rm_pct_medium  = sum(1 for m in _rm_vals if m == "MEDIUM")  / _n * 100
+    _rm_pct_high    = sum(1 for m in _rm_vals if m == "HIGH")    / _n * 100
+    _rm_pct_extreme = sum(1 for m in _rm_vals if m == "EXTREME") / _n * 100
+
+    return BacktestResult(
+        # ── Core performance (canonical names) ───────────────────────
+        return_pct     = (balance - starting_bal) / starting_bal * 100,
+        max_dd_pct     = _max_dd_pct,
+        win_rate       = len(_wins) / len(trades) if trades else 0,
+        avg_r          = sum(t["r"] for t in trades) / len(trades) if trades else 0,
+        best_r         = max((t["r"] for t in trades), default=0),
+        worst_r        = min((t["r"] for t in trades), default=0),
+        n_trades       = len(trades),
+        balance        = balance,
+        # ── Trade breakdown ───────────────────────────────────────────
+        avg_r_win      = sum(t["r"] for t in _wins)   / len(_wins)   if _wins   else 0,
+        avg_r_loss     = sum(t["r"] for t in _losses) / len(_losses) if _losses else 0,
+        n_target       = _ec.get("target_reached", 0) + _ec.get("weekend_proximity", 0),
+        n_ratchet      = _ec.get("ratchet_stop_hit", 0),
+        n_sl           = _ec.get("stop_hit", 0),
+        exec_rr_p50    = _rrs[len(_rrs) // 2] if _rrs else 0,
+        max_dollar_loss= min((t["pnl"] for t in trades), default=0.0),
+        # ── Gate hit counts (all 6 Alex rules + adaptive) ────────────
+        time_blocks              = _time_block_n,
+        countertrend_htf_blocks  = _htf_block_n,
+        weekly_limit_blocks      = _weekly_limit_blocks,
+        min_rr_small_blocks      = _min_rr_small_blocks,
+        indecision_doji_blocks   = _indes_block_n,
+        dd_killswitch_blocks     = dd_killswitch_blocks,
+        adaptive_time_blocks     = _adaptive_time_blocks,
+        strict_htf_blocks        = _strict_htf_blocks,
+        wd_htf_blocks            = _wd_htf_blocks,
+        dyn_pip_eq_blocks        = _dyn_pip_eq_blocks,
+        wd_alignment_pct         = (_wd_aligned_entries / len(trades) * 100
+                                    if trades else 0.0),
+        # ── Stop quality ──────────────────────────────────────────────
+        stop_type_counts         = dict(_stop_types),
+        atr_fallback_pct         = _atr_fb_pct,
+        stop_pips_p50            = _sp_p50,
+        # ── Regime analytics ─────────────────────────────────────────
+        regime_scores      = _regime_scores,
+        regime_avg         = sum(_regime_scores) / len(_regime_scores) if _regime_scores else 0.0,
+        regime_pct_high    = (sum(1 for s in _regime_scores if s >= 3.0)
+                              / len(_regime_scores) * 100 if _regime_scores else 0.0),
+        regime_pct_extreme = (sum(1 for s in _regime_scores if s >= 3.5)
+                              / len(_regime_scores) * 100 if _regime_scores else 0.0),
+        # ── Risk mode: % of trades in each mode ──────────────────────
+        risk_mode_pct_low     = _rm_pct_low,
+        risk_mode_pct_medium  = _rm_pct_medium,
+        risk_mode_pct_high    = _rm_pct_high,
+        risk_mode_pct_extreme = _rm_pct_extreme,
+        # ── Risk mode: % of calendar time in each mode ───────────────
+        time_in_mode_pct_low     = _tim_pct_low,
+        time_in_mode_pct_medium  = _tim_pct_medium,
+        time_in_mode_pct_high    = _tim_pct_high,
+        time_in_mode_pct_extreme = _tim_pct_extreme,
+        # ── Profiling ────────────────────────────────────────────────
+        api_calls     = _api_call_count,
+        eval_calls    = _eval_calls,
+        eval_ms_avg   = (_eval_ms / _eval_calls) if _eval_calls else 0.0,
+        # ── Raw lists ────────────────────────────────────────────────
+        trades         = trades,
+        trades_per_week= dict(_weekly_trade_counts),
+        gap_log        = gap_log,
+        candle_data    = candle_data,
+    )
 
 
 if __name__ == "__main__":
@@ -1257,6 +2694,42 @@ Examples:
                         help="Override a strategy_config lever (e.g. --lever MIN_CONFIDENCE=0.70)")
     parser.add_argument("--news-filter", action="store_true", default=False,
                         help="Enable historical news filter (CSV from data/news/). Alex never used this.")
+    parser.add_argument("--arm",   default="A",
+                        help="Trail arm: A | B | C | all  (default: A). "
+                             "A=activate1R trail0.5R  B=activate1.5R  C=2-stage 2R+3R")
+    parser.add_argument("--cache", action="store_true", default=False,
+                        help="No-op (kept for backward compat). Cache is ON by default. "
+                             "Use --no-cache to disable.")
+    parser.add_argument("--no-cache", action="store_true", default=False,
+                        help="Disable per-pair disk cache — always fetch from OANDA. "
+                             f"Cache dir: {CACHE_DIR}")
+    parser.add_argument("--max-trades", type=int, default=None,
+                        help="Override MAX_CONCURRENT_TRADES_BACKTEST. Default=1 (parity with live). "
+                             "Values >1 are tagged EXPERIMENTAL in results — never use as baseline.")
+    parser.add_argument("--timing", action="store_true", default=False,
+                        help="Print performance stats after each run: total bars, evaluate() calls, "
+                             "avg ms per call, total runtime.")
+    parser.add_argument("--protrend-only", action="store_true", default=False,
+                        help="Gate entries: require Weekly AND Daily bias to agree with trade direction. "
+                             "4H is exempt (Alex enters during 4H retracements). "
+                             "Wires PROTREND_ONLY=True. Use for W2 regime vs bug diagnostic.")
+    parser.add_argument("--force-mode", default=None,
+                        metavar="MODE",
+                        help="Pin risk mode for every entry: LOW | MEDIUM | HIGH | EXTREME. "
+                             "None = AUTO (compute dynamically per entry — default). "
+                             "Use for mode comparison runs.")
+    parser.add_argument("--low-mult", type=float, default=None,
+                        metavar="MULT",
+                        help="Override LOW risk-mode risk_mult (default 0.5). "
+                             "e.g. --low-mult 0.7 to reduce drag vs MEDIUM in bad markets. "
+                             "Only applies in AUTO mode when entries fall into LOW mode.")
+    parser.add_argument("--demote-after-losses", type=int, default=None,
+                        metavar="N",
+                        dest="demote_after_losses",
+                        help="Consecutive losses needed to flip streak_clear=False (default 1). "
+                             "1=current: any single loss demotes score; "
+                             "2=relax: need 2+ losses; keeps 1-loss trades in MEDIUM not LOW. "
+                             "Only affects mode assignment — HIGH gate uses loss_streak<=1 unchanged.")
     args = parser.parse_args()
 
     # ── Window shortcuts ──────────────────────────────────────────────────────
@@ -1299,6 +2772,21 @@ Examples:
     start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end   = datetime.strptime(args.end,   "%Y-%m-%d").replace(tzinfo=timezone.utc) if args.end else None
 
+    # ── LOW multiplier override ────────────────────────────────────────────────
+    # Patches RISK_MODE_PARAMS["LOW"]["risk_mult"] for this run only.
+    # Allows quantifying drag/protection tradeoff without touching source constants.
+    if args.low_mult is not None:
+        _low_mult_val = round(float(args.low_mult), 3)
+        RISK_MODE_PARAMS["LOW"]["risk_mult"] = _low_mult_val
+        print(f"  ⚡ LOW risk_mult overridden → {_low_mult_val}×  (default: 0.5×)")
+
+    # ── Streak demotion threshold override ────────────────────────────────────
+    # Controls how many consecutive losses flip streak_clear=False in compute_risk_mode.
+    # 1 (default): any loss → LOW eligible; 2: need 2+ losses → 1-loss stays MEDIUM.
+    _streak_demote_thresh = int(args.demote_after_losses) if args.demote_after_losses is not None else 1
+    if args.demote_after_losses is not None:
+        print(f"  ⚡ streak_demotion_thresh overridden → {_streak_demote_thresh}  (default: 1)")
+
     # Build notes string that captures any lever overrides
     notes = args.notes
     extra = []
@@ -1308,7 +2796,116 @@ Examples:
         extra.append(f"profile={args.profile}")
     if args.lever:
         extra.extend(args.lever)
+    if args.low_mult is not None:
+        extra.append(f"low_mult={args.low_mult}")
+    if args.demote_after_losses is not None:
+        extra.append(f"demote_after={_streak_demote_thresh}")
     if extra:
         notes = (notes + " [levers: " + ", ".join(extra) + "]").strip()
 
-    run_backtest(start_dt=start, end_dt=end, starting_bal=args.balance, notes=notes)
+    # ── Validate --arm ────────────────────────────────────────────────────────
+    _arm_arg = args.arm.upper()
+    if _arm_arg not in ("A", "B", "C", "ALL"):
+        parser.error(f"--arm must be A | B | C | all, got '{args.arm}'")
+    _arms_to_run = list(TRAIL_ARMS.keys()) if _arm_arg == "ALL" else [_arm_arg]
+
+    # ── Cache mode ────────────────────────────────────────────────────────────
+    _use_cache = not getattr(args, "no_cache", False)
+    if not _use_cache:
+        print("  ⚠ Cache disabled (--no-cache) — all data fetched from OANDA")
+
+    # ── Concurrency override (EXPERIMENTAL) ───────────────────────────────────
+    # Default = 1 (parity with live). --max-trades N lets you test multi-position
+    # behaviour explicitly. Any run with N > 1 is tagged EXPERIMENTAL in results
+    # so it can never be confused with a parity baseline.
+    _max_trades_override = getattr(args, "max_trades", None)
+    if _max_trades_override is not None:
+        if _max_trades_override < 1:
+            parser.error("--max-trades must be ≥ 1")
+        _sc.apply_levers({"MAX_CONCURRENT_TRADES_BACKTEST": _max_trades_override})
+        if _max_trades_override > 1:
+            _exp_tag = f"EXPERIMENTAL:max_trades={_max_trades_override}"
+            notes = (f"{_exp_tag} " + notes).strip()
+            print(f"  ⚠ EXPERIMENTAL: MAX_CONCURRENT_TRADES_BACKTEST={_max_trades_override} "
+                  f"(default=1, parity with live). Tagged in results.")
+        else:
+            print(f"  ✓ MAX_CONCURRENT_TRADES_BACKTEST={_max_trades_override} (explicit parity)")
+
+    # ── Run arms ──────────────────────────────────────────────────────────────
+    # For multi-arm runs, candle data is fetched once then shared in-memory
+    # across subsequent arms via preloaded_candle_data — no redundant I/O.
+    _arm_results: dict = {}
+    _shared_candles: Optional[dict] = None   # populated after first arm's fetch
+
+    for _arm_key in _arms_to_run:
+        _tcfg      = TRAIL_ARMS[_arm_key]
+        _arm_notes = f"{notes} [arm={_arm_key}]".strip()
+
+        _t_run = time.perf_counter()
+        _protrend_flag = getattr(args, "protrend_only", False)
+        _force_mode_raw = getattr(args, "force_mode", None)
+        _force_mode = _force_mode_raw.upper() if _force_mode_raw else None
+        if _force_mode and _force_mode not in ("LOW", "MEDIUM", "HIGH", "EXTREME"):
+            parser.error(f"--force-mode must be LOW|MEDIUM|HIGH|EXTREME, got '{_force_mode_raw}'")
+        result = run_backtest(
+            start_dt=start, end_dt=end, starting_bal=args.balance,
+            notes=_arm_notes, trail_cfg=_tcfg, trail_arm_key=_arm_key,
+            preloaded_candle_data=_shared_candles,
+            use_cache=_use_cache,
+            wd_protrend_htf=_protrend_flag,
+            force_risk_mode=_force_mode,
+            streak_demotion_thresh=_streak_demote_thresh,
+        )
+        _t_run_elapsed = time.perf_counter() - _t_run
+
+        if args.timing and result:
+            _ec  = result.get("eval_calls", 0)
+            _ems = result.get("eval_ms_avg", 0)
+            _ac  = result.get("api_calls", 0)
+            print(f"\n  ── Timing ──────────────────────────────────────────")
+            print(f"    Total runtime:        {_t_run_elapsed:.1f}s")
+            print(f"    evaluate() calls:     {_ec:,}")
+            print(f"    avg ms / evaluate():  {_ems:.2f} ms")
+            print(f"    OANDA API calls:      {_ac}")
+            _n_pairs = len(result.get("candle_data", {}))
+            print(f"    Pairs simulated:      {_n_pairs}")
+
+        # Share candle data from first arm with all subsequent arms in-process.
+        # Bypasses cache overhead entirely for arms 2+ in a single run.
+        if _shared_candles is None and result is not None:
+            _shared_candles = result.get("candle_data")
+
+        if result:
+            _arm_results[_arm_key] = result
+
+    # ── Multi-arm comparison table ────────────────────────────────────────────
+    if len(_arm_results) > 1:
+        print(f"\n{'='*75}")
+        print("MULTI-ARM COMPARISON SUMMARY")
+        print(f"{'='*75}")
+        hdr = f"{'Metric':<28}" + "".join(f"{'Arm '+k:>14}" for k in _arm_results)
+        print(hdr)
+        print("-" * len(hdr))
+
+        def _row(label, key, fmt=lambda x: str(x)):
+            vals = [_arm_results[k].get(key) for k in _arm_results]
+            row = f"  {label:<26}" + "".join(
+                f"{fmt(v) if v is not None else 'n/a':>14}" for v in vals
+            )
+            print(row)
+
+        _row("Trades",        "n_trades",      lambda x: str(x))
+        _row("Win rate",      "win_rate",       lambda x: f"{x:.0%}")
+        _row("Avg R",         "avg_r",          lambda x: f"{x:+.2f}R")
+        _row("Best R",        "best_r",         lambda x: f"{x:+.1f}R")
+        _row("Avg win R",     "avg_r_win",      lambda x: f"{x:+.2f}R")
+        _row("Avg loss R",    "avg_r_loss",     lambda x: f"{x:+.2f}R")
+        _row("Target reached","n_target",       lambda x: str(x))
+        _row("Ratchet stops", "n_ratchet",      lambda x: str(x))
+        _row("Stop hits",     "n_sl",           lambda x: str(x))
+        _row("Exec RR p50",   "exec_rr_p50",    lambda x: f"{x:.1f}R")
+        _row("Max DD",             "max_dd",                lambda x: f"{x:.1f}%")
+        _row("Return",             "ret_pct",               lambda x: f"{x:+.1f}%")
+        _row("Kill-switch blocks", "dd_killswitch_blocks",  lambda x: str(x))
+        _row("Max $ loss",         "max_dollar_loss",       lambda x: f"${x:,.0f}")
+        print(f"{'='*75}")

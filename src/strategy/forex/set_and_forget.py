@@ -27,6 +27,79 @@ from .session_filter import SessionFilter
 from .level_detector import LevelDetector, KeyLevel
 from .pattern_detector import PatternDetector, PatternResult, Trend
 from .entry_signal import EntrySignalDetector, EntrySignal
+from .targeting import select_target, find_next_structure_level, get_structure_stop
+
+
+class _TFBarCache:
+    """
+    Per-strategy instance cache for expensive per-TF computations.
+
+    detect_all() and detect_trend() are O(n_bars) and called inside
+    evaluate() — but daily/4H/weekly context only changes when a new
+    bar closes on that timeframe, not every H1 bar.
+
+    Cache invalidation: keyed on len(df) for each TF. When the slice
+    length hasn't changed (no new bar on that TF), cached results are
+    returned directly — no recomputation.
+
+    Expected speedup on Alex window (Jul 15–Oct 31 2024, 7 pairs):
+      detect_all(daily)  : 4,320 → 180 calls  (24× reduction)
+      detect_all(4h)     : 4,320 → 1,080 calls (4× reduction)
+      detect_trend(daily): 4,320 → 180 calls
+      detect_trend(4h)   : 4,320 → 1,080 calls
+      detect_trend(weekly): 4,320 → 26 calls
+    Net: ~8× speedup on cached operations which dominate runtime.
+    """
+    __slots__ = (
+        "daily_len", "h4_len", "weekly_len",
+        "trend_w", "trend_d", "trend_4h",
+        "ema21", "ema50",
+        "ext_z", "ext_high", "ext_low",
+        "patterns_daily", "patterns_4h",
+    )
+
+    def __init__(self):
+        self.daily_len:   int = -1
+        self.h4_len:      int = -1
+        self.weekly_len:  int = -1
+        self.trend_w           = None
+        self.trend_d           = None
+        self.trend_4h          = None
+        self.ema21:       float = 0.0
+        self.ema50:       float = 0.0
+        self.ext_z:       float = 0.0
+        self.ext_high:    bool  = False
+        self.ext_low:     bool  = False
+        self.patterns_daily: list = []
+        self.patterns_4h:    list = []
+
+    def refresh(self, df_daily: pd.DataFrame, df_4h: pd.DataFrame,
+                df_weekly: pd.DataFrame, detector: "PatternDetector",
+                price_extension_fn) -> None:
+        """Refresh any TF whose slice length has grown since last call."""
+        d_len  = len(df_daily)
+        h4_len = len(df_4h)
+        w_len  = len(df_weekly)
+
+        if d_len != self.daily_len and d_len > 0:
+            self.trend_d        = detector.detect_trend(df_daily)
+            self.patterns_daily = detector.detect_all(df_daily)
+            if d_len >= 50:
+                _closes = df_daily["close"].values
+                _ser = pd.Series(_closes)
+                self.ema21 = float(_ser.ewm(span=21, adjust=False).mean().iloc[-1])
+                self.ema50 = float(_ser.ewm(span=50, adjust=False).mean().iloc[-1])
+            self.ext_z, self.ext_high, self.ext_low = price_extension_fn(df_daily)
+            self.daily_len = d_len
+
+        if h4_len != self.h4_len and h4_len > 0:
+            self.trend_4h    = detector.detect_trend(df_4h)
+            self.patterns_4h = detector.detect_all(df_4h)
+            self.h4_len = h4_len
+
+        if w_len != self.weekly_len and w_len > 0:
+            self.trend_w    = detector.detect_trend(df_weekly)
+            self.weekly_len = w_len
 from . import strategy_config as _cfg   # module-ref import so apply_levers() patches propagate
 
 logger = logging.getLogger(__name__)
@@ -52,6 +125,11 @@ class TradeDecision:
     stop_loss: Optional[float]   = None
     target_1: Optional[float]    = None
     target_2: Optional[float]    = None
+    exec_target: Optional[float] = None   # final TP chosen by select_target() — backtester uses this verbatim
+    exec_rr: float               = 0.0    # R:R to exec_target — must be ≥ MIN_RR to enter
+    exec_target_type: str        = ""     # "4h_structure" | "measured_move" | "measured_move_t2"
+    stop_type: str               = ""     # "structural_anchor" | "retest_swing" | "atr_fallback" | "legacy_pattern_stop"
+    initial_stop_pips: float     = 0.0    # stop distance in pips at entry — fixed for R accounting even after BE move
     risk_pct: Optional[float]    = None   # % of account to risk
     lot_size: Optional[float]    = None
 
@@ -183,6 +261,23 @@ class SetAndForgetStrategy:
         # that same formation is exhausted — don't trade it again even if it re-forms.
         self.NECKLINE_CLUSTER_PCT: float = 0.003   # 0.3% — merges nearby necklines into one bucket
         self.traded_patterns: Dict[str, str] = {}
+
+        # Signal deduplication — block re-firing ENTER for the same setup on
+        # every bar.  Key: (pair, pattern_type, rounded_neckline, direction)
+        # Value: last-seen pandas Timestamp (or None).
+        # DUPLICATE_SIGNAL fires if the same key was last generated < DEDUP_HOURS ago.
+        # This stops "15 bars in a row at USD/CAD IH&S 1.40" spam.
+        self.DEDUP_HOURS: int = 6          # 6 hours = 6 bars on 1H data
+        self._recent_enter_ts: Dict[str, object] = {}    # key → pd.Timestamp
+
+        # TF bar cache — reuse detect_all/detect_trend/EMA results across H1
+        # bars when the higher-TF slice hasn't grown.  See _TFBarCache docstring.
+        self._tf_cache = _TFBarCache()
+
+        # Level-detect cache — level_detector.detect(df_daily, level) is O(n)
+        # on df_daily and only changes when a new daily bar appears or the
+        # queried level changes.  Cache key: (len(df_daily), rounded_level).
+        self._level_cache: dict = {}
 
     def update_balance(self, balance: float):
         self.account_balance = balance
@@ -552,13 +647,17 @@ class SetAndForgetStrategy:
         # ─────────────────────────────────────────────
         entry_allowed, session_reason = self.session_filter.is_entry_allowed(current_dt)
         if not entry_allowed:
+            # Use the specific reason code prefix (before ": ") so the
+            # backtester's time-block counter can match "NO_THU_FRI_TRADES",
+            # "NO_SUNDAY_TRADES", "MONDAY_WICK_GUARD", "LOW_QUALITY_SESSION".
+            _session_code = session_reason.split(":")[0].strip()
             return TradeDecision(
                 decision=Decision.BLOCKED,
                 pair=pair,
                 direction=None,
                 reason=f"Session blocked: {session_reason}",
                 confidence=0.0,
-                failed_filters=["session"],
+                failed_filters=[_session_code],
             )
 
         session, session_quality = self.session_filter.session_quality(current_dt)
@@ -617,9 +716,21 @@ class SetAndForgetStrategy:
         # Block only when there is no evidence of reversal on EITHER
         # the daily OR 4H — pure trend continuation with no pattern signal.
         # ─────────────────────────────────────────────
-        trend_w = self.pattern_detector.detect_trend(df_weekly)
-        trend_d = self.pattern_detector.detect_trend(df_daily)
-        trend_4 = self.pattern_detector.detect_trend(df_4h)
+
+        # ── TF bar cache refresh ──────────────────────────────────────────
+        # detect_all + detect_trend + EMA are O(n_bars) on the full TF slice.
+        # Re-run only when the slice length grew (new D/4H/W bar closed).
+        # Across 4,320 H1 bars this cuts daily detect_all from 4,320 → 180
+        # calls and 4H from 4,320 → 1,080 — ~8× overall speedup.
+        self._tf_cache.refresh(
+            df_daily, df_4h, df_weekly,
+            self.pattern_detector, self._price_extension,
+        )
+        _c = self._tf_cache
+
+        trend_w = _c.trend_w if _c.trend_w is not None else Trend.NEUTRAL
+        trend_d = _c.trend_d if _c.trend_d is not None else Trend.NEUTRAL
+        trend_4 = _c.trend_4h if _c.trend_4h is not None else Trend.NEUTRAL
 
         w_bullish = trend_w in (Trend.BULLISH, Trend.STRONG_BULLISH)
         w_bearish = trend_w in (Trend.BEARISH, Trend.STRONG_BEARISH)
@@ -660,20 +771,15 @@ class SetAndForgetStrategy:
         # EMA + price extension — pre-calculate for use in scoring below
         # ─────────────────────────────────────────────────────────────────
         _ema_confluence = False
-        _ema21 = _ema50 = 0.0
+        _ema21 = _c.ema21   # cached — recomputed only when daily bar advances
+        _ema50 = _c.ema50
         if len(df_daily) >= 50:
-            _closes_d = df_daily["close"].values
-            _ema21 = float(pd.Series(_closes_d).ewm(span=21, adjust=False).mean().iloc[-1])
-            _ema50 = float(pd.Series(_closes_d).ewm(span=50, adjust=False).mean().iloc[-1])
             _near_ema21 = abs(current_price - _ema21) / current_price < 0.005
             _near_ema50 = abs(current_price - _ema50) / current_price < 0.005
             _ema_confluence = _near_ema21 or _near_ema50
 
-        # Price extension Z-score — how far is current price from 1-year mean?
-        # Used in _mtf_context() to hard-block wrong-direction trades at extremes
-        # and add a confidence bonus to correct-direction trades (e.g., short
-        # at Z>2 = price at extreme high = ideal reversal short setup).
-        _ext_z, _ext_high, _ext_low = self._price_extension(df_daily)
+        # Price extension Z-score — cached; refreshed once per new daily bar
+        _ext_z, _ext_high, _ext_low = _c.ext_z, _c.ext_high, _c.ext_low
 
         # ─────────────────────────────────────────────────────────────────
         # FILTER 3: Pattern detection — PATTERN SETS DIRECTION
@@ -709,8 +815,8 @@ class SetAndForgetStrategy:
         #   PARTIAL ALIGNMENT (-3% adj): mixed signals, some confirmation
         # ─────────────────────────────────────────────────────────────────
 
-        # Build pattern list from daily (primary source — larger stops, clearer structure)
-        patterns_daily = self.pattern_detector.detect_all(df_daily)
+        # Build pattern list from daily — use cache (recomputed only on new daily bar)
+        patterns_daily = list(_c.patterns_daily)   # list() — downstream code appends 4H patterns
 
         # ── 4H patterns — ALSO valid entries per Alex's actual trades ────────
         # Alex's GBP/JPY Week 1 trade: H&S on 4H, daily only provided context.
@@ -724,7 +830,7 @@ class SetAndForgetStrategy:
         mtf_confluence: dict = {}
         if len(df_4h) >= 30:
             _4h_structural = [
-                p for p in self.pattern_detector.detect_all(df_4h)
+                p for p in _c.patterns_4h   # cached; refreshed only on new 4H bar
                 if 'sweep' not in p.pattern_type
                 and any(k in p.pattern_type for k in
                         ('head_and_shoulders', 'double_top', 'double_bottom',
@@ -937,6 +1043,23 @@ class SetAndForgetStrategy:
                 if is_long and _w_neutral:
                     return True, 0.0 + _ext_bonus, False
 
+            # ── TIER 3.5: D1 soft veto (D1_VETO_ONLY_STRONG_OPPOSITE lever) ──
+            # For structural reversal patterns at psych levels: if weekly is
+            # opposing but D1 is only MILDLY trending against us (not STRONG),
+            # allow the entry with a larger confidence penalty.
+            # Rationale: a double top at 205 with weekly=bullish + daily=bullish
+            # (but not STRONG_BULLISH) is a valid reversal — the pattern IS the
+            # signal. Only hard-veto when D1 is fresh, strongly opposite momentum.
+            # Controlled by D1_VETO_ONLY_STRONG_OPPOSITE lever (default True).
+            if is_reversal_type and _cfg.D1_VETO_ONLY_STRONG_OPPOSITE:
+                d1_strongly_opposite = (
+                    (is_short and trend_d == Trend.STRONG_BULLISH) or
+                    (is_long  and trend_d == Trend.STRONG_BEARISH)
+                )
+                if not d1_strongly_opposite:
+                    # Mildly opposing daily — allow with larger penalty (-10% conf adj)
+                    return True, -0.10 + _ext_bonus, True
+
             # ── BLOCK: insufficient context for all other cases ────────────
             return False, 0.0, False
 
@@ -1043,6 +1166,47 @@ class SetAndForgetStrategy:
             )
 
         # ─────────────────────────────────────────────
+        # FILTER 3.5: HTF trend alignment gate
+        # When REQUIRE_HTF_TREND_ALIGNMENT=True, require ALL of weekly/daily/4H
+        # to be non-opposing.  "Opposing" = strongly trending against direction.
+        #
+        # Alex rule: "don't fight the tape on ALL timeframes at once."
+        # Counter-trend is OK when at confirmed extremes — but if W+D+4H are ALL
+        # bullish on a SHORT entry, the trade lacks any institutional backing.
+        #
+        # Gate:  direction == 'short' AND all 3 HTFs are BULLISH → block
+        #        direction == 'long'  AND all 3 HTFs are BEARISH → block
+        # (Strict 3-of-3 consensus avoids blocking counter-trend-at-extreme setups
+        #  where weekly drove price to resistance but D/4H are already rolling over.)
+        # ─────────────────────────────────────────────
+        if _cfg.REQUIRE_HTF_TREND_ALIGNMENT and trade_direction is not None:
+            _is_short = (trade_direction == 'short')
+            _is_long  = (trade_direction == 'long')
+            _all_bullish = w_bullish and d_bullish and h4_bullish
+            _all_bearish = w_bearish and d_bearish and h4_bearish
+            _htf_blocked = (_is_short and _all_bullish) or (_is_long and _all_bearish)
+            if _htf_blocked:
+                _htf_dir = "bullish" if _all_bullish else "bearish"
+                failed_filters.append("COUNTERTREND_HTF")
+                return TradeDecision(
+                    decision=Decision.WAIT,
+                    pair=pair,
+                    direction=trade_direction,
+                    reason=(
+                        f"COUNTERTREND_HTF: pattern says {trade_direction} "
+                        f"but ALL 3 HTFs are {_htf_dir} "
+                        f"(W={trend_w.value} D={trend_d.value} 4H={trend_4.value}). "
+                        f"Not taking a trade against full-stack HTF consensus."
+                    ),
+                    confidence=0.10,
+                    failed_filters=["COUNTERTREND_HTF"],
+                    pattern=matching_pattern,
+                    trend_weekly=trend_w,
+                    trend_daily=trend_d,
+                    trend_4h=trend_4,
+                )
+
+        # ─────────────────────────────────────────────
         # FILTER 4: Key level validation — Round Number OR Structural Level
         #
         # Alex's level hierarchy (from his strategy notes, highest priority first):
@@ -1058,7 +1222,14 @@ class SetAndForgetStrategy:
         # levels — so we just check whether ANY detected level is near
         # the pattern's structural price.
         # ─────────────────────────────────────────────
-        levels = self.level_detector.detect(df_daily, matching_pattern.pattern_level, pair=pair)
+        # Cache level detection — result depends only on df_daily length and
+        # the queried pattern level.  Invalidated automatically when daily bar
+        # advances (len changes) or a different level is queried.
+        _lk = (len(df_daily), round(matching_pattern.pattern_level or 0, 6))
+        if _lk not in self._level_cache:
+            self._level_cache[_lk] = self.level_detector.detect(
+                df_daily, matching_pattern.pattern_level, pair=pair)
+        levels = self._level_cache[_lk]
 
         # Check round number first (fast path, no level detection needed)
         pattern_at_round_number = (
@@ -1207,6 +1378,60 @@ class SetAndForgetStrategy:
                 )
 
         # ─────────────────────────────────────────────
+        # FILTER 4.5: Zone touch gate
+        # Price must have wicked into the zone (within ATR tolerance of the
+        # neckline) in the last ZONE_TOUCH_LOOKBACK_BARS 1H candles.
+        # Prevents engulfing candles that fire far away from the actual level.
+        # Tolerance: 0.35×ATR for majors, 0.50×ATR for crosses.
+        # ─────────────────────────────────────────────
+        if _cfg.ZONE_REQUIRE_TOUCH and len(df_1h) >= 15:
+            _h1_h = df_1h['high'].values
+            _h1_l = df_1h['low'].values
+            _h1_c = df_1h['close'].values
+            _tr   = np.maximum(
+                _h1_h[-14:] - _h1_l[-14:],
+                np.maximum(
+                    np.abs(_h1_h[-14:] - _h1_c[-15:-1]),
+                    np.abs(_h1_l[-14:] - _h1_c[-15:-1]),
+                ),
+            )
+            _atr_1h = float(np.mean(_tr)) if len(_tr) > 0 else None
+
+            if _atr_1h and _atr_1h > 0:
+                _pair_ccys  = pair.replace("_", "/").split("/")
+                _is_cross   = "USD" not in _pair_ccys
+                _zone_mult  = _cfg.ZONE_TOUCH_ATR_MULT_CROSS if _is_cross else _cfg.ZONE_TOUCH_ATR_MULT
+                _zone_tol   = _atr_1h * _zone_mult
+                _level      = matching_pattern.neckline
+                _lookback   = min(_cfg.ZONE_TOUCH_LOOKBACK_BARS, len(df_1h))
+                _recent     = df_1h.iloc[-_lookback:]
+                _touched    = any(
+                    row['low']  <= _level + _zone_tol and
+                    row['high'] >= _level - _zone_tol
+                    for _, row in _recent.iterrows()
+                )
+                if not _touched:
+                    pip = 0.01 if "JPY" in pair else 0.0001
+                    failed_filters.append("no_zone_touch")
+                    return TradeDecision(
+                        decision=Decision.WAIT,
+                        pair=pair,
+                        direction=trade_direction,
+                        reason=(
+                            f"No zone touch in last {_lookback} bars: price not within "
+                            f"{_zone_tol/pip:.0f}p of neckline {_level:.5f} "
+                            f"(tol={_zone_mult:.2f}×ATR={_atr_1h/pip:.0f}p). "
+                            f"Wait for price to reach the level."
+                        ),
+                        confidence=0.15,
+                        failed_filters=failed_filters,
+                        pattern=matching_pattern,
+                        trend_weekly=trend_w,
+                        trend_daily=trend_d,
+                        trend_4h=trend_4,
+                    )
+
+        # ─────────────────────────────────────────────
         # FILTER 5: Engulfing candle — THE PATIENCE FILTER
         # THE most critical check. No signal = NO ENTRY. Ever.
         #
@@ -1214,7 +1439,15 @@ class SetAndForgetStrategy:
         # A 200-pip NFP spike looks like a perfect engulfing candle.
         # It isn't. It's a data release — not tradeable price action.
         # ─────────────────────────────────────────────
-        has_signal, signal = self.signal_detector.has_signal(df_1h, trade_direction)
+        # Level for at-level confirmation modes: prefer neckline, fall back to pattern_level
+        _signal_level = float(
+            matching_pattern.neckline
+            if getattr(matching_pattern, "neckline", None)
+            else matching_pattern.pattern_level or 0.0
+        )
+        has_signal, signal, _sig_reason = self.signal_detector.has_signal(
+            df_1h, trade_direction, level=_signal_level,
+        )
 
         # Check if the triggering candle is a news candle — if so, treat as no signal
         if has_signal and signal and len(df_1h) > 0:
@@ -1247,15 +1480,23 @@ class SetAndForgetStrategy:
              'inverted_head_and_shoulders', 'consolidation_breakout',
              'tweezer_top', 'tweezer_bottom', 'evening_star', 'morning_star'))
         if (not has_signal or signal is None) and _is_reversal_pattern and len(df_4h) >= 2:
-            has_signal_4h, signal_4h = self.signal_detector.has_signal(df_4h, trade_direction)
+            has_signal_4h, signal_4h, _sig_reason_4h = self.signal_detector.has_signal(
+                df_4h, trade_direction, level=_signal_level,
+            )
             if has_signal_4h and signal_4h:
                 signal_4h.signal_type = signal_4h.signal_type + '_4h'
                 has_signal = True
                 signal = signal_4h
+            else:
+                # Combine 1H + 4H reason codes for diagnostics
+                if _sig_reason_4h and _sig_reason_4h not in _sig_reason:
+                    _sig_reason = f"{_sig_reason}|{_sig_reason_4h}"
 
         if not has_signal or signal is None:
             # Setup is valid but we're waiting for the candle
             # This is the correct state 90% of the time
+            if _sig_reason:
+                failed_filters.append(_sig_reason)
             _level_str = (
                 f"level {nearest_level.price:.5f} (score={nearest_level.score})"
                 if nearest_level else
@@ -1267,10 +1508,11 @@ class SetAndForgetStrategy:
                 direction=trade_direction,
                 reason=(
                     f"Setup ACTIVE — {matching_pattern.pattern_type} at {_level_str}. "
-                    f"Trend aligned. WAITING FOR ENGULFING CANDLE. Do not enter without it."
+                    f"Trend aligned. WAITING FOR TRIGGER [{_sig_reason or 'NO_TRIGGER'}]. "
+                    f"No entry without engulfing or qualifying pin bar."
                 ),
                 confidence=0.70,
-                failed_filters=["awaiting_entry_signal"],
+                failed_filters=[_sig_reason or "awaiting_entry_signal"],
                 nearest_level=nearest_level,
                 pattern=matching_pattern,
                 trend_weekly=trend_w,
@@ -1328,6 +1570,37 @@ class SetAndForgetStrategy:
             level=nearest_level,
             pattern=matching_pattern,
         )
+
+        # ── Structure-based stop (replaces wide ATR/tol*N stop from pattern_detector) ──
+        # get_structure_stop() uses pattern.stop_anchor (the raw structural extreme
+        # stored by the pattern detector) + a tight pip buffer (3p majors / 5p crosses).
+        # Tighter stop → higher exec_rr for the same measured move → MIN_RR gate passes.
+        _is_jpy        = "JPY" in pair.upper()
+        _is_usd_cross  = "USD" not in pair.replace("_", "/").split("/")
+        _pip_size      = 0.01 if _is_jpy else 0.0001
+        _stop_log: list = []
+        _struct_stop, _stop_type, _stop_pips = get_structure_stop(
+            pattern_type     = matching_pattern.pattern_type,
+            direction        = trade_direction,
+            entry            = entry_price,
+            df_1h            = df_1h,
+            pattern          = matching_pattern,
+            pip_size         = _pip_size,
+            is_jpy_or_cross  = _is_jpy or _is_usd_cross,
+            atr_fallback_mult = 3.0,
+            stop_log         = _stop_log,
+        )
+        if _struct_stop != stop_loss:
+            stop_loss = _struct_stop
+            # Recompute lot_size with the new (tighter) stop
+            _risk_dollars = self.account_balance * (self.risk_pct / 100)
+            _risk_per_pip = abs(entry_price - stop_loss)
+            if _risk_per_pip > 0:
+                _risk_pips = _risk_per_pip * (100 if _is_jpy else 10000)
+                lot_size   = max(0.01, round(_risk_dollars / max(_risk_pips * 10, 0.01), 2))
+            else:
+                lot_size = 0.01
+        _stop_selected = next((e["type"] for e in _stop_log if "STOP_SELECTED" in e.get("action","")), _stop_type)
 
         # Final confidence score
         # Components:
@@ -1406,36 +1679,64 @@ class SetAndForgetStrategy:
                           f"{_effective_risk_pct:.1f}% risk each)")
 
         risk_dollars = self.account_balance * (_effective_risk_pct / 100)
-        # For consolidation_breakout: measured T1 = 1× range, stop = range + buffer.
-        # R:R at T1 ≈ 0.57 (always <1.0 by construction). Alex runs these for 2-3×
-        # the range minimum — use T2 (2× measured move) as the R:R quality reference.
-        _rr_target = (
-            target_2
-            if 'consolidation_breakout' in matching_pattern.pattern_type
-            else target_1
+        # ── Shared target selection + exec RR gate ────────────────────────────
+        # Uses targeting.select_target() — same function as the backtester.
+        # This is the single source of truth: strategy and backtester always
+        # choose the same target and apply the same RR gate. No more divergence.
+        #
+        # Candidate priority (Alex's method first):
+        #   1. Nearest 4H swing structure level  ("next 4-hour low/high")
+        #   2. Pattern measured move T1           (geometric fallback)
+        #   3. Pattern measured move T2           (CB patterns only)
+        #
+        # Wrong-side sanity is inside select_target() — SHORT target must be
+        # < entry, LONG target must be > entry. Fixes the Wk3 direction bug class.
+        _4h_cutoff  = df_1h.index[-1] if len(df_1h) > 0 else None
+        _4h_hist    = (df_4h[df_4h.index < _4h_cutoff]
+                       if df_4h is not None and _4h_cutoff is not None and len(df_4h) > 0
+                       else pd.DataFrame())
+        _struct_tgt = find_next_structure_level(
+            _4h_hist, trade_direction, neckline_ref or entry_price
         )
-        rr_1 = abs(entry_price - _rr_target) / max(abs(entry_price - stop_loss), 0.000001)
 
-        # ── Minimum R:R quality gate ───────────────────────────────────────
-        # If the pattern's measured move (T1 amplitude) is less than MIN_RR× the
-        # stop distance, the pattern is geometrically weak — either stop is
-        # too wide or the measured move is tiny. Both are quality failures.
-        # Alex's trades all had measured moves well beyond their stop distances.
-        # 1:0.4 R:R (like AUD/CAD IH&S Jul 2024) = clear junk setup.
-        # Controlled by MIN_RR lever in strategy_config (default 1.0).
-        if rr_1 < _cfg.MIN_RR:
+        _tgt_candidates = []
+        if _struct_tgt:
+            _tgt_candidates.append((_struct_tgt, "4h_structure"))
+        if target_1:
+            _tgt_candidates.append((target_1, "measured_move"))
+        if target_2:
+            _tgt_candidates.append((target_2, "measured_move_t2"))
+
+        _tgt_rejected: list = []
+        _exec_target, _exec_target_type, _exec_rr = select_target(
+            direction=trade_direction,
+            entry=entry_price,
+            stop=stop_loss,
+            candidates=_tgt_candidates,
+            min_rr=_cfg.MIN_RR,
+            rejected_log=_tgt_rejected,
+        )
+
+        if _exec_target is None:
+            _rejected_detail = "; ".join(
+                f"{r['type']}={r['rr']:.2f}R ({r['reason']})"
+                for r in _tgt_rejected
+            ) or "no candidates"
             return TradeDecision(
                 decision=Decision.WAIT,
                 pair=pair,
                 direction=trade_direction,
                 reason=(
-                    f"R:R too low ({rr_1:.2f} < {_cfg.MIN_RR:.1f} minimum). "
-                    f"Pattern amplitude too small vs stop distance. "
-                    f"{matching_pattern.pattern_type.upper()} at {entry_price:.5f} "
-                    f"SL={stop_loss:.5f} T1={target_1:.5f}"
+                    f"exec_rr_min: no qualifying target ≥ {_cfg.MIN_RR}R. "
+                    f"Tried: {_rejected_detail}"
                 ),
-                confidence=confidence * 0.5,
-                failed_filters=["rr_minimum"],
+                confidence=confidence * 0.4,
+                failed_filters=["exec_rr_min"],
+                nearest_level=nearest_level,
+                pattern=matching_pattern,
+                trend_weekly=trend_w,
+                trend_daily=trend_d,
+                trend_4h=trend_4,
             )
 
         _level_desc = (
@@ -1443,6 +1744,44 @@ class SetAndForgetStrategy:
             if nearest_level else
             f"Round number {matching_pattern.pattern_level:.5f}"
         )
+
+        # ── Signal deduplication gate ─────────────────────────────────────────
+        # Prevents the same pattern from firing ENTER on every bar while waiting
+        # for a position to open. E.g. USD/CAD IH&S at 1.40 would otherwise
+        # generate 15 consecutive ENTER decisions. Block if the same
+        # (pair, pattern_type, neckline, direction) was generated < DEDUP_HOURS ago.
+        import pandas as _pd
+        _dedup_key = (
+            f"{pair}|{matching_pattern.pattern_type}"
+            f"|{round(neckline_ref or matching_pattern.neckline, 3)}"
+            f"|{trade_direction}"
+        )
+        _now_ts    = df_1h.index[-1] if len(df_1h) > 0 else None
+        _last_ts   = self._recent_enter_ts.get(_dedup_key)
+        if (_now_ts is not None and _last_ts is not None):
+            try:
+                _elapsed_h = (_now_ts - _last_ts).total_seconds() / 3600
+            except Exception:
+                _elapsed_h = 999
+            if _elapsed_h < self.DEDUP_HOURS:
+                return TradeDecision(
+                    decision=Decision.WAIT,
+                    pair=pair,
+                    direction=trade_direction,
+                    reason=(
+                        f"DUPLICATE_SIGNAL: {matching_pattern.pattern_type.upper()} at "
+                        f"{neckline_ref or matching_pattern.neckline:.5f} last fired "
+                        f"{_elapsed_h:.1f}h ago (< {self.DEDUP_HOURS}h dedup window). "
+                        f"One entry per setup."
+                    ),
+                    confidence=0.0,
+                    failed_filters=["duplicate_signal"],
+                    nearest_level=nearest_level,
+                    pattern=matching_pattern,
+                )
+        # Record this as the last ENTER fire time for this setup
+        if _now_ts is not None:
+            self._recent_enter_ts[_dedup_key] = _now_ts
 
         return TradeDecision(
             decision=Decision.ENTER,
@@ -1455,7 +1794,8 @@ class SetAndForgetStrategy:
                 f"{signal.signal_type} (strength={signal.strength:.2f}) | "
                 f"Trend: W={trend_w.value} D={trend_d.value} 4H={trend_4.value} | "
                 f"Session: {session} | "
-                f"R:R (T1) = 1:{rr_1:.1f} | "
+                f"R:R ({_exec_target_type}) = 1:{_exec_rr:.1f} | "
+                f"Stop: {_stop_selected} {_stop_pips:.0f}p | "
                 f"Risk: ${risk_dollars:.2f}"
                 + (f" | Confirm: {', '.join(_secondary['labels'])}" if _secondary['labels'] else "")
                 + f"{_macro_note}"
@@ -1465,6 +1805,11 @@ class SetAndForgetStrategy:
             stop_loss=stop_loss,
             target_1=target_1,
             target_2=target_2,
+            exec_target=_exec_target,
+            exec_rr=_exec_rr,
+            exec_target_type=_exec_target_type,
+            stop_type=_stop_selected,
+            initial_stop_pips=_stop_pips,
             risk_pct=_effective_risk_pct,
             lot_size=lot_size,
             nearest_level=nearest_level,
@@ -1489,12 +1834,16 @@ class SetAndForgetStrategy:
     ):
         """Call this when a trade is actually opened."""
         self.open_positions[pair] = {
-            'entry':        entry_price,
-            'stop':         stop_loss,
-            'direction':    direction,
-            'pattern_type': pattern_type,   # stored so we can mark exhausted on close
-            'neckline_ref': neckline_ref,   # stored so we can mark exhausted on close
-            'risk_pct':     risk_pct or 0.0,  # stored for book exposure tracking
+            'entry':         entry_price,
+            'stop':          stop_loss,
+            'direction':     direction,
+            'pattern_type':  pattern_type,   # stored so we can mark exhausted on close
+            'neckline_ref':  neckline_ref,   # stored so we can mark exhausted on close
+            'risk_pct':      risk_pct or 0.0,  # stored for book exposure tracking
+            # Trail Arm C fields — used by position_monitor for two-stage ratchet
+            'initial_risk':  abs(entry_price - stop_loss),  # stop dist at entry (price)
+            'trail_max':     entry_price,    # running most-favourable price seen
+            'trail_locked':  False,          # True once Stage-1 lock fires (at 2R MFE)
         }
         logger.info(
             f"Position opened: {pair} {direction} at {entry_price:.5f} "

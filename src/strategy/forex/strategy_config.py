@@ -29,6 +29,7 @@ Or load a named profile:
 apply_levers(overrides) patches module globals at runtime so that
 set_and_forget.py (which imports this module by reference) sees the changes.
 """
+import os
 import sys as _sys
 
 # ── Signal quality gates ───────────────────────────────────────────────────
@@ -52,7 +53,49 @@ TARGET_PROXIMITY_PIPS: float = 15.0
 # Minimum R:R ratio based on pattern amplitude vs stop distance.
 # Not a take-profit target — geometric quality check only.
 # Blocks patterns where the measured move is smaller than the stop.
-MIN_RR: float = 1.0
+MIN_RR: float = 2.5   # minimum exec R:R — select_target() rejects any candidate below this
+
+# ── Small-account / Alex money-game rules ─────────────────────────────────
+# Alex treats equity < $25K as "money game" — capital preservation is the
+# primary objective.  Dollar caps become primary; percent caps secondary.
+# Equity ≥ $25K flips back to percent-cap-primary mode.
+#
+# These constants drive the backtester and live risk manager; all gates
+# log their reason codes for funnel reporting.
+SMALL_ACCOUNT_THRESHOLD:  float = 25_000.0   # USD equity boundary
+MIN_RR_STANDARD:          float = 2.5        # pro-trend baseline (W+D+4H all agree)
+# ── PROD CONFIG LOCKED: Arm D (2026-02-26) ──────────────────────────────────
+# Dynamic 3.0R non-protrend gate removed — net negative in W1 (kills +5.80R
+# winner, doubles DD 13→30%). Both pro-trend and non-protrend use flat 2.5R.
+# select_target() already guarantees exec_rr ≥ MIN_RR before entry; this alias
+# being equal to MIN_RR makes check_dynamic_min_rr() a no-op gate (always pass).
+MIN_RR_COUNTERTREND:      float = MIN_RR     # Arm D: flat 2.5R — no protrend penalty
+MIN_RR_SMALL_ACCOUNT:     float = MIN_RR_COUNTERTREND  # legacy alias — kept for compat
+
+# Weekly punch-card behaviour — Alex: "pretend you only have 2 trades per month"
+# Implementation: per-calendar-week cap (ISO week).
+MAX_TRADES_PER_WEEK_SMALL:    int = 1   # equity < SMALL_ACCOUNT_THRESHOLD
+MAX_TRADES_PER_WEEK_STANDARD: int = 2   # equity ≥ SMALL_ACCOUNT_THRESHOLD
+
+# HTF trend alignment — require ALL of weekly/daily/4H to agree with direction.
+# When True, block counter-trend entries with reason COUNTERTREND_HTF.
+# NOTE: Alex trades counter-trend at extremes; set False to preserve his style.
+# Default True here for measurement; production default may differ after backtests.
+REQUIRE_HTF_TREND_ALIGNMENT:  bool = True
+
+# Pro-trend-only entry gate (W2 diagnostic / LOW risk-mode behavior).
+# When True: require Weekly AND Daily bias to agree with trade direction.
+# 4H is exempt — Alex often enters during 4H retracements.
+# The existing HTF countertrend block (all W+D+4H oppose) remains active.
+# Default False (Alex's full counter-trend style is preserved).
+PROTREND_ONLY:  bool = False
+
+# Time-based session rules (Alex: "no Thu/Fri, not worth the spread")
+# NO_SUNDAY_TRADES: block all of Sunday (forex wick creation period)
+# NO_THU_FRI_TRADES: block Thu from 09:00 ET onward and all Friday
+NO_SUNDAY_TRADES_ENABLED:    bool = True
+NO_THU_FRI_TRADES_ENABLED:   bool = True
+THU_ENTRY_CUTOFF_HOUR_ET:     int  = 9   # 9:00 AM ET = start of block on Thu
 
 # ── ATR stop filter ────────────────────────────────────────────────────────
 # Stop must be ≤ ATR_STOP_MULTIPLIER × 14-day ATR.
@@ -70,9 +113,28 @@ ATR_MIN_MULTIPLIER: float = 0.15
 ATR_LOOKBACK: int = 14
 
 # ── Concurrency limits ─────────────────────────────────────────────────────
-# Maximum simultaneous open positions (non-theme trades).
-# Macro theme stacking bypasses this — 4 JPY shorts = 1 theme = allowed.
-MAX_CONCURRENT_TRADES: int = 4   # Alex runs 4+ simultaneous set-and-forget positions
+# PARITY RULE: backtest must mirror live. Default = 1 for both.
+# Changing BACKTEST without changing LIVE produces meaningless comparisons —
+# different exposure, different compounding, different drawdown paths.
+#
+#   MAX_CONCURRENT_TRADES_LIVE     — orchestrator + risk_manager (real account).
+#   MAX_CONCURRENT_TRADES_BACKTEST — backtester default. Must equal LIVE.
+#
+# Want to test multi-position behaviour? Use the CLI flag --max-trades N
+# in oanda_backtest_v2.py. Those runs are tagged EXPERIMENTAL in results
+# and notes so they're never confused with parity runs.
+#
+# Note on Alex: he runs 4+ simultaneous positions in his challenge. That's
+# irrelevant here — this bot is designed around 1 position at a time by
+# explicit choice (simple rules, clear attribution, matches live constraints
+# at $4K–$30K account size). Alex's multi-position behaviour is documented
+# for reference only; it is NOT the default operating mode.
+#
+# Macro theme stacking (JPY/CHF carry) is a separate concept — handled by
+# STACK_MAX in currency_strength.py and always bypasses this cap.
+MAX_CONCURRENT_TRADES_LIVE:     int = 1   # live — one position at a time
+MAX_CONCURRENT_TRADES_BACKTEST: int = 1   # backtest — must equal live (parity rule)
+MAX_CONCURRENT_TRADES:          int = MAX_CONCURRENT_TRADES_LIVE  # alias
 
 # ── Alex's confirmed watchlist (extracted from first video screenshot) ─────────
 # Only evaluate pairs on this list. Anything else is outside Alex's universe.
@@ -109,29 +171,72 @@ ALLOWED_PAIRS: frozenset = frozenset({
 # No exceptions for high-confidence setups — the whole point is simplicity.
 BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = False
 
-# ── Entry signal quality ────────────────────────────────────────────────────
-# Alex's rule: "No engulfing candle = no trade." Every video.
-# ENGULFING_ONLY=True: only bearish_engulfing / bullish_engulfing trigger entry.
-# ENGULFING_ONLY=False: also allows pin bars that meet PIN_BAR_* spec below.
+# ── Entry trigger mode ─────────────────────────────────────────────────────
+# Controls which 1H candlestick pattern is accepted as an entry trigger.
 #
-# Why False now: Alex uses pin rejections on retests, especially at clean round
-# levels. Keeping engulf-only biases the sample by undertrading retests where
-# price wicks through the level and snaps back — a very common Alex entry.
-# The pin bar spec below is intentionally tight to avoid opening the floodgates.
-ENGULFING_ONLY: bool = False
+#   "engulf_only"   — only bearish/bullish engulfing closes.
+#                     Alex's stated rule in every video: "No engulfing candle =
+#                     no trade." Confirmed as the #1 filter that separates his
+#                     real trades from near-misses. Production default.
+#
+#   "engulf_or_pin" — also allows tight pin bars meeting the strict spec below.
+#                     Use for research runs to measure whether pin-bar retest
+#                     rejections add independent edge, not as a prod default.
+#                     Backtest tag: "pin_bars_allowed"
+#
+# To compare: run backtester with ENTRY_TRIGGER_MODE overridden per arm.
+# Never change this to "engulf_or_pin" in production without data supporting it.
+ENTRY_TRIGGER_MODE: str = "engulf_only"
+# Valid modes (sourced from Alex's confirmed "daily driver" confirmations):
+#   "engulf_only"                         — baseline: engulfing only (Alex #1 rule)
+#   "engulf_or_pin"                       — engulfing OR loose pin bar
+#   "engulf_or_star_at_level"             — engulfing OR Morning/Evening Star at tested level
+#   "engulf_or_strict_pin_at_level"       — engulfing OR strict hammer/shooting star at level
+#   "engulf_or_star_or_strict_pin_at_level" — all three at-level confirmations
+# PRODUCTION DEFAULT: engulf_only.  Do NOT change without backtest support.
+
+# Backward-compatible derived flag — all existing call sites work unchanged.
+# Do not set ENGULFING_ONLY directly; change ENTRY_TRIGGER_MODE instead.
+ENGULFING_ONLY: bool = (ENTRY_TRIGGER_MODE == "engulf_only")
 
 # ── Pin bar entry spec ─────────────────────────────────────────────────────
-# Only active when ENGULFING_ONLY=False.
-# Tight spec prevents noise pin bars from triggering entries:
-#   1. Rejection wick must be ≥ PIN_BAR_MIN_WICK_BODY_RATIO × body size
-#   2. Close must be in the outer PIN_BAR_CLOSE_OUTER_PCT of candle range
-#      in the trade direction (bearish pin: close near bottom; long pin: near top)
-#   3. Candle must have wicked into the zone (verified in set_and_forget zone check)
-#
-# Alex pin bar examples: USD/JPY retest of 157.5 — wick poked through, closed
-# clean back on sell side. Classic rejection. Body was ~20% of range.
+# Only active when ENTRY_TRIGGER_MODE == "engulf_or_pin".
 PIN_BAR_MIN_WICK_BODY_RATIO: float = 2.0   # wick ≥ 2× body
 PIN_BAR_CLOSE_OUTER_PCT:     float = 0.30  # close in outer 30% (trade-direction end)
+
+# ── At-level candle confirmation spec ─────────────────────────────────────
+# Governs Morning/Evening Star and Strict Hammer/Shooting Star modes.
+# ALL of the following are only valid when price has RECENTLY TESTED the level.
+#
+# Level-touch check:  retest zone is the last LEVEL_TOUCH_H1_BARS H1 bars.
+# "5 M15 bars" ≈ 75 min ≈ 1-2 H1 bars; we use 5 H1 bars as conservative window.
+LEVEL_TOUCH_H1_BARS:        int   = 5       # how many recent H1 bars to check for level touch
+LEVEL_TOUCH_TOLERANCE_PCT:  float = 0.0015  # price within 0.15% of level = "touched"
+
+# Morning/Evening Star thresholds
+STAR_BAR1_MIN_BODY_PCT:     float = 0.45    # bar-1 body ≥ 45% of its range (large candle)
+STAR_BAR2_MAX_BODY_PCT:     float = 0.30    # bar-2 body ≤ 30% of its range (small star)
+STAR_BAR3_MIN_BODY_PCT:     float = 0.40    # bar-3 body ≥ 40% of its range (confirmation)
+STAR_BAR3_MIDPOINT_CLOSE:   float = 0.50    # bar-3 close must pass mid of bar-1 by this fraction
+
+# Strict Hammer / Shooting Star thresholds (stricter than regular pin bar)
+STRICT_HAMMER_WICK_BODY_RATIO:     float = 3.0   # rejection wick ≥ 3× body (vs 2× for pin)
+STRICT_HAMMER_CLOSE_OUTER_PCT:     float = 0.35  # close in outer 35% of range
+STRICT_HAMMER_MAX_OPPOSITE_PCT:    float = 0.10  # opposite wick ≤ 10% of range
+STRICT_HAMMER_MAX_BODY_RANGE_PCT:  float = 0.25  # body ≤ 25% of range (not a big candle)
+
+# ── Doji / Indecision candle filter ───────────────────────────────────────
+# Blocks entries where the TRIGGER CANDLE is an indecision candle.
+# Objective definition (from transcript): body ≤ 15% of range AND
+# both upper AND lower wicks ≥ 35% of range (classic doji / spinning top).
+#
+# Exception: Morning/Evening Star — bar2 (the "star") MAY be indecision;
+# bar3 (the final confirmation) must still pass.
+#
+# Set INDECISION_FILTER_ENABLED=False to disable globally (backtest comparison).
+INDECISION_FILTER_ENABLED:      bool  = True
+INDECISION_MAX_BODY_RATIO:      float = 0.15   # body ≤ 15% of range → tiny body
+INDECISION_MIN_WICK_RATIO:      float = 0.35   # both wicks ≥ 35% → long-legged
 
 # Unrealized-R threshold that defines a "winner running."
 # A position must be THIS many R's in profit RIGHT NOW (at current price)
@@ -196,6 +301,24 @@ NECKLINE_CLUSTER_PCT: float = 0.003
 # Used for risk sizing, kill-switch math, and P&L tracking.
 # Set this to the capital you intend to fund with.
 DRY_RUN_PAPER_BALANCE: float = 8_000.0
+
+# ── Account mode + paper equity ────────────────────────────────────────────
+# ACCOUNT_MODE: "LIVE_PAPER" | "LIVE_REAL"
+#   LIVE_PAPER  live pricing feed, simulated equity, no broker orders placed.
+#   LIVE_REAL   real OANDA orders; equity pulled from broker every tick.
+#
+# SIM_STARTING_EQUITY
+#   Seed balance for LIVE_PAPER on first run (when no paper_account.json exists).
+#   Ignored in LIVE_REAL.  Never used as a fallback for unknown broker equity.
+ACCOUNT_MODE:         str   = os.getenv("ACCOUNT_MODE",         "LIVE_PAPER")
+SIM_STARTING_EQUITY:  float = float(os.getenv("SIM_STARTING_EQUITY", "8000.0"))
+
+# ── Backtest candle cache ──────────────────────────────────────────────────
+# Version string baked into every per-pair/TF cache filename.
+# Bump this to v2, v3 etc. to invalidate all on-disk caches globally
+# (e.g. after changing OANDA price_type, instrument mapping, or TF set).
+# Cache dir: ~/.cache/forge_backtester/
+CACHE_VERSION: str = "v1"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -305,6 +428,93 @@ DD_L1_CAP: float = 10.0    # max risk % when DD ≥ L1
 DD_L2_PCT: float = 25.0    # second cap threshold (harder brake)
 DD_L2_CAP: float = 6.0     # max risk % when DD ≥ L2
 DD_RESUME_PCT: float = 0.95 # equity must recover to 95% of peak to lift the cap
+
+# ── DD Kill-switch (hard block, not just throttle) ────────────────────────
+# When DD ≥ DD_KILLSWITCH_PCT from peak, get_risk_pct_with_dd() returns
+# (0.0, "DD_KILLSWITCH") — the caller MUST block the new entry entirely.
+# This is deterministic: any call after breaching this threshold is blocked
+# until equity recovers above DD_RESUME_PCT × peak.
+DD_KILLSWITCH_PCT: float = 40.0   # hard no-new-entries threshold
+
+# ── Absolute dollar risk cap ─────────────────────────────────────────────
+# Prevents "same % → much bigger $ at high equity" compounding blowups.
+# Applied after all % caps: final_pct = min(final_pct, max_dollar/balance×100)
+# Format: list of (equity_threshold, max_dollar_risk) — last entry is the cap
+# for any equity above the previous threshold.
+#   equity < $25K  → no dollar cap (% caps are sufficient)
+#   $25K–$100K     → cap at $2,500 per trade
+#   > $100K        → cap at $5,000 per trade
+DOLLAR_RISK_CAP_ENABLED: bool = True
+DOLLAR_RISK_TIERS: list = [
+    (25_000,       None),    # below $25K: no dollar cap, % tiers dominate
+    (100_000,      2_500),   # $25K–$100K: max $2,500 at risk per trade
+    (float("inf"), 5_000),   # > $100K: max $5,000 at risk per trade
+]
+
+# ── Loss-streak brake ─────────────────────────────────────────────────────
+# After N consecutive losses, cap risk until a win resets the streak.
+# Targets the variance tail: 4+ loss clusters compound badly at high equity.
+#   2 consecutive losses → cap at STREAK_L2_CAP (6%)
+#   3+ consecutive losses → cap at STREAK_L3_CAP (3%)
+# Streak resets on any winning trade.  Applied AFTER DD caps.
+LOSS_STREAK_BRAKE_ENABLED: bool = True
+STREAK_L2_LOSSES: int   = 2     # streak length for L2 brake
+STREAK_L2_CAP:    float = 6.0   # cap at 6% after 2 consecutive losses
+STREAK_L3_LOSSES: int   = 3     # streak length for L3 brake
+STREAK_L3_CAP:    float = 3.0   # cap at 3% after 3+ consecutive losses
+
+# ── Spread model (backtester only) ───────────────────────────────────────
+# Models bid/ask spread cost as a round-turn deduction from each trade's P&L.
+# The backtester uses mid-price candles; real OANDA orders fill at ask (longs)
+# or bid (shorts).  Round-turn cost = spread_pips on entry + spread_pips on exit
+# = 2 × half_spread.  For v1 we apply the full round-turn as a P&L deduction
+# at close (conservative and simple).
+#
+# Spreads in pips (typical OANDA practice account values):
+#   Majors (EUR/USD, GBP/USD, USD/JPY, USD/CHF, USD/CAD):  ~1.0–2.0 pips
+#   JPY crosses (GBP/JPY, EUR/JPY):                         ~2.5–4.0 pips
+#   Other crosses (GBP/CHF, EUR/CHF, etc.):                 ~3.0–5.0 pips
+SPREAD_MODEL_ENABLED: bool = True
+
+# Per-pair round-trip spread in pips.  Missing pairs fall back to SPREAD_DEFAULT_PIPS.
+SPREAD_PIPS: dict = {
+    "EUR/USD": 1.0,
+    "GBP/USD": 1.5,
+    "USD/JPY": 1.2,
+    "USD/CHF": 2.0,
+    "USD/CAD": 2.0,
+    "GBP/JPY": 3.0,
+    "EUR/JPY": 2.5,
+    "GBP/CHF": 4.5,
+    "EUR/CHF": 3.5,
+    "AUD/USD": 1.5,
+    "NZD/USD": 2.0,
+    "AUD/JPY": 3.0,
+    "EUR/AUD": 3.5,
+    "EUR/CAD": 3.0,
+    "GBP/AUD": 5.0,
+    "GBP/CAD": 5.0,
+    "NZD/JPY": 3.5,
+    "AUD/CAD": 3.5,
+    "AUD/NZD": 3.0,
+}
+SPREAD_DEFAULT_PIPS: float = 3.0   # fallback for unlisted pairs
+
+# ── One-way ratchet trailing stop ─────────────────────────────────────────
+# Option B: replaces hard breakeven lock at 1:1.
+# When price moves TRAIL_ACTIVATE_R in our favour, the stop trails
+# TRAIL_DIST_R behind the running max-favourable price (never moves backward).
+#
+# Example (default 1R activate, 0.5R trail distance):
+#   MFE=0.9R  → stop stays at initial stop (not activated yet)
+#   MFE=1.0R  → trail activates; stop = max_fav - 0.5R = entry+0.5R (floor)
+#   MFE=2.0R  → stop = entry + 1.5R (trailing 0.5R behind max)
+#   MFE=3.5R  → stop = entry + 3.0R
+#   MFE pulls back → stop stays locked at whatever it ratcheted to
+#
+# Set TRAIL_DIST_R = 0.0 to disable trailing (reverts to hard BE lock).
+TRAIL_ACTIVATE_R: float = 1.0   # start trailing once MFE reaches this R multiple
+TRAIL_DIST_R:     float = 0.5   # trail this many R-multiples behind running max MFE
 
 # ── D1 strong-opposite veto for reversal patterns ─────────────────────────
 # For reversal patterns (H&S, DT, DB, IH&S): only apply a hard block when the
@@ -462,16 +672,24 @@ def load_profile(profile_name: str) -> dict:
 
 
 # ── Model tag helper ────────────────────────────────────────────────────────
-def get_model_tags() -> list:
+def get_model_tags(trail_arm: str = "", pairs_hash: str = "") -> list:
     """
     Returns a list of short descriptive tags capturing ALL active levers.
     Written into every backtest result record so you can always reproduce
     exactly what config produced a given number.
 
     Tags are stable short strings — sort + join them to get a run fingerprint.
+
+    Args:
+        trail_arm:   Trail arm key ("A", "B", "C") — injected by run_backtest().
+        pairs_hash:  MD5[:6] of sorted active pairs list — injected by run_backtest().
     """
     m = _sys.modules[__name__]
     tags = []
+
+    # ── Trail arm (injected by caller) ───────────────────────────────────────
+    if trail_arm:
+        tags.append(f"trail_{trail_arm}")
 
     # ── Peak direction + weekly stall ───────────────────────────────────────
     if not m.REQUIRE_PEAKS_AT_LEVEL:
@@ -502,8 +720,15 @@ def get_model_tags() -> list:
         tags.append("news_filter_on")
 
     # ── Entry signal ────────────────────────────────────────────────────────
-    tags.append("engulfing_only" if m.ENGULFING_ONLY else "pin_bars_allowed")
-    if not m.ENGULFING_ONLY:
+    _mode_tag = {
+        "engulf_only":                          "engulfing_only",
+        "engulf_or_pin":                        "pin_bars_allowed",
+        "engulf_or_star_at_level":              "star_at_level",
+        "engulf_or_strict_pin_at_level":        "strict_pin_at_level",
+        "engulf_or_star_or_strict_pin_at_level":"star_or_strict_pin",
+    }.get(m.ENTRY_TRIGGER_MODE, m.ENTRY_TRIGGER_MODE)
+    tags.append(_mode_tag)
+    if m.ENTRY_TRIGGER_MODE == "engulf_or_pin":
         tags.append(f"pin_wick_{m.PIN_BAR_MIN_WICK_BODY_RATIO:.1f}x")
 
     # ── Zone touch gate ──────────────────────────────────────────────────────
@@ -555,6 +780,29 @@ def get_model_tags() -> list:
     tags.append(f"atr_max_{int(m.ATR_STOP_MULTIPLIER)}")
     tags.append(f"conf_{int(m.MIN_CONFIDENCE * 100)}")
     tags.append(f"rr_{m.MIN_RR:.1f}")
-    tags.append(f"max_concurrent_{m.MAX_CONCURRENT_TRADES}")
+    tags.append(f"max_concurrent_{m.MAX_CONCURRENT_TRADES_BACKTEST}")
 
-    return tags
+    # ── Alex small-account gate flags ────────────────────────────────────────
+    # These must be recorded per-run so compare harnesses are reproducible.
+    # Convention: "on" suffix = gate active; absence = gate off.
+    if getattr(m, "NO_SUNDAY_TRADES_ENABLED",    False): tags.append("no_sun")
+    if getattr(m, "NO_THU_FRI_TRADES_ENABLED",   False): tags.append("no_thu_fri")
+    if getattr(m, "REQUIRE_HTF_TREND_ALIGNMENT",  False): tags.append("htf_gate")
+    _wk_small = getattr(m, "MAX_TRADES_PER_WEEK_SMALL", 999)
+    if _wk_small < 999:
+        _wk_std = getattr(m, "MAX_TRADES_PER_WEEK_STANDARD", 999)
+        tags.append(f"wk_{_wk_small}s_{_wk_std}n")   # e.g. wk_1s_2n = 1/wk small, 2/wk normal
+    _rr_ct  = getattr(m, "MIN_RR_COUNTERTREND", 0.0)
+    _rr_std = getattr(m, "MIN_RR_STANDARD",     0.0)
+    if _rr_ct and _rr_ct != _rr_std:
+        tags.append(f"rr_ct_{_rr_ct:.1f}_std_{_rr_std:.1f}")
+    if getattr(m, "INDECISION_FILTER_ENABLED", False): tags.append("doji_gate")
+
+    if getattr(m, "PROTREND_ONLY", False): tags.append("protrend_only")
+
+    # ── Pairs hash (injected by caller) ─────────────────────────────────────
+    if pairs_hash:
+        tags.append(f"pairs_{pairs_hash}")
+
+    # ── Defensive: ensure all tags are plain strings (no dict / object leak) ─
+    return [str(t) for t in tags]

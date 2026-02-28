@@ -249,6 +249,21 @@ class TradeJournal:
             "notes": notes,
         })
 
+    def log_reconcile_event(
+        self,
+        pair: str,
+        event: str,   # "EXTERNAL_CLOSE" | "RECOVERED_POSITION" | "EXTERNAL_MODIFY" | "RECONCILE_PAUSE"
+        data: dict,
+        notes: str = "",
+    ):
+        """Record a broker reconciliation event (state integrity, not a trade signal)."""
+        self._write({
+            "event":   f"RECONCILE_{event}",
+            "pair":    pair,
+            "notes":   notes or data.get("notes", ""),
+            **{k: v for k, v in data.items() if k != "notes"},
+        })
+
     # ── Read / Stats ──────────────────────────────────────────────────
 
     def _load_all(self) -> List[dict]:
@@ -362,3 +377,69 @@ class TradeJournal:
             except Exception:
                 pass
         return dict(sorted(weekly.items()))
+
+    def get_trades_this_week(self, as_of: "datetime | None" = None) -> int:
+        """
+        Return the number of trades *entered* (TRADE_OPENED events) in the
+        current ISO calendar week up to *as_of* (defaults to now UTC).
+
+        Used by the live orchestrator to enforce the weekly punch-card gate
+        (alex_policy.check_weekly_trade_limit).
+        """
+        if as_of is None:
+            as_of = datetime.now(timezone.utc)
+        iso_year, iso_week, _ = as_of.isocalendar()
+        entries = self._load_all()
+        count = 0
+        for e in entries:
+            if e.get("event") != "TRADE_OPENED":
+                continue
+            try:
+                dt = datetime.fromisoformat(e["timestamp"])
+                y, w, _ = dt.isocalendar()
+                if y == iso_year and w == iso_week:
+                    count += 1
+            except Exception:
+                pass
+        return count
+
+    def get_current_week_stats(self, as_of: "datetime | None" = None) -> dict:
+        """
+        Return closed-trade stats for the *current* ISO calendar week.
+
+        Returns dict with keys:
+          trades_this_week  : int
+          wins_this_week    : int
+          losses_this_week  : int
+          pnl_this_week     : float  (sum of pnl_dollars for TRADE_EXITED events)
+
+        Used by standings display to show W/L counts independently of AccountState
+        (which tracks week_pnl but not win/loss breakdown).
+        """
+        if as_of is None:
+            as_of = datetime.now(timezone.utc)
+        iso_year, iso_week, _ = as_of.isocalendar()
+        entries = self._load_all()
+
+        exits_this_week = []
+        for e in entries:
+            if e.get("event") != "TRADE_EXITED":
+                continue
+            try:
+                dt = datetime.fromisoformat(e["timestamp"])
+                y, w, _ = dt.isocalendar()
+                if y == iso_year and w == iso_week:
+                    exits_this_week.append(e)
+            except Exception:
+                pass
+
+        wins   = [e for e in exits_this_week if (e.get("rr_achieved") or 0) > 0]
+        losses = [e for e in exits_this_week if (e.get("rr_achieved") or 0) <= 0]
+        pnl    = sum(e.get("pnl_dollars", 0) for e in exits_this_week)
+
+        return {
+            "trades_this_week":  len(exits_this_week),
+            "wins_this_week":    len(wins),
+            "losses_this_week":  len(losses),
+            "pnl_this_week":     round(pnl, 2),
+        }

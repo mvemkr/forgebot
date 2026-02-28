@@ -63,6 +63,9 @@ logger = logging.getLogger("orchestrator")
 
 HEARTBEAT_FILE  = LOG_DIR / "forex_orchestrator.heartbeat"
 CONTROL_FILE    = LOG_DIR / "bot_control.json"   # Mike → Forge → bot command relay
+WHITELIST_LIVE_FILE  = LOG_DIR / "whitelist_live.json"   # live trading whitelist (UI-managed)
+WHITELIST_FILE       = WHITELIST_LIVE_FILE               # back-compat alias
+DECISIONS_FILE  = LOG_DIR / "decision_log.jsonl"  # audit + decision feed for dashboard
 
 WATCHLIST = [
     "USD/JPY", "GBP/CHF", "USD/CHF", "USD/CAD", "GBP/JPY",
@@ -80,13 +83,17 @@ from ..strategy.forex.strategy_config import (
     ATR_STOP_MULTIPLIER,
     ATR_MIN_MULTIPLIER,
     ATR_LOOKBACK,
-    MAX_CONCURRENT_TRADES,
+    MAX_CONCURRENT_TRADES_LIVE,
     LONDON_SESSION_START_UTC,
     LONDON_SESSION_END_UTC,
     STOP_COOLDOWN_DAYS,
     DRY_RUN_PAPER_BALANCE,
+    ACCOUNT_MODE,
+    SIM_STARTING_EQUITY,
     winner_rule_check,
 )
+from ..strategy.forex import alex_policy   # shared Alex small-account gate logic
+from .account_state import AccountMode, AccountState  # execution-mode + equity tracking
 
 
 class ForexOrchestrator:
@@ -108,43 +115,132 @@ class ForexOrchestrator:
         from .notifier import Notifier
         from .bot_state import BotState
 
-        self.dry_run  = dry_run
         self.BotMode  = BotMode
-        mode_label    = "DRY RUN" if dry_run else "⚠️  LIVE TRADING"
+
+        # ── Determine execution mode (ACCOUNT_MODE env var is authoritative) ──
+        # ACCOUNT_MODE=LIVE_PAPER → simulated equity, no broker orders.
+        # ACCOUNT_MODE=LIVE_REAL  → real orders, equity from broker.
+        # The --live CLI flag / dry_run parameter is a secondary override:
+        #   if --live is passed in LIVE_PAPER config, we honour it but warn.
+        _cfg_mode = ACCOUNT_MODE.upper().strip()  # "LIVE_PAPER" or "LIVE_REAL"
+        if _cfg_mode == "LIVE_REAL" and dry_run:
+            # Config says real but caller passed dry_run=True — keep paper for safety
+            logger.warning(
+                "ACCOUNT_MODE=LIVE_REAL in config but dry_run=True passed to constructor. "
+                "Running as LIVE_PAPER (safety override). Pass --live to override."
+            )
+            _cfg_mode = "LIVE_PAPER"
+        elif _cfg_mode == "LIVE_PAPER" and not dry_run:
+            # Config says paper but --live was passed — respect --live
+            logger.warning(
+                "ACCOUNT_MODE=LIVE_PAPER in config but --live flag passed. "
+                "Running as LIVE_REAL (CLI override)."
+            )
+            _cfg_mode = "LIVE_REAL"
+
+        exec_mode  = AccountMode.LIVE_REAL if _cfg_mode == "LIVE_REAL" else AccountMode.LIVE_PAPER
+        # Derive dry_run from mode (TradeExecutor, PositionMonitor, dashboard all read this)
+        self.dry_run = (exec_mode == AccountMode.LIVE_PAPER)
+        mode_label   = exec_mode.value.upper().replace("_", " ")
         logger.info(f"Initializing ForexOrchestrator [{mode_label}]")
 
-        self.oanda    = OandaClient()
+        # ── OandaClient: demo credentials for LIVE_PAPER, real for LIVE_REAL ──
+        if exec_mode == AccountMode.LIVE_PAPER:
+            self.oanda = OandaClient.for_paper_mode()
+        else:
+            self.oanda = OandaClient()
         self.journal  = TradeJournal()
         self.notifier = Notifier()
         self.state    = BotState()
 
-        try:
-            summary              = self.oanda.get_account_summary()
-            real_balance         = summary.get("balance", 0.0)
-            self.account_nav     = summary.get("nav", real_balance)
-            self.unrealized_pnl  = summary.get("unrealized_pnl", 0.0)
-            # In dry_run with an unfunded account ($0), use a paper balance so
-            # risk sizing and kill-switch math work correctly.
-            if dry_run and real_balance < 100.0:
-                self.account_balance = DRY_RUN_PAPER_BALANCE
-                logger.info(
-                    f"DRY RUN — OANDA balance ${real_balance:.2f} (unfunded). "
-                    f"Using paper balance ${DRY_RUN_PAPER_BALANCE:,.0f} for sizing."
-                )
-            else:
-                self.account_balance = real_balance
-                logger.info(f"Account balance: ${self.account_balance:,.2f}")
-        except Exception as e:
-            logger.error(f"Could not fetch account balance: {e}")
-            self.account_balance = DRY_RUN_PAPER_BALANCE if dry_run else 4000.0
-            self.account_nav     = self.account_balance
-            self.unrealized_pnl  = 0.0
+        self.account_nav    = 0.0
+        self.unrealized_pnl = 0.0
+
+        # ── Build AccountState ─────────────────────────────────────────────────
+        if exec_mode == AccountMode.LIVE_REAL:
+            try:
+                summary             = self.oanda.get_account_summary()
+                self.account        = AccountState.for_live_real(summary)
+                self.account_nav    = summary.get("nav",            self.account.safe_equity())
+                self.unrealized_pnl = summary.get("unrealized_pnl", 0.0)
+                logger.info(f"[LIVE REAL] Broker equity: {self.account.equity_display}")
+            except Exception as e:
+                logger.error(f"Could not fetch account balance: {e}")
+                self.account = AccountState.for_live_real(None)   # equity = UNKNOWN
+                logger.warning("[LIVE REAL] Starting with equity UNKNOWN — entries blocked until broker responds")
+        else:
+            # LIVE_PAPER: load persisted paper balance (or start fresh).
+            # Broker summary is still fetched for open-trade sync, but we NEVER
+            # use broker nav/balance/unrealized_pnl — they belong to the demo
+            # account (typically $0) and are meaningless for paper sizing.
+            try:
+                self.oanda.get_account_summary()   # connectivity check only; value discarded
+            except Exception:
+                pass  # paper mode: broker connectivity is optional at startup
+            # SIM_STARTING_EQUITY seeds paper_account.json on first run only;
+            # subsequent restarts always load persisted equity from disk.
+            self.account = AccountState.for_live_paper(SIM_STARTING_EQUITY)
+            # NAV = paper equity (no open positions at startup → unrealized = 0)
+            self.account_nav    = self.account.equity   # type: ignore[assignment]
+            self.unrealized_pnl = 0.0
+            logger.info(
+                f"[LIVE PAPER] Paper equity: {self.account.equity_display} "
+                f"| NAV: {self.account.equity_display} "
+                f"(SIM_STARTING_EQUITY={SIM_STARTING_EQUITY:,.0f})"
+            )
+
+        # Backward-compat: self.account_balance mirrors account.equity (may be None)
+        self.account_balance = self.account.equity
 
         self.risk             = ForexRiskManager(self.journal)
-        initial_risk_pct      = self.risk.get_risk_pct(self.account_balance)
+
+        # ── Persistent control plane (pause_new_entries) ───────────────
+        from .control_state import ControlState
+        self.control = ControlState(is_backtest=False)
+
+        # ── LIVE_REAL safety gate: auto-pause on every startup ──────────────
+        # In LIVE_REAL mode entries are paused by default on every restart.
+        # This is a hard safety rule — real money is at stake.
+        # Entries only open after Mike explicitly clicks "Resume Entries" in
+        # the dashboard (or calls /api/resume_entries).
+        if exec_mode == AccountMode.LIVE_REAL and not self.control.pause_new_entries:
+            self.control.pause(
+                "LIVE_REAL startup — auto-paused for safety. Resume via dashboard.",
+                "system:startup",
+            )
+            logger.warning(
+                "⏸  [LIVE REAL] Auto-paused on startup. "
+                "Resume entries via dashboard after confirming system state."
+            )
+        elif self.control.pause_new_entries:
+            logger.warning(
+                f"⏸  STARTUP: pause_new_entries=True "
+                f"(set by {self.control.updated_by}: {self.control.reason!r}). "
+                f"New entries blocked until resumed."
+            )
+
+        # ── Paper-mode peak isolation ──────────────────────────────────
+        # In LIVE_PAPER, the risk manager's persisted peak may be stale from a
+        # previous live/practice run (e.g., OANDA practice $10K).
+        # Reset so DD logic only measures this bot's simulated performance.
+        if exec_mode == AccountMode.LIVE_PAPER and self.account.equity is not None:
+            if self.risk._peak_balance > self.account.equity * 1.02:
+                old_peak = self.risk._peak_balance
+                self.risk._peak_balance = self.account.equity
+                self.risk._save_regroup_state()
+                logger.info(
+                    f"[LIVE PAPER] Reset inherited peak ${old_peak:,.0f} → "
+                    f"${self.account.equity:,.0f}. DD tracking starts from scratch."
+                )
+            # Sync AccountState peak with risk manager's persisted peak
+            if self.risk._peak_balance and self.risk._peak_balance > self.account.peak_equity:
+                self.account.peak_equity = self.risk._peak_balance
+
+        _sizing_balance   = self.account.safe_equity(self._equity_fallback)
+        initial_risk_pct  = self.risk.get_risk_pct(_sizing_balance)
 
         self.strategy = SetAndForgetStrategy(
-            account_balance=self.account_balance,
+            account_balance=_sizing_balance,
             risk_pct=initial_risk_pct,
         )
 
@@ -162,6 +258,7 @@ class ForexOrchestrator:
             journal=self.journal,
             notifier=self.notifier,
             dry_run=dry_run,
+            account=self.account,
         )
 
         self.scanner = WeeklyScanner(self.strategy)
@@ -169,9 +266,26 @@ class ForexOrchestrator:
         from .trade_analyzer import TradeAnalyzer
         self.analyzer = TradeAnalyzer(notifier=self.notifier)
 
-        self._last_hourly:         Optional[datetime] = None
-        self._last_4h:             Optional[datetime] = None
-        self._last_weekly:         Optional[datetime] = None
+        # ── Reconciler: continuous broker state integrity guardrail ────────────
+        from .reconciler import Reconciler
+        self.reconciler = Reconciler(
+            oanda        = self.oanda,
+            strategy     = self.strategy,
+            journal      = self.journal,
+            notifier     = self.notifier,
+            control      = self.control,
+            account      = self.account,
+            account_mode = exec_mode.value,   # "LIVE_REAL" | "LIVE_PAPER"
+            dry_run      = self.dry_run,
+        )
+        # Pass reconciler to PositionMonitor so it can call reconcile_light()
+        # before modifying stops (broker state may have drifted since last check)
+        self.monitor.reconciler = self.reconciler
+
+        self._last_hourly:          Optional[datetime] = None
+        self._last_4h:              Optional[datetime] = None
+        self._last_weekly:          Optional[datetime] = None
+        self._last_recon_periodic:  Optional[datetime] = None   # 60s light reconcile (LIVE_REAL)
         self._last_daily_brief:    Optional[datetime] = None
         self._last_standings:      Optional[datetime] = None
         self._last_regroup_obs:    Optional[datetime] = None
@@ -182,35 +296,53 @@ class ForexOrchestrator:
         # Shows what each pair is waiting for before the bot will enter.
         self._confluence_state:    Dict[str, dict]   = {}
 
-        # ── Crash recovery — restore full state from last save ───────────
-        # Reconciles saved state with OANDA live data:
-        #   - Open positions: restores full context (entry, stop, direction,
-        #     pattern, trends, confidence, entry_reason, tier — everything)
-        #   - Pattern memory: marks exhausted patterns so we don't re-enter
-        # If the bot restarts mid-trade, it picks up exactly where it left off.
+        # Regime score — computed each scan from H4 slices collected during
+        # pair evaluation (no extra API calls). Stored as a dict for status API.
+        self._last_h4_slices:      Dict[str, object] = {}   # pair → DataFrame (H4)
+        self._last_regime_score:   Optional[dict]    = None  # RegimeScore.to_dict()
+
+        # Consecutive loss streak — used by risk manager for streak brake cap.
+        # Loaded from saved state on startup; updated when positions close.
+        # A ratchet exit near 0R counts as a win (doesn't increment streak).
+        self._consecutive_losses:  int               = 0
+        # Hysteresis: consecutive H4 evals where ALL HIGH conditions held.
+        # Persisted across hourly regime evaluations (stateful, not per-entry).
+        self._consec_high_live:    int               = 0
+        self._demote_streak_live:  int               = 0
+
+        # ── Startup reconcile: restore state + validate broker integrity ─────
+        # Phase 1: restore rich saved context (patterns, trends, confidence,
+        #          tier, entry_reason) that the reconciler can't infer from
+        #          broker data alone. Must run BEFORE reconcile_full() so the
+        #          reconciler sees the full local position dict for diff logic.
         try:
-            recovery = self.state.reconcile_with_oanda(self.oanda, self.strategy)
-            if recovery.get("recovered"):
-                n_pos = len(recovery.get("recovered_positions", {}))
-                age_m = int(recovery.get("state_age_seconds", 0) / 60)
+            legacy = self.state.reconcile_with_oanda(self.oanda, self.strategy)
+            if legacy.get("recovered"):
+                n_pos = len(legacy.get("recovered_positions", {}))
+                age_m = int(legacy.get("state_age_seconds", 0) / 60)
                 if n_pos:
                     logger.info(
-                        f"✅ Recovered {n_pos} open position(s) from state "
-                        f"({age_m}m ago): {list(recovery['recovered_positions'].keys())}"
-                    )
-                    self.notifier.send(
-                        f"♻️ Bot restarted — recovered {n_pos} open position(s) from saved state "
-                        f"({age_m}m ago):\n" +
-                        "\n".join(
-                            f"  • {p}: {v.get('direction','?')} @ {v.get('entry','?'):.5f}  "
-                            f"SL={v.get('stop','?'):.5f}  pattern={v.get('pattern_type','?')}"
-                            for p, v in recovery["recovered_positions"].items()
-                        )
+                        f"✅ State-file recovery: {n_pos} position(s) "
+                        f"({age_m}m ago): {list(legacy['recovered_positions'].keys())}"
                     )
                 else:
-                    logger.info("State reconciled — no open positions to recover")
+                    logger.info("State file loaded — no saved open positions")
         except Exception as e:
-            logger.warning(f"State recovery failed: {e}")
+            logger.warning(f"State-file recovery failed: {e}")
+
+        # Phase 2: full broker reconcile — validates invariants, catches any
+        #          broker positions that the state file missed, and pauses
+        #          entries if a safety-relevant mismatch is detected.
+        try:
+            recon = self.reconciler.reconcile_full()
+            if recon.external_closes:
+                logger.warning(f"Startup: external close(s) detected: {recon.external_closes}")
+            if recon.recovered:
+                logger.info(f"Startup: position(s) recovered from broker: {recon.recovered}")
+            if recon.external_modifies:
+                logger.info(f"Startup: stop(s) adopted from broker: {recon.external_modifies}")
+        except Exception as e:
+            logger.warning(f"Startup reconcile_full() failed: {e}")
 
         # Restore pattern memory from last saved state
         try:
@@ -223,6 +355,15 @@ class ForexOrchestrator:
                     logger.info(f"Restored {len(restored)} exhausted pattern(s) from state")
         except Exception as e:
             logger.warning(f"Pattern memory restore failed: {e}")
+
+        # Restore consecutive loss streak from saved state
+        try:
+            saved = self.state.load()
+            self._consecutive_losses = int(saved.get("stats", {}).get("consecutive_losses", 0))
+            if self._consecutive_losses:
+                logger.info(f"Restored consecutive_losses={self._consecutive_losses} from state")
+        except Exception:
+            pass
 
         # Load Tier 1 news calendar on startup
         try:
@@ -270,25 +411,78 @@ class ForexOrchestrator:
         # Check control file for commands from Mike (relayed via Forge)
         self._check_control_file()
 
+        # Reload persistent control plane (pause_new_entries may have changed)
+        self.control.reload()
+
+        # ── Chop Shield: auto-resume when 48h pause expires ──────────────
+        # chop_pause_until in control.json marks the deadline for a streak-based pause.
+        # When it has passed, clear the pause so recovery-selectivity rules take over.
+        if (self.control.pause_new_entries
+                and "AUTO_PAUSE_STREAK3" in (self.control.reason or "")
+                and self.control.chop_pause_expired()):
+            self.control.resume(reason="Chop Shield 48h pause expired — recovery mode",
+                                updated_by="bot")
+            logger.info("▶  Chop Shield: 48h pause expired — entries re-enabled in recovery mode")
+            try:
+                from .telegram_notify import send_telegram
+                send_telegram(
+                    "▶ *Chop Shield: 48h pause expired*\n"
+                    "Recovery mode active — higher-quality entries only:\n"
+                    f"• exec_rr ≥ {getattr(_sc, 'RECOVERY_MIN_RR', 3.0):.1f}R\n"
+                    f"• confidence +{getattr(_sc, 'RECOVERY_CONF_BOOST', 0.05):.0%}\n"
+                    f"• weekly_cap = {getattr(_sc, 'RECOVERY_WEEKLY_CAP', 1)}"
+                )
+            except Exception:
+                pass
+
+        # ── Periodic light reconcile: every 60s on LIVE_REAL ─────────────
+        # Catches manual closes/edits while the bot is running.
+        # LIVE_PAPER skips this — no real broker positions to drift.
+        if self.account.mode == AccountMode.LIVE_REAL:
+            _now_recon = datetime.now(timezone.utc)
+            _recon_due = (
+                self._last_recon_periodic is None
+                or (_now_recon - self._last_recon_periodic).total_seconds() >= 60
+            )
+            if _recon_due:
+                try:
+                    self.reconciler.reconcile_light(throttle=False)
+                except Exception as _re:
+                    logger.debug(f"Periodic reconcile_light failed (harmless): {_re}")
+                self._last_recon_periodic = _now_recon
+
         # Save full state to disk (dashboard reads this)
         self._save_state()
 
-        # Refresh balance
+        # ── Balance / equity refresh ──────────────────────────────────────
         try:
-            summary    = self.oanda.get_account_summary()
-            real_bal   = summary.get("balance", self.account_balance)
-            # Dry run with unfunded account: always use paper balance so risk
-            # sizing and kill-switch math work. Never let $0 bleed through.
-            if self.dry_run and real_bal < 100.0:
-                self.account_balance = DRY_RUN_PAPER_BALANCE
+            summary = self.oanda.get_account_summary()
+            if self.account.mode == AccountMode.LIVE_REAL:
+                # LIVE_REAL: equity + NAV from broker; None fallback (never 0)
+                self.account.update_from_broker(summary)
+                broker_nav          = summary.get("nav")
+                self.account_nav    = broker_nav if broker_nav is not None else self.account.equity
+                self.unrealized_pnl = summary.get("unrealized_pnl") or 0.0
             else:
-                self.account_balance = real_bal
-            self.account_nav     = summary.get("nav",     self.account_nav)
-            self.unrealized_pnl  = summary.get("unrealized_pnl", 0.0)
-            self.strategy.update_balance(self.account_balance)
-            self.strategy.risk_pct = self.risk.get_risk_pct(self.account_balance)
+                # LIVE_PAPER: broker summary fetched only for open-trade sync.
+                # NAV and equity must NEVER come from the broker; paper account
+                # is typically $0 and would corrupt sizing / display.
+                # NAV = paper equity + simulated unrealized PnL (currently 0).
+                self.unrealized_pnl = 0.0   # paper mode: no live floating PnL yet
+                self.account_nav    = (self.account.equity or 0.0) + self.unrealized_pnl
         except Exception as e:
             logger.warning(f"Balance refresh failed: {e}")
+            if self.account.mode == AccountMode.LIVE_REAL:
+                self.account.mark_broker_failed()
+                self.account_nav = None   # explicitly UNKNOWN — do NOT default to 0
+
+        # Keep backward-compat attribute in sync (may be None for LIVE_REAL on failure)
+        self.account_balance = self.account.equity
+
+        # Propagate usable balance to strategy (use safe fallback if UNKNOWN)
+        _eff_bal = self.account.safe_equity(self._equity_fallback)
+        self.strategy.update_balance(_eff_bal)
+        self.strategy.risk_pct = self.risk.get_effective_risk_pct(_eff_bal)
 
         # Mode check
         mode, mode_reason = self.risk.check_and_update_mode(self.account_balance)
@@ -325,7 +519,30 @@ class ForexOrchestrator:
             self._last_4h = now
 
         if self._should_run_hourly(now):
-            self._run_strategy_evaluation(now)
+            # ── Equity-unknown guard (LIVE_REAL only) ─────────────────
+            # If broker fetch has failed, we don't know true equity.
+            # Skip ALL entry sizing / evaluation — never default to 0.
+            # Position management (monitor, stop moves) continues unaffected.
+            if self.account.is_unknown:
+                logger.warning(
+                    f"⚠️  EQUITY UNKNOWN ({self.account.broker_fetch_failures} consecutive "
+                    f"broker failures) — skipping entry scan this cycle. "
+                    f"Existing positions continue to be managed."
+                )
+                # Log one BROKER_EQUITY_UNKNOWN decision so the dashboard can surface it
+                for pair in getattr(self.strategy, "universe", []):
+                    self.state.log_decision(
+                        "WAIT",
+                        pair,
+                        {
+                            "reason":        "BROKER_EQUITY_UNKNOWN",
+                            "failures":      self.account.broker_fetch_failures,
+                            "equity_source": self.account.equity_source,
+                        },
+                    )
+                    break   # one representative entry is enough
+            else:
+                self._run_strategy_evaluation(now)
             self._last_hourly = now
 
     # ── Mode Transition Handling ───────────────────────────────────────
@@ -425,11 +642,102 @@ class ForexOrchestrator:
                 f"watching {', '.join(macro_theme.confirming_pairs[:4])}"
             )
 
+        # ── Pair whitelist ────────────────────────────────────────────────────
+        wl_enabled, wl_pairs = self._load_whitelist()
+        if wl_enabled:
+            logger.info(f"Whitelist ACTIVE — trading only: {', '.join(sorted(wl_pairs))}")
+
+        # Reset H4 slices collection before scan so stale data doesn't persist
+        self._last_h4_slices = {}
+
         for pair in WATCHLIST:
             try:
-                self._evaluate_pair(pair, overnight=is_overnight, macro_theme=macro_theme)
+                self._evaluate_pair(
+                    pair, overnight=is_overnight, macro_theme=macro_theme,
+                    whitelist_enabled=wl_enabled, whitelist_pairs=wl_pairs,
+                )
             except Exception as e:
                 logger.error(f"{pair}: Evaluation error: {e}")
+
+        # ── Regime score (post-scan) ──────────────────────────────────────
+        # Uses H4 data already fetched during pair evaluation — no extra API calls.
+        # Representative primary H4: use first available scanned pair.
+        try:
+            from ..strategy.forex.regime_score import compute_regime_score
+            _primary_h4 = next(iter(self._last_h4_slices.values()), None)
+            if _primary_h4 is not None:
+                _recent_trades = self.journal.get_recent_trades(10)
+                _rs = compute_regime_score(
+                    df_h4        = _primary_h4,
+                    recent_trades = _recent_trades,
+                    h4_slices    = self._last_h4_slices,
+                )
+                self._last_regime_score = _rs.to_dict()
+                logger.info(
+                    f"📊 RegimeScore: {_rs.total:.1f}  "
+                    f"vol={_rs.vol_expansion} trend={_rs.trend_persistence} "
+                    f"perf={_rs.recent_performance} cluster={_rs.correlation_cluster}  "
+                    f"{'✅ HIGH_ELIGIBLE' if _rs.eligible_high else ''}"
+                    f"{'⚡ EXTREME_ELIGIBLE' if _rs.eligible_extreme else ''}"
+                )
+
+                # ── RiskMode computation (simplified integer score) ───────
+                from ..strategy.forex.regime_score import compute_risk_mode
+                _primary_pair = next(iter(self._last_h4_slices.keys()), "")
+                _trend_w = ""
+                _trend_d = ""
+                if _primary_pair and hasattr(self.strategy, "_last_weekly_trend"):
+                    _trend_w = getattr(self.strategy, "_last_weekly_trend", {}).get(_primary_pair, "")
+                    _trend_d = getattr(self.strategy, "_last_daily_trend",  {}).get(_primary_pair, "")
+                _live_dd_pct = 0.0
+                if self.account.peak_equity and self.account.equity:
+                    _live_dd_pct = max(
+                        0.0,
+                        (self.account.peak_equity - float(self.account.equity))
+                        / self.account.peak_equity * 100,
+                    )
+                _rms = compute_risk_mode(
+                    trend_weekly          = _trend_w,
+                    trend_daily           = _trend_d,
+                    df_h4                 = _primary_h4,
+                    recent_trades         = _recent_trades,
+                    loss_streak           = self._consecutive_losses,
+                    dd_pct                = _live_dd_pct,
+                    # Instantaneous snapshot: live entry evaluations are too
+                    # infrequent for 2-bar hysteresis accumulation. HIGH/EXTREME
+                    # granted immediately when ALL conditions are met right now.
+                    instantaneous         = True,
+                )
+                if _rms.promotion_note:
+                    logger.info(f"🔺 REGIME PROMOTION: {_rms.mode.value} | {_rms.promotion_note}")
+                self._last_regime_score.update(_rms.to_dict())
+
+                # ── Risk-mode source: control.json pin wins over dynamic ──
+                # If the dashboard / API has pinned a specific mode, use it.
+                # Otherwise, use the dynamically computed mode from score.
+                _pinned_mode = self.control.risk_mode   # None = AUTO
+                _effective_mode = _pinned_mode if _pinned_mode else _rms.mode.value
+                _mode_source    = "PINNED" if _pinned_mode else "AUTO"
+                self.risk.set_regime_mode(_effective_mode)
+
+                # Enrich last_regime_score with effective mode + source
+                self._last_regime_score["risk_mode"]        = _effective_mode
+                self._last_regime_score["risk_mode_source"] = _mode_source
+                self._last_regime_score["risk_mode_pinned"] = _pinned_mode
+
+                from src.strategy.forex.regime_score import RISK_MODE_PARAMS as _RMP
+                _mult = _RMP.get(_effective_mode, {}).get("risk_mult", 1.0)
+                logger.info(
+                    f"📊 RiskMode: {_effective_mode} [{_mode_source}]  "
+                    f"score={_rms.score}/4  mult={_mult}×  "
+                    f"wd={_rms.wd_aligned} vol={_rms.atr_expanding} "
+                    f"edge={_rms.edge_positive} streak={_rms.streak_clear}"
+                )
+        except Exception as e:
+            logger.warning(f"Regime score computation failed: {e}")
+
+        # Always log one entry per scan cycle so the dashboard Decision Feed is alive
+        self._write_scan_heartbeat()
 
     def _detect_macro_theme(self):
         """
@@ -452,6 +760,34 @@ class ForexOrchestrator:
         except Exception as e:
             logger.warning(f"Macro theme detection failed: {e}")
             return None
+
+    def _set_block_reason(
+        self,
+        pair: str,
+        stage: str,
+        reason: str,
+        reason_code: str = "",
+    ) -> None:
+        """
+        Patch the confluence state entry for *pair* with a block reason.
+        Called after every gate check that blocks an ENTER signal so the dashboard
+        shows WHY the pair is blocked, not just "BLOCKED".
+
+        Parameters
+        ----------
+        stage : str
+            One of: WAIT | PAUSED | BLOCKED | SESSION | WEEKLY | RR | CONF | HTF | DOJI
+        reason : str
+            Human-readable explanation for the dashboard.
+        reason_code : str
+            Machine-readable code for the UI badge (e.g. "WEEKLY_TRADE_LIMIT").
+        """
+        entry = self._confluence_state.get(pair)
+        if entry is None:
+            return
+        entry["block_stage"]   = stage
+        entry["block_reason"]  = reason
+        entry["block_code"]    = reason_code or stage
 
     def _capture_confluence(self, pair: str, decision, macro_theme) -> None:
         """
@@ -476,41 +812,9 @@ class ForexOrchestrator:
         conf_req     = MIN_CONFIDENCE
         conf_ok      = conf_val >= conf_req
 
-        # ── Derive "waiting for" — ordered by what needs to happen first
-        waiting = []
-        if not has_pattern:
-            waiting.append("Pattern to form")
-        if not has_level:
-            waiting.append("Price near key level")
-        if not trend_ok:
-            waiting.append("Multi-TF trend alignment")
-        if has_pattern and has_level and trend_ok and not conf_ok:
-            waiting.append(f"Confidence {conf_val:.0%} → {conf_req:.0%}")
-        if has_pattern and has_level and trend_ok and conf_ok and not has_signal:
-            waiting.append("Engulfing candle / entry signal")
-        # Pip equity gate — show if pattern exists but measured move is too small
+        # ── Pip equity: measured move in pips (neckline → target_1) ─────────
+        # Must be computed BEFORE the waiting-for list (used in pip equity gate).
         from src.strategy.forex import strategy_config as _sc_live
-        if has_pattern and _pip_equity > 0 and _pip_equity < _sc_live.MIN_PIP_EQUITY:
-            waiting.append(f"Pip equity {_pip_equity:.0f}p → {_sc_live.MIN_PIP_EQUITY:.0f}p min")
-        if not session_ok:
-            waiting.append("London session (3–8 AM ET)")
-        if not news_ok:
-            waiting.append("News blackout to clear")
-        if "max_concurrent" in ff:
-            waiting.append("Open position to close first")
-        if "currency_overlap" in ff:
-            waiting.append("Currency exposure to free up")
-        if "winner_rule" in ff:
-            waiting.append("Winner running — door closed until it stops")
-        if not waiting and decision.decision.value == "ENTER":
-            waiting.append("Nothing — ready to enter")
-        elif not waiting:
-            waiting.append("Building setup")
-
-        # Pip equity: measured move in pips (neckline → target_1)
-        # Reflects how much room the trade has to run — key priority signal.
-        # consolidation_breakout: use target_2 (2× range) — T1 is small by
-        # construction (= 1× range) but Alex runs these 2-3× minimum.
         _pip_mult   = 100.0 if "JPY" in pair.upper() else 10000.0
         _pip_equity = 0.0
         if has_pattern and decision.pattern.target_1 and decision.pattern.neckline:
@@ -519,6 +823,42 @@ class ForexOrchestrator:
                           if _is_cb and decision.pattern.target_2
                           else decision.pattern.target_1)
             _pip_equity = abs(decision.pattern.neckline - _pe_target) * _pip_mult
+
+        # ── Whitelist-blocked shortcut ────────────────────────────────────────
+        is_whitelist_blocked = "whitelist_blocked" in ff
+
+        # ── Derive "waiting for" — ordered by what needs to happen first ─────
+        waiting = []
+        if is_whitelist_blocked:
+            waiting.append("Not in active whitelist — edit in Backtests → Whitelist")
+        else:
+            if not has_pattern:
+                waiting.append("Pattern to form")
+            if not has_level:
+                waiting.append("Price near key level")
+            if not trend_ok:
+                waiting.append("Multi-TF trend alignment")
+            if has_pattern and has_level and trend_ok and not conf_ok:
+                waiting.append(f"Confidence {conf_val:.0%} → {conf_req:.0%}")
+            if has_pattern and has_level and trend_ok and conf_ok and not has_signal:
+                waiting.append("Engulfing candle / entry signal")
+            # Pip equity gate
+            if has_pattern and _pip_equity > 0 and _pip_equity < _sc_live.MIN_PIP_EQUITY:
+                waiting.append(f"Pip equity {_pip_equity:.0f}p → {_sc_live.MIN_PIP_EQUITY:.0f}p min")
+            if not session_ok:
+                waiting.append("London session (3–8 AM ET)")
+            if not news_ok:
+                waiting.append("News blackout to clear")
+            if "max_concurrent" in ff:
+                waiting.append("Open position to close first")
+            if "currency_overlap" in ff:
+                waiting.append("Currency exposure to free up")
+            if "winner_rule" in ff:
+                waiting.append("Winner running — door closed until it stops")
+            if not waiting and decision.decision.value == "ENTER":
+                waiting.append("Nothing — ready to enter")
+            elif not waiting:
+                waiting.append("Building setup")
 
         self._confluence_state[pair] = {
             "pair":        pair,
@@ -547,11 +887,32 @@ class ForexOrchestrator:
                 "session":       session_ok,
                 "news":          news_ok,
             },
-            "failed_filters": list(ff),
-            "waiting_for":    waiting,
+            "failed_filters":     list(ff),
+            "waiting_for":        waiting,
+            "whitelist_blocked":  is_whitelist_blocked,
         }
 
-    def _evaluate_pair(self, pair: str, overnight: bool = False, macro_theme=None):
+    def _evaluate_pair(
+        self, pair: str, overnight: bool = False, macro_theme=None,
+        whitelist_enabled: bool = False, whitelist_pairs: set = None,
+    ):
+        # ── Whitelist gate (before any API fetch — saves quota) ──────────────
+        if whitelist_enabled and whitelist_pairs is not None:
+            if pair not in whitelist_pairs:
+                from ..strategy.forex.set_and_forget import Decision, TradeDecision
+                blocked = TradeDecision(
+                    decision=Decision.BLOCKED,
+                    pair=pair,
+                    direction=None,
+                    reason=f"⛔ WHITELIST: {pair} not in active whitelist. "
+                           f"Enabled pairs: {', '.join(sorted(whitelist_pairs))}",
+                    confidence=0.0,
+                    failed_filters=["whitelist_blocked"],
+                )
+                self._capture_confluence(pair, blocked, macro_theme)
+                logger.debug(f"{pair}: WHITELIST_BLOCKED — skipping data fetch")
+                return
+
         df_w  = self._fetch_oanda_candles(pair, "W",  count=100)
         df_d  = self._fetch_oanda_candles(pair, "D",  count=200)
         df_4h = self._fetch_oanda_candles(pair, "H4", count=200)
@@ -560,6 +921,10 @@ class ForexOrchestrator:
         if any(df is None or len(df) < 20 for df in [df_w, df_d, df_4h, df_1h]):
             logger.debug(f"{pair}: Insufficient data, skipping")
             return
+
+        # Collect H4 for regime score (reuses already-fetched data — no extra API calls)
+        if df_4h is not None and len(df_4h) >= 20:
+            self._last_h4_slices[pair] = df_4h
 
         decision = self.strategy.evaluate(
             pair=pair,
@@ -582,24 +947,136 @@ class ForexOrchestrator:
                     f"⚠ {pair}: ENTER signal BLOCKED — confidence {decision.confidence:.0%} "
                     f"< {MIN_CONFIDENCE:.0%} threshold. Waiting for stronger setup."
                 )
+                self._set_block_reason(
+                    pair, "CONF",
+                    f"Conf {decision.confidence:.0%} < {MIN_CONFIDENCE:.0%} required",
+                    "CONFIDENCE",
+                )
                 return
 
+            # ── Global pause gate ─────────────────────────────────────────
+            if self.control.pause_new_entries:
+                logger.info(
+                    f"⏸  {pair}: ENTER BLOCKED — PAUSE_BLOCK "
+                    f"(pause_new_entries=True, reason={self.control.reason!r})"
+                )
+                self._set_block_reason(
+                    pair, "PAUSED",
+                    f"Entries paused: {self.control.reason or 'manual hold'}",
+                    "PAUSE_BLOCK",
+                )
+                return
+
+            # ── Chop Shield Part B: recovery-selectivity filters ─────────
+            # Active when: streak >= THRESH AND pause has expired (we're past the 48h window).
+            # Does NOT block during active pause (pause gate above handles that).
+            # Blocks: entries with exec_rr < RECOVERY_MIN_RR, conf below boosted floor,
+            # or weekly_cap already reached at RECOVERY_WEEKLY_CAP=1.
+            _chop_thresh = getattr(_sc, "CHOP_SHIELD_STREAK_THRESH", 3)
+            if self._consecutive_losses >= _chop_thresh:
+                _rec_rr  = getattr(_sc, "RECOVERY_MIN_RR", 3.0)
+                _rec_boost = getattr(_sc, "RECOVERY_CONF_BOOST", 0.05)
+                _rec_wcap  = getattr(_sc, "RECOVERY_WEEKLY_CAP", 1)
+                _rec_conf  = _sc.MIN_CONFIDENCE + _rec_boost
+                # exec_rr gate
+                if decision.exec_rr < _rec_rr:
+                    logger.info(
+                        f"🔵 {pair}: RECOVERY_MIN_RR BLOCK"
+                        f" — streak={self._consecutive_losses}, exec_rr={decision.exec_rr:.2f}R"
+                        f" < {_rec_rr:.1f}R required"
+                    )
+                    self._set_block_reason(
+                        pair, "BLOCKED",
+                        f"Recovery mode: exec_rr {decision.exec_rr:.2f}R < {_rec_rr:.1f}R",
+                        "RECOVERY_MIN_RR",
+                    )
+                    return
+                # Confidence gate
+                if decision.confidence < _rec_conf:
+                    logger.info(
+                        f"🔵 {pair}: RECOVERY_CONF BLOCK"
+                        f" — streak={self._consecutive_losses},"
+                        f" conf={decision.confidence:.0%} < {_rec_conf:.0%}"
+                    )
+                    self._set_block_reason(
+                        pair, "BLOCKED",
+                        f"Recovery mode: conf {decision.confidence:.0%} < {_rec_conf:.0%}",
+                        "RECOVERY_CONF",
+                    )
+                    return
+                # Weekly cap gate (stricter than normal during recovery)
+                try:
+                    _wk_count_rec = self.journal.get_trades_this_week()
+                    if _wk_count_rec >= _rec_wcap:
+                        logger.info(
+                            f"🔵 {pair}: RECOVERY_WEEKLY_CAP BLOCK"
+                            f" — streak={self._consecutive_losses},"
+                            f" week trades={_wk_count_rec} ≥ cap={_rec_wcap}"
+                        )
+                        self._set_block_reason(
+                            pair, "BLOCKED",
+                            f"Recovery mode: weekly_cap={_rec_wcap} reached",
+                            "RECOVERY_WEEKLY_CAP",
+                        )
+                        return
+                except Exception:
+                    pass
+
             # ── Macro theme direction gate ────────────────────────────────
-            # PARITY: identical logic to backtester (oanda_backtest_v2.py).
-            # If a macro theme is active and this pair is one of its suggested
-            # trades, block entries whose direction CONTRADICTS the theme.
-            # E.g. USD_strong theme → EUR/USD SHORT is fine, EUR/USD LONG is blocked.
-            # Controlled by REQUIRE_THEME_GATE lever in strategy_config.py.
             if _sc.REQUIRE_THEME_GATE and macro_theme:
                 _theme_dir_map = dict(macro_theme.suggested_trades)
                 _theme_dir     = _theme_dir_map.get(pair)
                 if _theme_dir and _theme_dir != decision.direction:
+                    _theme_name = f"{macro_theme.currency}_{macro_theme.direction}"
                     logger.info(
                         f"⚠ {pair}: ENTER BLOCKED — theme direction conflict. "
-                        f"Theme={macro_theme.currency}_{macro_theme.direction} "
-                        f"wants {_theme_dir}, pattern wants {decision.direction}."
+                        f"Theme={_theme_name} wants {_theme_dir}, "
+                        f"pattern wants {decision.direction}."
+                    )
+                    self._set_block_reason(
+                        pair, "BLOCKED",
+                        f"Theme {_theme_name} wants {_theme_dir}, "
+                        f"signal wants {decision.direction}",
+                        "THEME_CONFLICT",
                     )
                     return
+
+            # ── Alex small-account gates (live parity via alex_policy) ──
+
+            # Gate 1: Alignment-based MIN_RR
+            _htf_aligned_flag = alex_policy.htf_aligned(
+                decision.direction or "",
+                decision.trend_weekly,
+                decision.trend_daily,
+                decision.trend_4h,
+            )
+            _rr_blk, _rr_rsn = alex_policy.check_dynamic_min_rr(
+                decision.exec_rr,
+                htf_aligned_flag=_htf_aligned_flag,
+                balance=self.account_balance,
+            )
+            if _rr_blk:
+                logger.info(f"⚠ {pair}: ENTER BLOCKED — {_rr_rsn}")
+                self._set_block_reason(
+                    pair, "BLOCKED",
+                    _rr_rsn,
+                    "RR_MIN",
+                )
+                return
+
+            # Gate 2: Weekly trade punch-card
+            _wk_count = self.journal.get_trades_this_week()
+            _wk_blk, _wk_rsn = alex_policy.check_weekly_trade_limit(
+                _wk_count, self.account_balance
+            )
+            if _wk_blk:
+                logger.info(f"⚠ {pair}: ENTER BLOCKED — {_wk_rsn}")
+                self._set_block_reason(
+                    pair, "WEEKLY",
+                    _wk_rsn,
+                    "WEEKLY_TRADE_LIMIT",
+                )
+                return
 
             # ── Winner rule: don't compete with your winner ───────────────
             # Block new entries only when any open position is ACTIVELY up
@@ -634,15 +1111,19 @@ class ForexOrchestrator:
             )
             if win_blocked:
                 logger.info(f"⚠ {pair}: ENTER BLOCKED — {win_reason}")
+                self._set_block_reason(pair, "BLOCKED", win_reason, "WINNER_RUNNING")
                 return
 
             # ── Session gate — only auto-execute during London session ────
-            # Outside London: log the signal so Mike can act manually, but
-            # don't auto-execute. Alex always enters London session (1-3 AM ET).
             if not overnight:
                 logger.info(
                     f"⏰ {pair}: ENTER signal in non-London session — "
                     f"logging for review, not auto-executing. (conf={decision.confidence:.0%})"
+                )
+                self._set_block_reason(
+                    pair, "SESSION",
+                    "Outside London session (3–8 AM ET) — signal logged, not auto-executed",
+                    "TIME_BLOCK",
                 )
                 self.notifier.send(
                     f"⏰ <b>{pair} signal (non-London)</b> — {decision.direction} @ "
@@ -652,9 +1133,7 @@ class ForexOrchestrator:
                 )
                 return
 
-            # ── ATR stop check (matches backtester _stop_ok logic) ────────
-            # Stop must be ≤ ATR_STOP_MULTIPLIER × ATR (rejects ancient levels)
-            # Stop must be ≥ ATR_MIN_MULTIPLIER × ATR (rejects micro-stop noise)
+            # ── ATR stop check ────────────────────────────────────────────
             if decision.entry_price and decision.stop_loss and len(df_d) >= ATR_LOOKBACK + 1:
                 import numpy as np
                 recent   = df_d.tail(ATR_LOOKBACK + 1)
@@ -666,24 +1145,80 @@ class ForexOrchestrator:
                 dist     = abs(decision.entry_price - decision.stop_loss)
                 pip      = 0.01 if "JPY" in pair else 0.0001
                 if dist > atr * ATR_STOP_MULTIPLIER:
-                    logger.info(
-                        f"⚠ {pair}: ENTER BLOCKED — stop too wide: "
-                        f"{dist/pip:.0f}p > max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p "
-                        f"({ATR_STOP_MULTIPLIER:.0f}×ATR)"
-                    )
+                    _msg = (f"Stop too wide: {dist/pip:.0f}p > "
+                            f"max {atr*ATR_STOP_MULTIPLIER/pip:.0f}p "
+                            f"({ATR_STOP_MULTIPLIER:.0f}×ATR)")
+                    logger.info(f"⚠ {pair}: ENTER BLOCKED — {_msg}")
+                    self._set_block_reason(pair, "BLOCKED", _msg, "STOP_WIDE")
                     return
                 if dist < atr * ATR_MIN_MULTIPLIER:
-                    logger.info(
-                        f"⚠ {pair}: ENTER BLOCKED — stop too tight: "
-                        f"{dist/pip:.0f}p < min {atr*ATR_MIN_MULTIPLIER/pip:.0f}p "
-                        f"({ATR_MIN_MULTIPLIER:.2f}×ATR) — micro-stop, daily noise will hit it"
-                    )
+                    _msg = (f"Stop too tight: {dist/pip:.0f}p < "
+                            f"min {atr*ATR_MIN_MULTIPLIER/pip:.0f}p "
+                            f"({ATR_MIN_MULTIPLIER:.2f}×ATR) — micro-stop")
+                    logger.info(f"⚠ {pair}: ENTER BLOCKED — {_msg}")
+                    self._set_block_reason(pair, "BLOCKED", _msg, "STOP_TIGHT")
                     return
+
+            # ── Pre-order reconcile: validate broker state before committing ──
+            # Catches any drift (manual close, external stop edit) that occurred
+            # since the last periodic reconcile. Fails open — never blocks entry
+            # due to a network hiccup.
+            try:
+                _pre_recon = self.reconciler.reconcile_light()
+                if not _pre_recon.clean:
+                    logger.warning(
+                        f"⚠ {pair}: pre-order reconcile found mismatch: "
+                        f"{_pre_recon.summary()} — continuing with caution"
+                    )
+                    if _pre_recon.pause_triggered:
+                        # Reconciler already paused entries; don't place this order.
+                        logger.warning(f"⚠ {pair}: entry aborted — reconciler paused entries")
+                        return
+            except Exception as _re:
+                logger.debug(f"Pre-order reconcile failed (fail-open): {_re}")
 
             logger.info(f"🎯 {pair}: ENTER signal! overnight={overnight} conf={decision.confidence:.0%}")
             result = self.executor.execute(decision, self.account_balance)
 
             if result.get("status") in ("filled", "pending", "dry_run"):
+                # ── Paper journal: log entry event ──────────────────────────
+                if self.account.mode == AccountMode.LIVE_PAPER:
+                    # Gather risk-mode audit data from risk manager state.
+                    # All fields are optional — journal write never blocks entry.
+                    try:
+                        _j_eq    = self._equity_fallback
+                        _j_peak  = self.account.peak_equity or _j_eq
+                        _j_mode  = self.risk._regime_mode or "MEDIUM"
+                        _j_mult  = self.risk.regime_risk_multiplier()
+                        _j_base  = self.risk.get_risk_pct(_j_eq)
+                        _j_eff   = self.risk.get_risk_pct_with_dd(
+                            _j_eq,
+                            peak_equity=_j_peak,
+                            consecutive_losses=self._consecutive_losses,
+                        )[0]
+                        _j_tier  = self.risk._tier_idx
+                        _j_dd    = (max(0.0, (_j_peak - _j_eq) / _j_peak * 100)
+                                    if _j_peak > 0 else 0.0)
+                        _j_stk   = self._consecutive_losses
+                    except Exception:
+                        _j_mode, _j_mult, _j_base = "UNKNOWN", 1.0, 0.0
+                        _j_eff, _j_tier, _j_dd, _j_stk = 0.0, 0, 0.0, 0
+                    _j_risk_usd = result.get("risk_amount", 0)
+                    self.account.log_entry_event(
+                        pair                 = pair,
+                        direction            = decision.direction or "?",
+                        entry_price          = decision.entry_price or 0,
+                        stop_loss            = decision.stop_price  or 0,
+                        risk_dollars         = _j_risk_usd,
+                        risk_mode            = _j_mode,
+                        base_risk_pct        = _j_base,
+                        mode_mult            = _j_mult,
+                        effective_risk_pct   = _j_eff,
+                        planned_risk_dollars = _j_risk_usd,
+                        tier_idx             = _j_tier,
+                        dd_pct_at_entry      = _j_dd,
+                        loss_streak_at_entry = _j_stk,
+                    )
                 # Send trade notification — extra detail if overnight
                 self.notifier.send_trade_entry(
                     pair=pair,
@@ -696,6 +1231,7 @@ class ForexOrchestrator:
                     key_level=decision.nearest_level.price if decision.nearest_level else 0,
                     overnight=overnight,
                     dry_run=self.dry_run,
+                    account_mode=self.account.mode.value,   # "live_paper" | "live_real"
                 )
 
         elif decision.confidence >= 0.60:
@@ -786,10 +1322,23 @@ class ForexOrchestrator:
     # ── Daily Brief ───────────────────────────────────────────────────
 
     def _send_daily_brief(self):
-        try:
-            summary = self.oanda.get_account_summary()
-        except Exception:
-            summary = {}
+        # ── Equity source: SIM (paper) or broker (real/unknown) ───────────
+        # LIVE_PAPER: never show broker balance — it's the OANDA practice
+        # account default ($100K play-money) and has no relation to our sim.
+        # Always use paper_account.json equity for display.
+        if self.account.mode == AccountMode.LIVE_PAPER:
+            _eq    = float(self.account.equity or 0.0)
+            _nav   = _eq + float(self.unrealized_pnl or 0.0)
+            summary = {
+                "balance":         _eq,
+                "nav":             _nav,
+                "unrealized_pnl":  float(self.unrealized_pnl or 0.0),
+            }
+        else:
+            try:
+                summary = self.oanda.get_account_summary()
+            except Exception:
+                summary = {}
 
         # Include today's Tier 1 news events in the brief
         try:
@@ -809,32 +1358,55 @@ class ForexOrchestrator:
         """
         Send a regular standings update — 6H cadence.
         Mike always knows where things stand, even after overnight trades.
+
+        Weekly PnL source:
+          LIVE_PAPER → AccountState.week_pnl  (resets on ISO-week boundary,
+                        updated only on trade exits — closed system, no broker)
+          LIVE_REAL  → journal.get_current_week_stats() PnL (broker-sourced)
         """
         try:
-            week_stats   = self.journal.get_stats()
-            weekly_pnl   = sum(self.journal.get_weekly_pnl().values()) if self.journal.get_weekly_pnl() else 0.0
-            trades_week  = week_stats.get("trades_this_week", 0)
-            wins_week    = week_stats.get("wins_this_week", 0)
-            losses_week  = week_stats.get("losses_this_week", 0)
+            wk = self.journal.get_current_week_stats()
+            trades_week  = wk["trades_this_week"]
+            wins_week    = wk["wins_this_week"]
+            losses_week  = wk["losses_this_week"]
+
+            if self.account.mode == AccountMode.LIVE_PAPER:
+                # AccountState is the closed-system source of truth for paper equity.
+                # week_pnl resets on ISO-week boundary and only changes on apply_pnl()
+                # (i.e., actual simulated trade exits) — never from broker data.
+                weekly_pnl = self.account.week_pnl
+            else:
+                # LIVE_REAL: sum closed-trade PnL from journal for this week
+                weekly_pnl = wk["pnl_this_week"]
         except Exception:
             weekly_pnl = trades_week = wins_week = losses_week = 0
 
-        risk_status = self.risk.status(self.account_balance)
+        _std_bal    = self.account.safe_equity(self._equity_fallback)
+        risk_status = self.risk.status(_std_bal, consecutive_losses=self._consecutive_losses, dry_run=self.dry_run)
+
+        _base_risk    = risk_status["base_risk_pct"]
+        _risk_mode    = self.risk.regime_mode or "MEDIUM"
+        _mode_mult    = self.risk.regime_risk_multiplier()
+        _eff_risk_pct = self.risk.get_effective_risk_pct(_std_bal)
 
         self.notifier.send_standings(
-            account_balance  = self.account_balance,
-            nav              = self.account_nav,
-            unrealized_pnl   = self.unrealized_pnl,
-            weekly_pnl       = weekly_pnl,
-            peak_balance     = self.risk._peak_balance or self.account_balance,
-            risk_pct         = risk_status["risk_pct"],
-            tier_label       = risk_status["tier_label"],
-            open_positions   = self.strategy.open_positions,
-            trades_this_week = trades_week,
-            wins_this_week   = wins_week,
-            losses_this_week = losses_week,
-            mode             = risk_status["mode"],
-            regroup_ends     = self.risk.regroup_ends,
+            account_balance    = _std_bal,
+            nav                = self.account_nav,
+            unrealized_pnl     = self.unrealized_pnl,
+            weekly_pnl         = weekly_pnl,
+            peak_balance       = self.risk._peak_balance or self.account_balance,
+            risk_pct           = risk_status["risk_pct"],
+            tier_label         = risk_status["tier_label"],
+            open_positions     = self.strategy.open_positions,
+            trades_this_week   = trades_week,
+            wins_this_week     = wins_week,
+            losses_this_week   = losses_week,
+            mode               = risk_status["mode"],
+            regroup_ends       = self.risk.regroup_ends,
+            base_risk_pct      = _base_risk,
+            risk_mode          = _risk_mode,
+            mode_mult          = _mode_mult,
+            effective_risk_pct = _eff_risk_pct,
         )
 
     # ── Data Fetching ─────────────────────────────────────────────────
@@ -903,6 +1475,73 @@ class ForexOrchestrator:
 
     # ── Control File ──────────────────────────────────────────────────
 
+    def _write_scan_heartbeat(self) -> None:
+        """
+        Write a SCAN_HEARTBEAT entry to decision_log.jsonl after each hourly scan.
+        This keeps the dashboard Decision Feed alive even when no trades are entering.
+
+        Summarises: pairs scanned, decision breakdown, top WAIT setups.
+        """
+        import json as _json
+        try:
+            cs    = self._confluence_state   # populated by _capture_confluence
+            total = len(cs)
+            if total == 0:
+                return
+
+            wait_pairs    = [(p, v) for p, v in cs.items() if v.get("decision") == "WAIT"]
+            enter_pairs   = [p for p, v in cs.items() if v.get("decision") == "ENTER"]
+            blocked_pairs = [p for p, v in cs.items() if v.get("decision") == "BLOCKED"]
+
+            # Top WAIT setups: those with a pattern, sorted by confidence desc
+            top_wait = sorted(
+                [(p, v) for p, v in wait_pairs if v.get("pattern")],
+                key=lambda x: x[1].get("confidence", 0), reverse=True,
+            )[:3]
+            top_wait_notes = [
+                f"{p} {v.get('pattern','?')} {v.get('confidence',0):.0%}"
+                for p, v in top_wait
+            ]
+
+            entry = {
+                "ts":           datetime.now(timezone.utc).isoformat(),
+                "event":        "SCAN_HEARTBEAT",
+                "pair":         "ALL",
+                "pairs_scanned": total,
+                "wait_count":   len(wait_pairs),
+                "enter_count":  len(enter_pairs),
+                "blocked_count": len(blocked_pairs),
+                "top_watching": top_wait_notes,
+                "notes":        (
+                    f"ENTER: {enter_pairs[0]}" if enter_pairs
+                    else (f"WAIT: {top_wait_notes[0]}" if top_wait_notes
+                          else f"No setups — scanning {total} pairs")
+                ),
+                "regime_score": self._last_regime_score,
+            }
+            DECISIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(DECISIONS_FILE, "a") as f:
+                f.write(_json.dumps(entry) + "\n")
+        except Exception as e:
+            logger.warning(f"Could not write scan heartbeat: {e}")
+
+    def _load_whitelist(self) -> tuple[bool, set]:
+        """
+        Read logs/whitelist_live.json and return (enabled, pairs_set).
+        Returns (False, empty_set) if file missing → no whitelist active (all pairs evaluated).
+        Called once per scan cycle (not per-pair) to avoid repeated disk reads.
+        """
+        if not WHITELIST_LIVE_FILE.exists():
+            return False, set()
+        try:
+            data    = json.loads(WHITELIST_LIVE_FILE.read_text())
+            enabled = bool(data.get("enabled", False))
+            pairs   = set(str(p) for p in data.get("pairs", []))
+            return enabled, pairs
+        except Exception as e:
+            logger.warning(f"Could not read whitelist_live.json: {e}")
+            return False, set()
+
     def _check_control_file(self):
         """
         Read bot_control.json for commands relayed by Forge from Mike's Telegram.
@@ -957,12 +1596,73 @@ class ForexOrchestrator:
 
     # ── State Save ────────────────────────────────────────────────────
 
+    def _refresh_consecutive_losses(self):
+        """
+        Recompute _consecutive_losses from recent journal entries.
+        Called at the start of each state save so the dashboard is always current.
+        Scratch exits (|pnl| < 0.10 × risk) count as wins (don't extend streak).
+
+        Chop Shield (Part A): if streak first reaches CHOP_SHIELD_STREAK_THRESH,
+        auto-set pause_new_entries=True for CHOP_SHIELD_PAUSE_HOURS via control.json.
+        Does nothing when already paused with reason=AUTO_PAUSE_STREAK3.
+        """
+        try:
+            trades = self.journal.get_recent_trades(30)  # most-recent first
+            count = 0
+            for t in trades:
+                pnl = t.get("pnl", 0) or 0
+                r   = t.get("r",   None)
+                # Use R if available (more robust than pnl for micro-positions)
+                is_loss = (r is not None and r < -0.10) or (r is None and pnl < 0)
+                if is_loss:
+                    count += 1
+                else:
+                    break
+            self._consecutive_losses = count
+        except Exception:
+            pass  # keep existing value on error
+
+        # ── Chop Shield Part A: auto-pause on streak ≥ 3 ─────────────────
+        try:
+            _thresh = getattr(_sc, "CHOP_SHIELD_STREAK_THRESH", 3)
+            _hours  = getattr(_sc, "CHOP_SHIELD_PAUSE_HOURS", 48.0)
+            if self._consecutive_losses >= _thresh:
+                # Only trigger if not already paused by chop shield
+                _already_chop = "AUTO_PAUSE_STREAK3" in (self.control.reason or "")
+                if not _already_chop and not self.control.pause_new_entries:
+                    self.control.chop_pause(_hours, updated_by="bot")
+                    logger.warning(
+                        f"🛑  Chop Shield: streak={self._consecutive_losses}"
+                        f" ≥ {_thresh} — auto-paused for {_hours:.0f}h"
+                    )
+                    try:
+                        from .telegram_notify import send_telegram
+                        send_telegram(
+                            f"🛑 *Chop Shield Activated*\n"
+                            f"Loss streak: {self._consecutive_losses} consecutive losses\n"
+                            f"New entries paused for {_hours:.0f}h\n"
+                            f"Recovery rules apply after pause expires."
+                        )
+                    except Exception:
+                        pass
+        except Exception as _ex:
+            logger.debug(f"Chop Shield streak check failed: {_ex}")
+
     def _save_state(self):
         """Save full bot state to disk — dashboard reads this."""
         try:
-            risk_status = self.risk.status(self.account_balance)
+            self._refresh_consecutive_losses()
+            # Use safe equity so risk.status() always gets a float, even when
+            # broker equity is UNKNOWN.  Display layer will show UNKNOWN separately.
+            _safe_bal    = self.account.safe_equity(self._equity_fallback)
+            risk_status  = self.risk.status(
+                _safe_bal,
+                consecutive_losses=self._consecutive_losses,
+                dry_run=self.dry_run,
+            )
+            session_info = self._session_status()
             self.state.save(
-                account_balance  = self.account_balance,
+                account_balance  = _safe_bal,    # display fallback; equity_display shows UNKNOWN
                 dry_run          = self.dry_run,
                 halted           = self.risk.is_halted,
                 halt_reason      = self.risk.regroup_reason,
@@ -973,12 +1673,46 @@ class ForexOrchestrator:
                 mode             = risk_status["mode"],
                 confluence_state = self._confluence_state,
                 stats            = {
-                    "traded_patterns": len(self.strategy.traded_patterns),
-                    "mode":            risk_status["mode"],
-                    "tier":            risk_status["tier_label"],
-                    "peak_balance":    risk_status["peak_balance"],
-                    "regroup_ends":    risk_status["regroup_ends"],
+                    "traded_patterns":     len(self.strategy.traded_patterns),
+                    "mode":                risk_status["mode"],
+                    "tier":               risk_status["tier_label"],
+                    "peak_balance":        risk_status["peak_balance"],
+                    # nav / unrealized — mode-aware; None means broker fetch failed
+                    "nav":                self.account_nav,
+                    "unrealized_pnl":     self.unrealized_pnl,
+                    "drawdown_pct":        risk_status["drawdown_pct"],
+                    "regroup_ends":        risk_status["regroup_ends"],
+                    "base_risk_pct":       risk_status["base_risk_pct"],
+                    "final_risk_pct":      risk_status["final_risk_pct"],
+                    "dd_flag":             risk_status["dd_flag"],
+                    "active_cap_label":    risk_status["active_cap_label"],
+                    "final_risk_dollars":  risk_status["final_risk_dollars"],
+                    "consecutive_losses":  self._consecutive_losses,
+                    "paused":              risk_status["paused"],
+                    "paused_since":        risk_status["paused_since"],
+                    "peak_source":         risk_status["peak_source"],
+                    "session_allowed":     session_info["session_allowed"],
+                    "session_reason":      session_info["session_reason"],
+                    "next_session":        session_info["next_session"],
+                    "next_session_mins":   session_info["next_session_mins"],
                     "traded_pattern_keys": list(self.strategy.traded_patterns.keys()),
+                    "regime_score":        self._last_regime_score,
+                    # ── Control plane ─────────────────────────────────
+                    "pause_new_entries":   self.control.pause_new_entries,
+                    "pause_reason":        self.control.reason,
+                    "pause_updated_by":    self.control.updated_by,
+                    "pause_last_updated":  self.control.last_updated,
+                    # ── Regime mode (risk scaling) ────────────────────
+                    "risk_mode":           self.risk.regime_mode,
+                    "risk_mode_mult":      self.risk.regime_risk_multiplier(),
+                    "risk_mode_source":    (self._last_regime_score or {}).get("risk_mode_source", "AUTO"),
+                    "risk_mode_pinned":    self.control.risk_mode,
+                    "effective_risk_pct":  self.risk.get_effective_risk_pct(
+                                               self.account.safe_equity(self._equity_fallback)
+                                           ),
+                    "regime_weekly_caps":  self.risk.regime_weekly_caps(),
+                    # ── Account mode / equity source ──────────────────
+                    **{f"account_{k}": v for k, v in self.account.to_dict().items()},
                 },
             )
         except Exception as e:
@@ -986,19 +1720,70 @@ class ForexOrchestrator:
 
     # ── Heartbeat ─────────────────────────────────────────────────────
 
+    @property
+    def _equity_fallback(self) -> float:
+        """
+        Best available equity estimate when account.equity is None (LIVE_REAL broker failure).
+        Preference order:
+          1. risk._peak_balance  — last known peak (most accurate recent value)
+          2. SIM_STARTING_EQUITY — configured starting balance (never 0 or a random constant)
+        In LIVE_PAPER mode, account.equity is always set so this is never reached.
+        """
+        return self.risk._peak_balance or SIM_STARTING_EQUITY
+
+    def _session_status(self) -> dict:
+        """Current session block status + minutes to next valid entry window."""
+        try:
+            sf = self.strategy.session_filter
+            now = datetime.now(timezone.utc)
+            allowed, reason = sf.is_entry_allowed(now)
+            next_session, mins_until = sf.next_entry_window(now)
+            return {
+                "session_allowed":     allowed,
+                "session_reason":      reason if not allowed else "",
+                "next_session":        next_session,
+                "next_session_mins":   mins_until,
+            }
+        except Exception:
+            return {"session_allowed": True, "session_reason": "", "next_session": "", "next_session_mins": 0}
+
     def _write_heartbeat(self, status: str = "ok"):
         try:
-            risk_status = self.risk.status(self.account_balance)
+            _hb_bal       = self.account.safe_equity(self._equity_fallback)
+            risk_status   = self.risk.status(
+                _hb_bal,
+                consecutive_losses=self._consecutive_losses,
+                dry_run=self.dry_run,
+            )
+            session_info  = self._session_status()
             HEARTBEAT_FILE.write_text(json.dumps({
-                "timestamp":       datetime.now(timezone.utc).isoformat(),
-                "status":          status,
-                "mode":            risk_status["mode"],
-                "open_positions":  list(self.strategy.open_positions.keys()),
-                "account_balance": self.account_balance,
-                "risk_pct":        risk_status["risk_pct"],
-                "tier":            risk_status["tier_label"],
-                "regroup_ends":    risk_status["regroup_ends"],
-                "dry_run":         self.dry_run,
+                "timestamp":          datetime.now(timezone.utc).isoformat(),
+                "status":             status,
+                "mode":               risk_status["mode"],
+                "open_positions":     list(self.strategy.open_positions.keys()),
+                "account_balance":    _hb_bal,
+                "account_equity":     self.account.equity,        # None = UNKNOWN
+                "nav":                self.account_nav,            # None = UNKNOWN
+                "unrealized_pnl":     self.unrealized_pnl,
+                "account_mode":       self.account.mode.value,
+                "equity_source":      self.account.equity_source,
+                "equity_unknown":     self.account.is_unknown,
+                "risk_pct":           risk_status["risk_pct"],
+                "base_risk_pct":      risk_status["base_risk_pct"],
+                "final_risk_pct":     risk_status["final_risk_pct"],
+                "dd_flag":            risk_status["dd_flag"],
+                "active_cap_label":   risk_status["active_cap_label"],
+                "final_risk_dollars": risk_status["final_risk_dollars"],
+                "consecutive_losses": self._consecutive_losses,
+                "tier":               risk_status["tier_label"],
+                "drawdown_pct":       risk_status["drawdown_pct"],
+                "peak_balance":       risk_status["peak_balance"],
+                "regroup_ends":        risk_status["regroup_ends"],
+                "dry_run":             self.dry_run,
+                "session_allowed":     session_info["session_allowed"],
+                "session_reason":      session_info["session_reason"],
+                "next_session":        session_info["next_session"],
+                "next_session_mins":   session_info["next_session_mins"],
             }, indent=2))
         except Exception:
             pass

@@ -12,11 +12,13 @@
 <!-- Alpine.js -->
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 
-<!-- Chart.js -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+{% if page == 'live' %}
+<!-- Chart.js — only needed for the P&L bar chart on the live page -->
+<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+{% endif %}
 
-<!-- Phosphor Icons -->
-<script src="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/index.js"></script>
+<!-- Phosphor Icons — defer so it never blocks page render -->
+<script defer src="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/index.js"></script>
 
 <style>
   body { background: #0a0e1a; }
@@ -44,31 +46,116 @@
       <div class="font-bold text-lg leading-tight">Forge Bot</div>
       <div class="text-xs text-base-content/50">Set & Forget Forex Strategy</div>
     </div>
-    <div class="badge ml-2" :class="state.dry_run === false ? 'badge-error' : 'badge-success'">
-      <span x-text="state.dry_run === false ? '⚠️ LIVE' : '🧪 DRY RUN'"></span>
+    <!-- Account mode badge: replaces old DRY RUN / LIVE label -->
+    <div class="badge ml-2 font-mono"
+         :class="{
+           'badge-error':   state.account_mode === 'live_real',
+           'badge-warning': state.account_mode === 'live_paper',
+           'badge-ghost':   !state.account_mode || state.account_mode === 'backtest'
+         }"
+         :title="state.account_mode_label || state.account_mode">
+      <span x-text="state.account_mode === 'live_real'  ? '⚠️ LIVE REAL'   :
+                    state.account_mode === 'live_paper' ? '🧪 LIVE PAPER'  :
+                    state.account_mode === 'backtest'   ? '📊 BACKTEST'    :
+                    state.dry_run === false              ? '⚠️ LIVE REAL'   : '🧪 LIVE PAPER'"></span>
     </div>
     <div x-show="state.halted" class="badge badge-error gap-1 ml-1">
       <i class="ph ph-warning"></i> HALTED
     </div>
   </div>
-  <div class="flex-none gap-4 items-center">
-    <div class="text-right">
-      <div class="text-xs text-base-content/50">Account Balance</div>
-      <div class="font-mono font-bold text-success text-lg" x-text="'$' + fmt(state.account_balance)">—</div>
+  <div class="flex-none flex flex-wrap items-center justify-end gap-x-5 gap-y-2 text-right">
+    <div class="text-right min-w-[150px]">
+      <div class="flex items-center justify-end gap-1">
+        <span class="text-xs text-base-content/50 whitespace-nowrap">Account Balance</span>
+        <!-- Equity source chip -->
+        <span class="badge badge-xs font-mono"
+              :class="{
+                'badge-error':   state.equity_unknown,
+                'badge-success': state.equity_source === 'BROKER',
+                'badge-warning': state.equity_source === 'SIM',
+                'badge-ghost':   !state.equity_source
+              }"
+              x-text="state.equity_unknown ? 'UNKNOWN' :
+                       state.equity_source === 'BROKER'    ? 'BROKER'    :
+                       state.equity_source === 'SIM' ? 'SIM'       : '—'">
+        </span>
+      </div>
+      <div class="font-mono font-bold text-lg"
+           :class="state.equity_unknown ? 'text-error' : 'text-success'"
+           x-text="state.equity_unknown ? '— UNKNOWN —' : ('$' + fmt(state.account_balance))">—</div>
     </div>
-    <div class="text-right">
-      <div class="text-xs text-base-content/50">Risk/trade</div>
-      <div class="font-mono font-bold" x-text="(state.risk_pct || '—') + '%'">—</div>
+    <div class="text-right min-w-[180px]">
+      <div class="text-xs text-base-content/50 whitespace-nowrap">Risk / trade</div>
+      <div class="font-mono font-bold"
+           :class="state.dd_flag ? 'text-warning' : 'text-base-content'"
+           x-text="'$' + fmt(state.final_risk_dollars||0) + ' (' + (state.final_risk_pct||state.risk_pct||'—') + '%)'">—</div>
+      <div class="text-xs opacity-60" x-show="state.dd_flag" x-text="state.active_cap_label"></div>
     </div>
-    <div class="divider divider-horizontal m-0"></div>
-    <div class="flex items-center gap-2">
+    <div class="divider divider-horizontal m-0 hidden lg:flex"></div>
+    <div class="flex items-center gap-2 whitespace-nowrap">
       <div class="w-2 h-2 rounded-full pulse-green" :class="botOnline ? 'bg-success' : 'bg-error'"></div>
       <div class="text-xs">
         <div :class="botOnline ? 'text-success' : 'text-error'" x-text="botOnline ? 'Bot Online' : 'Bot Offline'"></div>
         <div class="text-base-content/40" x-text="lastSeen">—</div>
       </div>
     </div>
-    <div class="countdown font-mono text-sm opacity-40">
+    <!-- Pause / Resume controls (full bot stop) -->
+    <div class="flex gap-1">
+      <button class="btn btn-xs btn-error gap-1"
+              x-show="!state.paused"
+              @click="pauseBot()"
+              title="Full pause — stops all execution">
+        <i class="ph ph-pause-circle"></i> Pause
+      </button>
+      <button class="btn btn-xs btn-success gap-1"
+              x-show="state.paused"
+              @click="resumeBot()"
+              title="Resume trading">
+        <i class="ph ph-play-circle"></i> Resume
+      </button>
+    </div>
+    <!-- Pause Entries toggle (entries only — open positions still managed) -->
+    <div class="flex gap-1">
+      <button class="btn btn-xs btn-warning gap-1"
+              x-show="!state.pause_new_entries"
+              @click="pauseEntries()"
+              title="Block new entries only — open positions continue to be managed">
+        <i class="ph ph-hand"></i> Pause Entries
+      </button>
+      <button class="btn btn-xs btn-success gap-1"
+              x-show="state.pause_new_entries"
+              @click="resumeEntries()"
+              title="Allow new entries again">
+        <i class="ph ph-play"></i> Resume Entries
+      </button>
+    </div>
+    <!-- Risk Mode badge + selector -->
+    <div class="dropdown dropdown-end" x-data="{ rmOpen: false }">
+      <div tabindex="0" role="button"
+           class="badge badge-outline gap-1 font-mono text-xs cursor-pointer select-none"
+           :class="{
+             'badge-error':   state.risk_mode === 'EXTREME',
+             'badge-warning': state.risk_mode === 'HIGH',
+             'badge-info':    state.risk_mode === 'MEDIUM',
+             'badge-ghost':   state.risk_mode === 'LOW' || !state.risk_mode
+           }"
+           :title="'Risk Mode: ' + (state.risk_mode || 'AUTO') + ' [' + (state.risk_mode_source||'AUTO') + '] ' + (state.risk_mode_mult ? state.risk_mode_mult+'×' : '') + (state.effective_risk_pct ? '  eff=' + state.effective_risk_pct.toFixed(1)+'%' : '')"
+           @click="rmOpen = !rmOpen">
+        <span x-text="state.risk_mode ? ('MKT: ' + state.risk_mode + (state.risk_mode_source==='PINNED' ? ' 📌' : '')) : 'MKT: AUTO'"></span>
+        <span x-show="state.effective_risk_pct" class="opacity-60"
+              x-text="state.effective_risk_pct ? ' '+state.effective_risk_pct.toFixed(1)+'%' : ''"></span>
+      </div>
+      <ul x-show="rmOpen" @click.outside="rmOpen=false"
+          class="dropdown-content menu bg-base-200 rounded-box z-50 w-44 p-1 shadow text-xs">
+        <li class="menu-title text-xs opacity-50">Pin Risk Mode</li>
+        <template x-for="m in ['AUTO','LOW','MEDIUM','HIGH','EXTREME']" :key="m">
+          <li><a :class="(m==='AUTO' ? !state.risk_mode_pinned : state.risk_mode_pinned===m) ? 'font-bold text-primary' : ''"
+                 @click="rmOpen=false; setRiskMode(m==='AUTO' ? null : m)"
+                 x-text="m + (m==='AUTO' ? ' (dynamic)' : '')"></a></li>
+        </template>
+      </ul>
+    </div>
+    <div class="countdown font-mono text-sm opacity-40 hidden lg:block">
       <span x-text="refreshIn + 's'"></span>
     </div>
   </div>
@@ -84,23 +171,131 @@
   </span>
 </div>
 <!-- Paused banner -->
-<div x-show="state.mode === 'paused'" class="alert alert-error rounded-none">
-  <i class="ph ph-warning-diamond ph-bold text-xl"></i>
-  <span>⏸ <strong>BOT PAUSED</strong> — No new trades. Tell Forge "resume trading" to restart.</span>
+<div x-show="state.paused || state.mode === 'paused'" class="alert alert-error rounded-none flex justify-between">
+  <div class="flex items-center gap-3">
+    <i class="ph ph-warning-diamond ph-bold text-xl"></i>
+    <span>⏸ <strong>BOT PAUSED</strong> — No new entries.
+      <span x-show="state.paused_since" class="opacity-70">
+        Since <span x-text="state.paused_since ? new Date(state.paused_since).toLocaleString() : ''"></span>
+      </span>
+    </span>
+  </div>
+  <button class="btn btn-sm btn-success gap-1" @click="resumeBot()">
+    <i class="ph ph-play-circle"></i> Resume Trading
+  </button>
+</div>
+
+<!-- Entries paused banner (new entries blocked; open positions still managed) -->
+<div x-show="state.pause_new_entries && !state.paused"
+     class="alert alert-warning rounded-none flex justify-between">
+  <div class="flex items-center gap-3">
+    <i class="ph ph-hand ph-bold text-xl"></i>
+    <span>🟡 <strong>ENTRIES PAUSED</strong> — No new trades opened.
+      Open positions continue to be managed normally.
+      <span x-show="state.reason" class="opacity-70 ml-1">
+        Reason: <em x-text="state.reason"></em>
+      </span>
+      <span x-show="state.last_updated" class="opacity-50 ml-1 text-xs">
+        Set <span x-text="state.last_updated ? new Date(state.last_updated).toLocaleString() : ''"></span>
+        by <span x-text="state.updated_by || '?'"></span>
+      </span>
+    </span>
+  </div>
+  <button class="btn btn-sm btn-success gap-1" @click="resumeEntries()">
+    <i class="ph ph-play"></i> Resume Entries
+  </button>
+</div>
+
+<!-- Equity unknown banner (LIVE REAL only — broker fetch failed) -->
+<div x-show="state.equity_unknown && state.account_mode === 'live_real'"
+     class="alert alert-error rounded-none flex justify-between">
+  <div class="flex items-center gap-3">
+    <i class="ph ph-cloud-slash ph-bold text-xl"></i>
+    <span>🔴 <strong>EQUITY UNKNOWN</strong> — Broker fetch failed
+      (<span x-text="(state.broker_fetch_failures || '?') + ' consecutive failure(s)'"></span>).
+      New entries are blocked. Open positions continue to be managed.
+    </span>
+  </div>
+  <span class="badge badge-error font-mono text-xs">NO NEW ENTRIES</span>
+</div>
+
+<!-- ── WHY NOT TRADING? BANNER ───────────────────────────── -->
+<!-- Priority: kill-switch → session blocked → no setups. Paused has its own banner above. -->
+<div x-show="!state.paused && botOnline && state.dd_flag === 'DD_KILLSWITCH'"
+     class="alert alert-error rounded-none">
+  <i class="ph ph-skull ph-bold text-xl"></i>
+  <span>🛑 <strong>KILL-SWITCH ACTIVE</strong> — DD ≥ 40%. All new entries blocked until equity recovers.</span>
+</div>
+
+<div x-show="!state.paused && botOnline && state.dd_flag !== 'DD_KILLSWITCH' && !state.session_allowed"
+     class="alert alert-info rounded-none">
+  <i class="ph ph-clock ph-bold text-xl"></i>
+  <span>
+    🕐 <strong>SESSION CLOSED</strong> —
+    <span x-text="state.session_reason || 'Outside London/NY window'"></span>.
+    <span x-show="state.next_session_mins > 0">
+      Next <strong x-text="state.next_session || 'London'"></strong> open in
+      <strong x-text="state.next_session_mins >= 60
+        ? Math.floor(state.next_session_mins/60) + 'h ' + (state.next_session_mins%60) + 'm'
+        : state.next_session_mins + 'm'"></strong>.
+    </span>
+    <span x-show="state.next_session_mins === 0 && !state.session_allowed" class="ml-1 opacity-70">
+      (calculating…)
+    </span>
+  </span>
+</div>
+
+<!-- Whitelist active banner (info, not alarm) -->
+<div x-show="!state.paused && botOnline && state.whitelist_live_enabled"
+     class="alert alert-warning rounded-none py-2">
+  <i class="ph ph-funnel ph-bold text-xl"></i>
+  <span>
+    🔒 <strong>LIVE WHITELIST ON</strong> —
+    Trading only: <strong x-text="(state.whitelist_live_pairs||[]).join(', ') || '(none)'"></strong>.
+    <a href="/whitelist" class="underline ml-1 text-sm">Edit →</a>
+  </span>
+</div>
+
+<!-- No active setups -->
+<div x-show="!state.paused && botOnline && state.session_allowed && state.dd_flag !== 'DD_KILLSWITCH' && noActiveSetups && confluenceLoaded"
+     class="alert rounded-none py-2 bg-base-300/50 border-y border-base-300">
+  <i class="ph ph-binoculars text-base-content/40 text-xl"></i>
+  <span class="text-base-content/60">
+    👁 <strong>NO SETUPS</strong> — Scanning
+    <span x-text="confluence.length"></span> pairs.
+    No patterns at key levels yet. Checking again next scan.
+  </span>
+</div>
+
+<!-- Waiting for entry trigger (pattern found, no signal yet) -->
+<div x-show="!state.paused && botOnline && state.session_allowed && state.dd_flag !== 'DD_KILLSWITCH' && waitingForTrigger && !noActiveSetups"
+     class="alert rounded-none py-2 bg-base-300/30 border-y border-base-300">
+  <i class="ph ph-hourglass-medium text-warning/60 text-xl"></i>
+  <span class="text-base-content/60">
+    ⏳ <strong>WAITING FOR TRIGGER</strong> —
+    <span x-text="confluence.filter(c => c.decision==='WAIT' && c.pattern).length"></span>
+    pattern(s) at key level(s).
+    Watching for engulfing candle to confirm entry.
+  </span>
 </div>
 
 <!-- ── TAB NAV ────────────────────────────────────────────── -->
 <div class="px-6 pt-4 border-b border-base-300 bg-base-200 flex gap-1">
-  <button @click="activeTab='live'"
-    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
-    :class="activeTab==='live' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
+  <a href="/"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors
+           {% if page == 'live' %}bg-base-100 border-base-300 text-base-content{% else %}border-transparent text-base-content/40 hover:text-base-content/70{% endif %}">
     <i class="ph ph-pulse mr-1"></i> Live
-  </button>
-  <button @click="activeTab='backtests'; loadBacktests()"
-    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors"
-    :class="activeTab==='backtests' ? 'bg-base-100 border-base-300 text-base-content' : 'border-transparent text-base-content/40 hover:text-base-content/70'">
+  </a>
+  <a href="/backtests"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors
+           {% if page == 'backtests' %}bg-base-100 border-base-300 text-base-content{% else %}border-transparent text-base-content/40 hover:text-base-content/70{% endif %}">
     <i class="ph ph-chart-bar mr-1"></i> Backtests
-  </button>
+  </a>
+  <a href="/whitelist"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors
+           {% if page == 'whitelist' %}bg-base-100 border-base-300 text-base-content{% else %}border-transparent text-base-content/40 hover:text-base-content/70{% endif %}">
+    <i class="ph ph-funnel mr-1"></i> Whitelist
+  </a>
 </div>
 
 <!-- ── MAIN GRID ──────────────────────────────────────────── -->
@@ -108,21 +303,57 @@
 
   <!-- ── ACCOUNT STATS ROW ────────────────────────────── -->
   <div class="col-span-12 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-    <div class="stat bg-base-200 rounded-2xl border border-base-300">
-      <div class="stat-figure text-success"><i class="ph ph-currency-dollar ph-bold text-3xl"></i></div>
-      <div class="stat-title">Balance</div>
-      <div class="stat-value text-success font-mono text-2xl" x-text="'$' + fmt(state.account_balance || acct.balance)">—</div>
-      <div class="stat-desc" x-text="'NAV: $' + fmt(acct.nav)">—</div>
-    </div>
-    <div class="stat bg-base-200 rounded-2xl border border-base-300">
-      <div class="stat-figure" :class="(acct.unrealized_pnl||0) >= 0 ? 'text-success' : 'text-error'">
-        <i class="ph ph-trend-up ph-bold text-3xl" x-show="(acct.unrealized_pnl||0) >= 0"></i>
-        <i class="ph ph-trend-down ph-bold text-3xl" x-show="(acct.unrealized_pnl||0) < 0"></i>
+    <!-- Balance tile — shows equity source chip + UNKNOWN state -->
+    <div class="stat bg-base-200 rounded-2xl border border-base-300"
+         :class="state.equity_unknown ? 'border-error/50' : ''">
+      <div class="stat-figure"
+           :class="state.equity_unknown ? 'text-error' : 'text-success'">
+        <i class="ph ph-currency-dollar ph-bold text-3xl"></i>
       </div>
-      <div class="stat-title">Unrealized P&L</div>
-      <div class="stat-value font-mono text-2xl" :class="(acct.unrealized_pnl||0)>=0?'text-success':'text-error'"
-           x-text="((acct.unrealized_pnl||0)>=0?'+':'') + '$' + Math.abs(acct.unrealized_pnl||0).toFixed(2)">—</div>
-      <div class="stat-desc" x-text="(acct.open_trades||0) + ' open trade(s)'"></div>
+      <div class="stat-title flex items-center gap-1">
+        Equity
+        <span class="badge badge-xs font-mono ml-1"
+              :class="{
+                'badge-error':   state.equity_unknown,
+                'badge-success': state.equity_source === 'BROKER',
+                'badge-warning': state.equity_source === 'SIM'
+              }"
+              x-text="state.equity_unknown ? 'UNKNOWN' :
+                       state.equity_source === 'BROKER' ? 'BROKER' :
+                       state.equity_source === 'SIM' ? 'SIM' : '—'">
+        </span>
+      </div>
+      <div class="font-mono font-bold text-2xl mt-1"
+           :class="state.equity_unknown ? 'text-error' : 'text-success'"
+           x-text="state.equity_unknown ? '— UNKNOWN —' : ('$' + fmt(state.account_balance || acct.balance))">—</div>
+      <div class="stat-desc flex flex-col gap-0.5">
+        <span x-text="state.account_mode_label || (state.dry_run === false ? 'LIVE REAL' : 'LIVE PAPER')"></span>
+        <!-- NAV line: equity + unrealized, or N/A if unknown -->
+        <span :class="state.nav === null || state.nav === undefined ? 'text-warning' : ''"
+              x-text="(state.nav !== null && state.nav !== undefined)
+                       ? ('NAV: $' + fmt(state.nav) + (state.unrealized_pnl ? ' (' + (state.unrealized_pnl >= 0 ? '+' : '') + '$' + Math.abs(state.unrealized_pnl||0).toFixed(2) + ' unrealized)' : ''))
+                       : 'NAV: N/A'">
+        </span>
+      </div>
+    </div>
+    <!-- Planned Risk vs Session PnL tile -->
+    <div class="stat bg-base-200 rounded-2xl border border-base-300">
+      <div class="stat-figure"
+           :class="(state.realized_session_pnl||0) >= 0 ? 'text-success' : 'text-error'">
+        <i class="ph ph-scales ph-bold text-3xl"></i>
+      </div>
+      <div class="stat-title">Planned Risk / Session PnL</div>
+      <div class="font-mono font-bold text-lg mt-1"
+           :class="state.equity_unknown ? 'text-base-content/40' : 'text-base-content'"
+           x-text="state.equity_unknown ? '— / —' :
+                   ('$' + fmt(state.final_risk_dollars||0) + ' / ' +
+                    ((state.realized_session_pnl||0)>=0?'+':'') +
+                    '$' + Math.abs(state.realized_session_pnl||0).toFixed(2))">—</div>
+      <div class="stat-desc">
+        <span x-text="'Risk: ' + (state.final_risk_pct||state.risk_pct||'—') + '%'"></span>
+        <span x-show="state.equity_source === 'SIM'" class="ml-1 opacity-60">· simulated</span>
+        <span x-show="state.equity_source === 'BROKER'" class="ml-1 opacity-60">· broker confirmed</span>
+      </div>
     </div>
     <div class="stat bg-base-200 rounded-2xl border border-base-300">
       <div class="stat-figure text-info"><i class="ph ph-chart-line-up ph-bold text-3xl"></i></div>
@@ -148,7 +379,8 @@
       <div class="stat-value font-mono text-2xl"
            :class="(state.drawdown_pct||0) > 30 ? 'text-error' : (state.drawdown_pct||0) > 15 ? 'text-warning' : 'text-success'"
            x-text="(state.drawdown_pct||0) > 0 ? (state.drawdown_pct||0) + '%' : '✓ Peak'">—</div>
-      <div class="stat-desc" x-text="'KS trigger: 40% | Peak: $' + fmt(state.peak_balance||0)"></div>
+      <div class="stat-desc"
+           x-text="'KS trigger: 40% | Peak: $' + fmt(state.peak_balance||0) + ' (' + (state.peak_source||'broker') + ')'"></div>
     </div>
     <div class="stat bg-base-200 rounded-2xl border border-base-300"
          :class="state.mode==='regroup' ? 'border-warning/50' : state.mode==='paused' ? 'border-error/50' : 'border-success/20'">
@@ -161,6 +393,12 @@
            :class="state.mode==='active'?'text-success':state.mode==='regroup'?'text-warning':'text-error'"
            x-text="(state.mode||'—').toUpperCase()">—</div>
       <div class="stat-desc" x-text="(state.tier_label||'—') + ' · ' + (state.pattern_memory_count||0) + ' patterns locked'"></div>
+      <div class="stat-desc mt-1 font-semibold"
+           x-show="state.dd_flag"
+           :class="state.dd_flag === 'DD_KILLSWITCH' ? 'text-error' : 'text-warning'"
+           x-text="state.active_cap_label"></div>
+      <div class="stat-desc" x-show="state.consecutive_losses > 0"
+           x-text="'Streak: ' + state.consecutive_losses + ' loss' + (state.consecutive_losses > 1 ? 'es' : '')"></div>
     </div>
   </div>
 
@@ -323,7 +561,9 @@
             <div class="rounded-xl border p-4 pair-card" :class="{
               'border-success/40 bg-success/5':  c.decision === 'ENTER',
               'border-warning/30 bg-warning/5':  c.decision === 'WAIT' && c.confidence >= 0.60,
-              'border-base-300 bg-base-300/30':  c.decision === 'NO_TRADE' || c.confidence < 0.60
+              'border-error/20 bg-error/5':      c.decision === 'BLOCKED' && !c.whitelist_blocked,
+              'border-base-300/50 bg-base-300/10 opacity-50': c.whitelist_blocked,
+              'border-base-300 bg-base-300/30':  c.decision === 'NO_TRADE' || (c.decision !== 'BLOCKED' && c.confidence < 0.60)
             }">
 
               <!-- Header row -->
@@ -341,8 +581,9 @@
                   <span class="badge badge-xs" :class="{
                     'badge-success': c.decision==='ENTER',
                     'badge-warning': c.decision==='WAIT',
-                    'badge-ghost':   c.decision==='NO_TRADE'
-                  }" x-text="c.decision"></span>
+                    'badge-error':   c.decision==='BLOCKED' && !c.whitelist_blocked,
+                    'badge-ghost':   c.decision==='NO_TRADE' || c.whitelist_blocked
+                  }" x-text="c.whitelist_blocked ? 'WLIST' : c.decision"></span>
                 </div>
               </div>
 
@@ -396,9 +637,9 @@
                 </span>
               </div>
 
-              <!-- Waiting for -->
+              <!-- Waiting for / Blocked by -->
               <div class="text-xs" x-show="c.waiting_for && c.waiting_for.length > 0">
-                <span class="opacity-40">Waiting for: </span>
+                <span class="opacity-40" x-text="c.decision === 'BLOCKED' ? 'Blocked by: ' : 'Waiting for: '"></span>
                 <template x-for="(item, i) in (c.waiting_for||[])" :key="i">
                   <span>
                     <span :class="item.includes('Pip equity') ? 'text-error font-semibold' :
@@ -410,6 +651,22 @@
                     <span class="opacity-30" x-show="i < (c.waiting_for||[]).length - 1"> · </span>
                   </span>
                 </template>
+              </div>
+
+              <!-- Risk bar — shows what bot will actually risk on this pair's next entry -->
+              <div class="mt-2 pt-2 border-t border-base-300/50 text-xs flex items-center gap-2 flex-wrap"
+                   x-show="state.final_risk_dollars > 0 || state.dd_flag">
+                <span class="opacity-40">Risk:</span>
+                <span class="font-mono font-semibold"
+                      :class="state.dd_flag ? 'text-warning' : 'text-success'"
+                      x-text="'$' + fmt(state.final_risk_dollars||0) + ' (' + (state.final_risk_pct||state.risk_pct||'—') + '%)'"></span>
+                <span x-show="state.dd_flag" class="badge badge-xs"
+                      :class="state.dd_flag === 'DD_KILLSWITCH' ? 'badge-error' : 'badge-warning'"
+                      x-text="state.dd_flag"></span>
+                <span x-show="state.drawdown_pct > 0" class="opacity-50"
+                      x-text="'DD ' + (state.drawdown_pct||0) + '%'"></span>
+                <span x-show="state.consecutive_losses >= 2" class="opacity-50"
+                      x-text="'streak ' + state.consecutive_losses"></span>
               </div>
 
               <div class="text-xs opacity-30 mt-2" x-text="timeAgo(c.timestamp)"></div>
@@ -434,10 +691,12 @@
           <template x-for="(d, i) in recentDecisions" :key="i">
             <div class="flex gap-3 items-start text-sm">
               <div class="w-2 h-2 rounded-full mt-1.5 flex-shrink-0" :class="{
-                'bg-success': d.event==='TRADE_ENTERED'||d.event==='BREAKEVEN_MOVED',
-                'bg-error': d.event==='STOP_HIT'||d.event==='KILL_SWITCH',
-                'bg-warning': d.event==='EXIT_SIGNAL'||d.event==='SETUP_DETECTED',
-                'bg-base-content/20': d.event==='BLOCKED'
+                'bg-success':          d.event==='TRADE_ENTERED'||d.event==='BREAKEVEN_MOVED',
+                'bg-error':            d.event==='STOP_HIT'||d.event==='KILL_SWITCH',
+                'bg-warning':          d.event==='EXIT_SIGNAL'||d.event==='SETUP_DETECTED',
+                'bg-info/60':          d.event==='SCAN_HEARTBEAT',
+                'bg-primary/60':       d.event==='WHITELIST_UPDATE',
+                'bg-base-content/20':  d.event==='BLOCKED'||d.event==='SCAN_COMPLETE'||d.event==='CONTROL_PAUSE'||d.event==='CONTROL_RESUME'
               }"></div>
               <div class="flex-1 min-w-0">
                 <div class="flex gap-2">
@@ -585,13 +844,16 @@
     <div class="overflow-x-auto">
       <table class="table table-sm">
         <thead><tr>
-          <th>Run</th><th>Window</th><th>Return</th><th>Trades</th><th>WR</th><th>Net P&L</th><th>Model</th>
+          <th>Commit</th><th>Run date</th><th>Window</th><th>Return</th><th>Trades</th><th>WR</th><th>Net P&L</th><th>Model</th>
         </tr></thead>
         <tbody>
           <template x-for="id in btSelected" :key="id">
             <template x-if="btResults.find(r=>r._id===id)">
               <tr>
                 <td class="font-mono text-xs" x-text="btResults.find(r=>r._id===id).commit"></td>
+                <td class="font-mono text-xs text-base-content/50"
+                    :title="btResults.find(r=>r._id===id).run_dt"
+                    x-text="shortDt(btResults.find(r=>r._id===id).run_dt)"></td>
                 <td class="text-xs" x-text="btResults.find(r=>r._id===id).window_start.slice(0,10)+' → '+btResults.find(r=>r._id===id).window_end.slice(0,10)"></td>
                 <td class="font-mono font-bold"
                     :class="(btResults.find(r=>r._id===id).results.return_pct||0)>=0?'text-success':'text-error'"
@@ -632,6 +894,8 @@
               x-text="btResults[0]?.results?.n_trades+'T · '+btResults[0]?.results?.win_rate+'% WR · $'+Math.abs(btResults[0]?.results?.net_pnl||0).toFixed(0)"></span>
         <span class="font-mono text-xs" :class="btResults[0]?.commit?.includes('dirty')?'text-warning':'text-base-content/30'"
               x-text="btResults[0]?.commit"></span>
+        <span class="text-xs text-base-content/30 font-mono" :title="btResults[0]?.run_dt"
+              x-text="'run ' + shortDt(btResults[0]?.run_dt)"></span>
       </div>
     </div>
     <div class="overflow-x-auto">
@@ -639,12 +903,13 @@
         <thead>
           <tr class="text-base-content/50">
             <th>#</th>
-            <th>Date</th>
+            <th>Entry UTC</th>
+            <th>Exit UTC</th>
             <th>Pair</th>
             <th>Dir</th>
             <th>Pattern</th>
-            <th class="text-right">Entry</th>
-            <th class="text-right">Exit</th>
+            <th class="text-right">Entry px</th>
+            <th class="text-right">Exit px</th>
             <th class="text-right">Pips</th>
             <th class="text-right">R</th>
             <th class="text-right">P&L</th>
@@ -657,7 +922,10 @@
           <template x-for="(t, i) in latestTrades()" :key="t.pair+t.entry_ts">
             <tr :class="t.pnl > 0 ? 'hover:bg-success/5' : t.pnl < 0 ? 'hover:bg-error/5' : 'hover:bg-base-300/20'">
               <td class="text-base-content/30 text-xs" x-text="i+1"></td>
-              <td class="font-mono text-xs text-base-content/60" x-text="t.entry_ts?.slice(0,10)"></td>
+              <td class="font-mono text-xs text-base-content/70 whitespace-nowrap"
+                  x-text="tradeDt(t.entry_ts)"></td>
+              <td class="font-mono text-xs text-base-content/40 whitespace-nowrap"
+                  x-text="tradeDt(t.exit_ts)"></td>
               <td class="font-mono font-bold text-sm" x-text="t.pair"></td>
               <td>
                 <span class="badge badge-xs"
@@ -691,7 +959,7 @@
         </tbody>
         <tfoot x-show="btResults[0]">
           <tr class="border-t-2 border-base-300 font-bold">
-            <td colspan="9" class="text-right text-xs text-base-content/50">TOTAL</td>
+            <td colspan="10" class="text-right text-xs text-base-content/50">TOTAL</td>
             <td class="font-mono text-sm text-right"
                 :class="(btResults[0]?.results?.net_pnl||0)>=0?'text-success':'text-error'"
                 x-text="((btResults[0]?.results?.net_pnl||0)>=0?'+$':'−$')+Math.abs(btResults[0]?.results?.net_pnl||0).toFixed(0)"></td>
@@ -752,6 +1020,9 @@
             <!-- Commit -->
             <div class="font-mono text-xs" :class="run.commit.includes('dirty')?'text-warning':'text-base-content/30'"
                  x-text="run.commit"></div>
+            <!-- Run date -->
+            <div class="text-xs text-base-content/30 font-mono whitespace-nowrap" :title="run.run_dt"
+                 x-text="shortDt(run.run_dt)"></div>
             <!-- Expand chevron -->
             <i class="ph text-base-content/30 transition-transform duration-200"
                :class="btExpanded===run._id ? 'ph-caret-up' : 'ph-caret-down'"></i>
@@ -761,13 +1032,17 @@
           <div x-show="btExpanded===run._id" class="px-5 pb-4 bg-base-300/20">
             <table class="table table-xs mt-2">
               <thead><tr>
-                <th></th><th>Pair</th><th>Dir</th><th>Pattern</th>
-                <th>Entry</th><th>Exit</th><th>R</th><th>P&L</th><th>Reason</th>
+                <th></th><th>Entry UTC</th><th>Exit UTC</th><th>Pair</th><th>Dir</th><th>Pattern</th>
+                <th>Entry px</th><th>Exit px</th><th>R</th><th>P&L</th><th>Reason</th>
               </tr></thead>
               <tbody>
                 <template x-for="t in (run.trades||[])" :key="t.pair+t.entry_ts">
                   <tr>
                     <td x-text="t.pnl>=0?'✅':'❌'"></td>
+                    <td class="font-mono text-xs text-base-content/70 whitespace-nowrap"
+                        x-text="tradeDt(t.entry_ts)"></td>
+                    <td class="font-mono text-xs text-base-content/40 whitespace-nowrap"
+                        x-text="tradeDt(t.exit_ts)"></td>
                     <td class="font-mono font-bold" x-text="t.pair"></td>
                     <td>
                       <span class="badge badge-xs"
@@ -800,6 +1075,175 @@
       </template>
     </div>
   </div>
+
+  <!-- Whitelist shortcut -->
+  <div class="text-center py-2 opacity-50 text-sm">
+    <a href="/whitelist" class="underline">
+      <i class="ph ph-funnel mr-1"></i> Manage Pair Whitelist →
+    </a>
+  </div>
+
+</div>
+
+<!-- ── WHITELIST TAB ──────────────────────────────────────── -->
+<div x-show="activeTab==='whitelist'" class="p-6 space-y-5">
+
+  <!-- Scope toggle -->
+  <div class="flex items-center gap-3">
+    <span class="text-sm font-semibold uppercase tracking-widest text-base-content/50">Scope:</span>
+    <div class="join">
+      <button class="join-item btn btn-sm"
+              :class="wlScope==='live' ? 'btn-warning' : 'btn-ghost border border-base-300'"
+              @click="wlScope='live'; loadWhitelist('live')">
+        <i class="ph ph-pulse mr-1"></i> Live Trading
+      </button>
+      <button class="join-item btn btn-sm"
+              :class="wlScope==='backtest' ? 'btn-info' : 'btn-ghost border border-base-300'"
+              @click="wlScope='backtest'; loadWhitelist('backtest')">
+        <i class="ph ph-chart-bar mr-1"></i> Backtests
+      </button>
+    </div>
+    <span class="text-xs opacity-40 ml-2">
+      Live and Backtest are <strong>independent</strong> — changing one never affects the other.
+    </span>
+  </div>
+
+  <!-- Status card -->
+  <div class="bg-base-200 border rounded-2xl p-5 space-y-4"
+       :class="wlScope==='live' ? 'border-warning/30' : 'border-info/30'">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between">
+      <div class="font-bold text-sm uppercase tracking-widest text-base-content/50">
+        <span x-text="wlScope==='live' ? '🔴 Live Trading Whitelist' : '🔵 Backtest Whitelist'"></span>
+      </div>
+      <div class="flex items-center gap-3">
+        <span class="text-xs opacity-40"
+              x-text="wl.updated_at ? 'Saved ' + new Date(wl.updated_at).toLocaleString() : 'Not saved yet'"></span>
+        <span class="badge"
+              :class="wl.enabled
+                ? (wlScope==='live' ? 'badge-warning' : 'badge-info')
+                : 'badge-ghost'"
+              x-text="wl.enabled ? '🔒 ACTIVE' : '🔓 OFF'"></span>
+      </div>
+    </div>
+
+    <!-- What this scope does -->
+    <div class="text-xs opacity-50 bg-base-300/30 rounded-lg px-4 py-2">
+      <span x-show="wlScope==='live'">
+        When ACTIVE: orchestrator skips non-whitelisted pairs entirely (no OANDA API calls = quota saved).
+        Blocked pairs show as <strong>WLIST</strong> on the Live tab confluence cards.
+      </span>
+      <span x-show="wlScope==='backtest'">
+        When ACTIVE: backtester filters pairs after loading cache — only whitelisted pairs are simulated.
+        Useful for Alex-only runs without re-fetching data.
+      </span>
+    </div>
+
+    <!-- Enable toggle -->
+    <div class="flex items-center gap-4">
+      <label class="flex items-center gap-3 cursor-pointer">
+        <input type="checkbox" class="toggle"
+               :class="wlScope==='live' ? 'toggle-warning' : 'toggle-info'"
+               x-model="wl.enabled">
+        <span class="text-sm font-medium"
+              x-text="wl.enabled ? 'Whitelist ACTIVE — only selected pairs' : 'Off — all pairs evaluated'"></span>
+      </label>
+    </div>
+
+    <!-- Presets -->
+    <div>
+      <div class="text-xs text-base-content/40 mb-2 uppercase tracking-widest">Presets</div>
+      <div class="flex gap-2 flex-wrap">
+        <template x-for="[name, label, icon] in [
+          ['alex',    'Alex Core (7)',  '🎯'],
+          ['majors',  'Majors (7)',     '💱'],
+          ['jpy',     'JPY Complex',    '🇯🇵'],
+          ['chf',     'CHF Block',      '🇨🇭'],
+          ['wide',    'Wide (all)',     '🌐']
+        ]" :key="name">
+          <button @click="applyPreset(name)"
+                  class="btn btn-xs border"
+                  :class="JSON.stringify(wl.pairs) === JSON.stringify(wl.presets && wl.presets[name])
+                    ? (wlScope==='live' ? 'btn-warning' : 'btn-info')
+                    : 'btn-ghost border-base-300'">
+            <span x-text="icon + ' ' + label"></span>
+          </button>
+        </template>
+      </div>
+    </div>
+
+    <!-- Pair grid -->
+    <div>
+      <div class="text-xs text-base-content/40 mb-2 uppercase tracking-widest">
+        Pairs
+        <span class="ml-2 font-mono" x-text="'(' + (wl.pairs||[]).length + ' selected)'"></span>
+      </div>
+      <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 xl:grid-cols-6 gap-2">
+        <template x-for="pair in (wl.all_known_pairs || [])" :key="pair">
+          <label class="flex items-center gap-1.5 cursor-pointer p-2 rounded-lg border text-xs transition-all"
+                 :class="wl.pairs && wl.pairs.includes(pair)
+                   ? (wlScope==='live'
+                       ? 'border-warning/60 bg-warning/10 font-semibold'
+                       : 'border-info/60 bg-info/10 font-semibold')
+                   : 'border-base-300/30 opacity-40 hover:opacity-70'">
+            <input type="checkbox" class="checkbox checkbox-xs"
+                   :class="wlScope==='live' ? 'checkbox-warning' : 'checkbox-info'"
+                   :checked="wl.pairs && wl.pairs.includes(pair)"
+                   @change="togglePair(pair)">
+            <span class="font-mono" x-text="pair"></span>
+            <!-- Alex ★ marker -->
+            <span x-show="wl.presets && wl.presets.alex && wl.presets.alex.includes(pair)"
+                  class="ml-auto opacity-60 text-warning">★</span>
+          </label>
+        </template>
+      </div>
+    </div>
+
+    <!-- Save -->
+    <div class="flex items-center gap-3 pt-1 border-t border-base-300">
+      <button @click="saveWhitelist()"
+              class="btn btn-sm"
+              :class="wlScope==='live' ? 'btn-warning' : 'btn-info'"
+              :disabled="wlSaving">
+        <i class="ph ph-floppy-disk mr-1"></i>
+        <span x-text="wlSaving ? 'Saving…' : 'Save ' + (wlScope==='live' ? 'Live' : 'Backtest') + ' Whitelist'"></span>
+      </button>
+      <span class="text-xs" :class="wlMsg.includes('error')||wlMsg.includes('Error') ? 'text-error' : 'text-success'"
+            x-show="wlMsg" x-text="wlMsg"></span>
+    </div>
+  </div>
+
+  <!-- Live status summary (always visible) -->
+  <div class="grid grid-cols-2 gap-4 text-sm">
+    <div class="bg-base-200 border border-warning/20 rounded-2xl p-4 space-y-1">
+      <div class="text-xs uppercase tracking-widest text-base-content/40 mb-2">Live Trading</div>
+      <div class="flex items-center gap-2">
+        <span class="badge badge-sm" :class="state.whitelist_live_enabled ? 'badge-warning' : 'badge-ghost'"
+              x-text="state.whitelist_live_enabled ? '🔒 ACTIVE' : '🔓 OFF'"></span>
+        <span class="opacity-60 text-xs"
+              x-text="state.whitelist_live_enabled
+                ? (state.whitelist_live_pairs||[]).length + ' pairs'
+                : 'all pairs'"></span>
+      </div>
+      <div class="font-mono text-xs opacity-60"
+           x-text="state.whitelist_live_enabled ? (state.whitelist_live_pairs||[]).join(', ') : '(wide)'"></div>
+    </div>
+    <div class="bg-base-200 border border-info/20 rounded-2xl p-4 space-y-1">
+      <div class="text-xs uppercase tracking-widest text-base-content/40 mb-2">Backtests</div>
+      <div class="flex items-center gap-2">
+        <span class="badge badge-sm" :class="state.whitelist_backtest_enabled ? 'badge-info' : 'badge-ghost'"
+              x-text="state.whitelist_backtest_enabled ? '🔒 ACTIVE' : '🔓 OFF'"></span>
+        <span class="opacity-60 text-xs"
+              x-text="state.whitelist_backtest_enabled
+                ? (state.whitelist_backtest_pairs||[]).length + ' pairs'
+                : 'all pairs'"></span>
+      </div>
+      <div class="font-mono text-xs opacity-60"
+           x-text="state.whitelist_backtest_enabled ? (state.whitelist_backtest_pairs||[]).join(', ') : '(wide)'"></div>
+    </div>
+  </div>
+
 </div>
 
 <!-- ── Progress bar ─────────────────────────────────────── -->
@@ -818,6 +1262,20 @@ function dashboard() {
     botOnline: false, lastSeen: '—', refreshIn: REFRESH_SECS,
     confluenceSort: 'decision',
     confluenceLoaded: false,
+
+    // ── Why-not-trading computed helpers ───────────────────────────────
+    get noActiveSetups() {
+      // True when no pair has a pattern forming (all BLOCKED, NO_TRADE, or WAIT with no pattern)
+      return this.confluenceLoaded &&
+             this.confluence.filter(c => c.pattern && c.decision !== 'BLOCKED').length === 0;
+    },
+    get waitingForTrigger() {
+      // True when at least one pair has a pattern but no entry signal yet
+      return this.confluenceLoaded &&
+             this.confluence.some(c =>
+               c.decision === 'WAIT' && c.pattern && c.checks && !c.checks.entry_signal
+             );
+    },
 
     get sortedConfluence() {
       const arr = [...this.confluence];
@@ -839,20 +1297,120 @@ function dashboard() {
     newsEvents: [],
 
     // ── Backtests tab ───────────────────────────────────────────────
-    activeTab: 'live',
+    activeTab: '{{ page }}',
     btResults: [], btExpanded: null, btSelected: [],
     btStart: '2024-07-01', btEnd: '2024-10-31', btNotes: '',
     btRunning: false, btMsg: '', btPollTimer: null,
+    // ── Whitelist state ────────────────────────────────────────────────
+    wl: { enabled: false, pairs: [], all_known_pairs: [], presets: {}, updated_at: null, scope: 'live' },
+    wlScope: 'live',
+    wlSaving: false, wlMsg: '',
 
     async init() {
-      await this.refresh();
-      await this.fetchNews();
-      setInterval(() => this.refresh(), REFRESH_SECS * 1000);
-      setInterval(() => this.fetchNews(), 5 * 60 * 1000);  // refresh news every 5 min
-      setInterval(() => {
-        this.refreshIn = Math.max(0, this.refreshIn - 1);
-        this.progressPct = (this.refreshIn / REFRESH_SECS) * 100;
-      }, 1000);
+      const page = '{{ page }}';
+
+      if (page === 'live') {
+        await this.refresh();
+        await this.fetchNews();
+        setInterval(() => this.refresh(), REFRESH_SECS * 1000);
+        setInterval(() => this.fetchNews(), 5 * 60 * 1000);
+        setInterval(() => {
+          this.refreshIn = Math.max(0, this.refreshIn - 1);
+          this.progressPct = (this.refreshIn / REFRESH_SECS) * 100;
+        }, 1000);
+      } else if (page === 'backtests') {
+        await this.loadBacktests();
+      } else if (page === 'whitelist') {
+        await this.loadWhitelist('live');
+      }
+    },
+
+    async pauseBot() {
+      if (!confirm('Pause trading? The bot will stop entering new trades until you resume.')) return;
+      try {
+        const r = await fetch('/api/pause', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Dashboard pause request'})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.paused = true;
+          await this.refresh();
+        } else {
+          alert('Pause failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Pause request failed: ' + e); }
+    },
+
+    async resumeBot() {
+      try {
+        const r = await fetch('/api/resume', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Dashboard resume request'})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.paused = false;
+          await this.refresh();
+        } else {
+          alert('Resume failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Resume request failed: ' + e); }
+    },
+
+    async pauseEntries() {
+      if (!confirm('Pause new entries?\nOpen positions will continue to be managed.\nPersists across restarts.')) return;
+      try {
+        const r = await fetch('/api/pause_entries', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Dashboard pause entries'})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.pause_new_entries = true;
+          await this.refresh();
+        } else {
+          alert('Pause entries failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Pause entries request failed: ' + e); }
+    },
+
+    async resumeEntries() {
+      try {
+        const r = await fetch('/api/resume_entries', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Dashboard resume entries'})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.pause_new_entries = false;
+          await this.refresh();
+        } else {
+          alert('Resume entries failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Resume entries request failed: ' + e); }
+    },
+
+    async setRiskMode(mode) {
+      // mode = "LOW"|"MEDIUM"|"HIGH"|"EXTREME"|null (null = AUTO/clear pin)
+      try {
+        const r = await fetch('/api/set_risk_mode', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({mode: mode})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.state.risk_mode_pinned = mode;
+          await this.refresh();
+        } else {
+          alert('Set risk mode failed: ' + (d.error || 'unknown error'));
+        }
+      } catch(e) { alert('Set risk mode request failed: ' + e); }
     },
 
     async fetchNews() {
@@ -879,7 +1437,27 @@ function dashboard() {
           fetch('/api/weekly_pnl').then(r => r.json()),
         ]);
 
-        this.state    = status.heartbeat || {};
+        // Merge heartbeat with top-level status fields so templates can use state.X for all
+        const _topFields = ['mode','dry_run','halted','paused','paused_since',
+          'risk_pct','base_risk_pct','final_risk_pct','dd_flag','active_cap_label',
+          'final_risk_dollars','consecutive_losses','drawdown_pct','peak_balance',
+          'tier_label','total_pnl','total_trades','win_rate','account_balance',
+          'pattern_memory_count','regroup_ends',
+          'last_scan_ts','last_decision_ts','last_state_write_ts','engine_sha',
+          'peak_source','session_allowed','session_reason','next_session','next_session_mins',
+          'whitelist_live_enabled','whitelist_live_pairs','whitelist_live_updated_at',
+          'whitelist_backtest_enabled','whitelist_backtest_pairs','whitelist_backtest_updated_at',
+          'entry_trigger_mode','max_concurrent_live','max_concurrent_backtest',
+          'account_mode','account_mode_label','equity_source','equity_unknown',
+          'equity_display','realized_session_pnl','broker_fetch_failures',
+          'nav','unrealized_pnl',
+          'pause_new_entries','reason','updated_by','last_updated',
+          'risk_mode','risk_mode_source','risk_mode_pinned','risk_mode_mult',
+          'effective_risk_pct','regime_weekly_caps','regime_score'];
+        this.state = { ...(status.heartbeat || {}) };
+        for (const k of _topFields) {
+          if (status[k] !== undefined) this.state[k] = status[k];
+        }
         this.acct     = status.account   || {};
         this.stats    = status.stats     || {};
         this.openTrades    = status.open_trades || [];
@@ -938,9 +1516,11 @@ function dashboard() {
     fmt(n) { return (n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
 
     evtLabel(e) {
-      return { TRADE_ENTERED:'IN TRADE', SETUP_DETECTED:'SETUP', EXIT_SIGNAL:'⚠️ EXIT',
-               BREAKEVEN_MOVED:'BREAKEVEN', BLOCKED:'BLOCKED', STOP_HIT:'STOP HIT',
-               KILL_SWITCH:'🛑 HALTED', SCAN_COMPLETE:'SCAN DONE' }[e] || e;
+      return { TRADE_ENTERED:'🎯 ENTERED', SETUP_DETECTED:'SETUP', EXIT_SIGNAL:'⚠️ EXIT',
+               BREAKEVEN_MOVED:'BE MOVED', BLOCKED:'BLOCKED', STOP_HIT:'STOP HIT',
+               KILL_SWITCH:'🛑 HALTED', SCAN_COMPLETE:'SCAN DONE',
+               SCAN_HEARTBEAT:'📡 SCAN', WHITELIST_UPDATE:'🔒 WHITELIST',
+               CONTROL_PAUSE:'⏸ PAUSED', CONTROL_RESUME:'▶ RESUMED' }[e] || e;
     },
 
     trendColor(t) {
@@ -960,6 +1540,29 @@ function dashboard() {
       if (diff < 3600) return Math.floor(diff/60) + 'm ago';
       if (diff < 86400)return Math.floor(diff/3600) + 'h ago';
       return new Date(ts).toLocaleDateString();
+    },
+    shortDt(ts) {
+      // "Feb 26 08:14" — compact run timestamp for backtest history rows (local time)
+      if (!ts) return '—';
+      const d = new Date(ts);
+      const mon = d.toLocaleDateString('en-US', {month:'short'});
+      const day = d.getDate();
+      const hh  = String(d.getHours()).padStart(2,'0');
+      const mm  = String(d.getMinutes()).padStart(2,'0');
+      return `${mon} ${day} ${hh}:${mm}`;
+    },
+    tradeDt(ts) {
+      // "2024-07-02 09:00" — backtest trade timestamp in UTC so it matches
+      // TradingView / OANDA chart candles directly (OANDA uses UTC).
+      // Always shows full date so trades from different years are unambiguous.
+      if (!ts) return '—';
+      const d = new Date(ts);
+      const y   = d.getUTCFullYear();
+      const mo  = String(d.getUTCMonth()+1).padStart(2,'0');
+      const day = String(d.getUTCDate()).padStart(2,'0');
+      const hh  = String(d.getUTCHours()).padStart(2,'0');
+      const mm  = String(d.getUTCMinutes()).padStart(2,'0');
+      return `${y}-${mo}-${day} ${hh}:${mm}`;
     },
 
     // ── Latest run trade list helpers ──────────────────────────────
@@ -1022,6 +1625,61 @@ function dashboard() {
       }
     },
 
+    // ── Whitelist methods ──────────────────────────────────────────────
+    async loadWhitelist(scope) {
+      scope = scope || this.wlScope || 'live';
+      this.wlScope = scope;
+      try {
+        const r = await fetch(`/api/whitelist?scope=${scope}`);
+        const d = await r.json();
+        this.wl = { ...this.wl, ...d, scope };
+      } catch(e) {
+        console.warn('Could not load whitelist:', e);
+      }
+    },
+
+    async saveWhitelist() {
+      this.wlSaving = true;
+      this.wlMsg = '';
+      const scope = this.wlScope || 'live';
+      try {
+        const r = await fetch(`/api/whitelist?scope=${scope}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled: this.wl.enabled,
+            pairs:   this.wl.pairs,
+            reason:  `Dashboard update (${scope})`,
+          }),
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          this.wlMsg = `✅ ${d.message}`;
+          this.wl.updated_at = new Date().toISOString();
+          await this.refresh();
+        } else {
+          this.wlMsg = '⚠️ Error: ' + (d.error || 'unknown');
+        }
+      } catch(e) {
+        this.wlMsg = 'Error: ' + e.message;
+      }
+      this.wlSaving = false;
+    },
+
+    applyPreset(name) {
+      const preset = (this.wl.presets || {})[name];
+      if (!preset) return;
+      this.wl.pairs   = [...preset];
+      this.wl.enabled = (name !== 'wide');
+    },
+
+    togglePair(pair) {
+      if (!this.wl.pairs) this.wl.pairs = [];
+      const idx = this.wl.pairs.indexOf(pair);
+      if (idx >= 0) this.wl.pairs.splice(idx, 1);
+      else          this.wl.pairs.push(pair);
+    },
+
     tagColor(tag) {
       if (tag.includes('engulfing_only'))  return 'badge-info';
       if (tag.includes('pin_bars'))        return 'badge-warning';
@@ -1035,5 +1693,21 @@ function dashboard() {
   };
 }
 </script>
+<!-- ── FOOTER ──────────────────────────────────────────────── -->
+<div class="px-6 py-3 border-t border-base-300 bg-base-200/50 flex flex-wrap gap-x-6 gap-y-1 text-xs text-base-content/30 font-mono">
+  <span>engine: <span x-text="state.engine_sha || 'unknown'"></span></span>
+  <span x-show="state.last_scan_ts">last scan: <span x-text="state.last_scan_ts ? timeAgo(state.last_scan_ts) : '—'"></span></span>
+  <span x-show="state.last_decision_ts">last decision: <span x-text="state.last_decision_ts ? timeAgo(state.last_decision_ts) : '—'"></span></span>
+  <span x-show="state.last_state_write_ts">state written: <span x-text="state.last_state_write_ts ? timeAgo(state.last_state_write_ts) : '—'"></span></span>
+  <span x-text="'server: ' + (state.server_time ? new Date(state.server_time).toLocaleTimeString() : '—')"></span>
+  <span x-show="state.entry_trigger_mode"
+        :class="state.entry_trigger_mode === 'engulf_only' ? '' : 'text-warning'"
+        x-text="'trigger: ' + (state.entry_trigger_mode || '—')"></span>
+  <span x-show="state.max_concurrent_live !== undefined"
+        x-text="'concurrent: live=' + state.max_concurrent_live + ' bt=' + state.max_concurrent_backtest"></span>
+  <span x-show="state.regime_score"
+        :class="state.regime_score?.regime_score >= 3.0 ? 'text-success' : ''"
+        x-text="state.regime_score ? 'market state: ' + (state.regime_score.risk_mode || state.regime_score.regime_score?.toFixed(1) || '—') + (state.risk_mode_mult && state.risk_mode_mult !== 1 ? ' ' + state.risk_mode_mult + '×' : '') : ''"></span>
+</div>
 </body>
 </html>

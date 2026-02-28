@@ -85,15 +85,35 @@ class Notifier:
         key_level:    float,
         overnight:    bool = False,
         dry_run:      bool = False,
+        account_mode: str  = "",     # "live_paper" | "live_real" | ""
     ):
-        """Fires the moment a trade is placed — especially important for overnight entries."""
+        """Fires the moment a trade is placed — especially important for overnight entries.
+
+        Label logic:
+          account_mode="live_paper" → 🧪 PAPER ENTERED (SIM)
+          account_mode="live_real"  → 🎯 LIVE ENTERED (real order placed)
+          overnight                 → prepended with 🌙 OVERNIGHT
+        The old dry_run bool is kept for backward compat but account_mode wins.
+        """
         arrow   = "⬆️ LONG" if direction == "long" else "⬇️ SHORT"
         pips    = abs(entry_price - stop_price) * (100 if "JPY" in pair else 10_000)
-        mode    = "🌙 OVERNIGHT AUTO-EXECUTE" if overnight else "🎯 TRADE ENTERED"
-        dry_tag = " [DRY RUN]" if dry_run else ""
+
+        # ── Determine label from account_mode (preferred) or dry_run (legacy) ──
+        _mode = (account_mode or "").lower()
+        if _mode == "live_paper":
+            entry_label = "🧪 PAPER ENTERED (SIM)"
+        elif _mode == "live_real":
+            entry_label = "🎯 LIVE ENTERED"
+        elif dry_run:
+            entry_label = "🧪 PAPER ENTERED (SIM)"
+        else:
+            entry_label = "🎯 LIVE ENTERED"
+
+        if overnight:
+            entry_label = "🌙 OVERNIGHT " + entry_label
 
         self.send(
-            f"<b>{mode}{dry_tag}</b>\n\n"
+            f"<b>{entry_label}</b>\n\n"
             f"  Pair:    <b>{pair}</b>  {arrow}\n"
             f"  Entry:   {entry_price:.5f}\n"
             f"  Stop:    {stop_price:.5f}  ({pips:.1f} pips)\n"
@@ -145,19 +165,24 @@ class Notifier:
 
     def send_standings(
         self,
-        account_balance:  float,
-        nav:              float,
-        unrealized_pnl:   float,
-        weekly_pnl:       float,
-        peak_balance:     float,
-        risk_pct:         float,
-        tier_label:       str,
-        open_positions:   dict,
-        trades_this_week: int,
-        wins_this_week:   int,
-        losses_this_week: int,
-        mode:             str = "active",
-        regroup_ends:     Optional[datetime] = None,
+        account_balance:    float,
+        nav,                # float | None — None shown as N/A (broker unknown)
+        unrealized_pnl:     float,
+        weekly_pnl:         float,
+        peak_balance:       float,
+        risk_pct:           float,
+        tier_label:         str,
+        open_positions:     dict,
+        trades_this_week:   int,
+        wins_this_week:     int,
+        losses_this_week:   int,
+        mode:               str   = "active",
+        regroup_ends:       Optional[datetime] = None,
+        # ── Risk decomposition (removes "(?)" ambiguity) ──────────
+        base_risk_pct:      float = 0.0,   # raw tier %  e.g. 6.0
+        risk_mode:          str   = "",    # "LOW" | "MEDIUM" | "HIGH" | "EXTREME"
+        mode_mult:          float = 1.0,   # mode multiplier  e.g. 0.5
+        effective_risk_pct: float = 0.0,   # base × mult before DD caps
     ):
         """
         Regular standings update — send every 6 hours so Mike always
@@ -193,15 +218,29 @@ class Notifier:
         weekly_tag  = f"+${weekly_pnl:,.0f}" if weekly_pnl >= 0 else f"-${abs(weekly_pnl):,.0f}"
         dd_tag      = f"{drawdown_from_peak:.1f}% from peak" if drawdown_from_peak > 1 else "✅ Near peak"
 
+        # ── Risk/trade line: full decomposition when available ────────
+        if base_risk_pct > 0 and risk_mode:
+            _eff = effective_risk_pct if effective_risk_pct > 0 else base_risk_pct * mode_mult
+            _risk_line = (
+                f"{base_risk_pct:.0f}% base"
+                f" × {mode_mult:.1f}× {risk_mode}"
+                f" = {_eff:.1f}% eff"
+            )
+            # Show active cap if final is materially below effective
+            if risk_pct < _eff - 0.1:
+                _risk_line += f"  → capped {risk_pct:.0f}%"
+        else:
+            _risk_line = f"{risk_pct:.0f}%  ({tier_label})"
+
         self.send(
             f"<b>📊 Standings Update</b>\n\n"
             f"  Mode:      {mode_tag}{ends_tag}\n"
             f"  Balance:   <b>${account_balance:,.2f}</b>\n"
-            f"  NAV:       ${nav:,.2f}  (unrealized: ${unrealized_pnl:+,.2f})\n"
+            f"  NAV:       {('$'+f'{nav:,.2f}') if nav is not None else 'N/A'}  (unrealized: ${unrealized_pnl:+,.2f})\n"
             f"  This week: {weekly_tag}  |  {wins_this_week}W / {losses_this_week}L  "
             f"({trades_this_week} trade{'s' if trades_this_week != 1 else ''})\n"
             f"  Drawdown:  {dd_tag}\n"
-            f"  Risk/trade: {risk_pct:.0f}%  ({tier_label})\n\n"
+            f"  Risk/trade: {_risk_line}\n\n"
             f"  <b>Open positions:</b>\n{pos_block}"
         )
 

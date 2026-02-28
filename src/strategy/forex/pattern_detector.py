@@ -53,12 +53,24 @@ class PatternResult:
     neckline: float          # key level to watch for break/retest
     entry_zone_low: float    # entry zone bottom
     entry_zone_high: float   # entry zone top
-    stop_loss: float         # logical stop placement
+    stop_loss: float         # logical stop placement (legacy — kept for fallback)
     target_1: float          # conservative target (1:2 R:R)
     target_2: float          # extended target (1:4+ R:R)
     clarity: float           # 0.0–1.0 (1.0 = textbook pattern)
     notes: str = ""
     pattern_level: float = 0.0  # the structural price to validate against round numbers:
+                                 #   see full description below
+    # stop_anchor: the RAW structural extreme stop should go behind — NO buffer included.
+    # targeting.get_structure_stop() adds only a tight pip buffer to this value.
+    #   H&S bearish  → right shoulder high (rs price from swing detection)
+    #   IH&S bullish → right shoulder low
+    #   double top   → highest of the two peaks (peak_high)
+    #   double bottom→ lowest of the two troughs (trough_low)
+    #   break/retest → the broken consolidation level (neckline / consol boundary)
+    #   consol break → same boundary
+    #   liquidity sw → sweep candle extreme (bar_high / bar_low)
+    # None = pattern detector didn't set it; get_structure_stop() falls back to ATR
+    stop_anchor: Optional[float] = None
                                  #   double_bottom → average of the two lows (the support floor)
                                  #   double_top    → average of the two highs (the resistance ceiling)
                                  #   H&S / IH&S   → neckline (the level everyone is watching)
@@ -345,6 +357,7 @@ class PatternDetector:
                 entry_zone_low=entry_low,
                 entry_zone_high=entry_high,
                 stop_loss=stop,
+                stop_anchor=rs,           # right shoulder high — buffer added by get_structure_stop()
                 target_1=neckline - (h - neckline),       # measured move
                 target_2=neckline - (h - neckline) * 1.5,
                 clarity=clarity,
@@ -413,6 +426,7 @@ class PatternDetector:
                 entry_zone_low=entry_low,
                 entry_zone_high=entry_high,
                 stop_loss=stop,
+                stop_anchor=rs,           # right shoulder low — buffer added by get_structure_stop()
                 target_1=neckline + abs(neckline - h),
                 target_2=neckline + abs(neckline - h) * 1.5,
                 clarity=clarity,
@@ -472,6 +486,7 @@ class PatternDetector:
                 entry_zone_low=valley,
                 entry_zone_high=valley * (1 + self.tol),
                 stop_loss=stop,
+                stop_anchor=peak_high,    # highest of the two tops — buffer added by get_structure_stop()
                 target_1=valley - measured_move,
                 target_2=valley - measured_move * 1.5,
                 clarity=clarity,
@@ -512,6 +527,7 @@ class PatternDetector:
                 entry_zone_low=peak * (1 - self.tol),
                 entry_zone_high=peak,
                 stop_loss=stop,
+                stop_anchor=trough_low,   # lowest of the two bottoms — buffer added by get_structure_stop()
                 target_1=peak + measured_move,
                 target_2=peak + measured_move * 1.5,
                 clarity=clarity,
@@ -568,6 +584,7 @@ class PatternDetector:
                     entry_zone_low=retest_zone_low,
                     entry_zone_high=retest_zone_high,
                     stop_loss=consol_low * (1 + self.tol * 4),
+                    stop_anchor=consol_low,   # broken level; get_structure_stop() finds retest rejection high above this
                     target_1=current_close - consol_range,
                     target_2=current_close - consol_range * 2,
                     clarity=clarity,
@@ -588,6 +605,7 @@ class PatternDetector:
                     entry_zone_low=retest_zone_low,
                     entry_zone_high=retest_zone_high,
                     stop_loss=consol_high * (1 - self.tol * 4),
+                    stop_anchor=consol_high,  # broken level; get_structure_stop() finds retest rejection low below this
                     target_1=current_close + consol_range,
                     target_2=current_close + consol_range * 2,
                     clarity=clarity,
@@ -700,6 +718,7 @@ class PatternDetector:
                     entry_zone_low  = bar_close * (1 - self.tol),
                     entry_zone_high = swing_high,
                     stop_loss     = stop,
+                    stop_anchor   = bar_high,     # sweep wick high — stop goes above this + buffer
                     target_1      = swing_high - target_dist,
                     target_2      = swing_high - target_dist * 1.5,
                     clarity       = clarity,
@@ -753,6 +772,7 @@ class PatternDetector:
                     entry_zone_low  = swing_low,
                     entry_zone_high = bar_close * (1 + self.tol),
                     stop_loss     = stop,
+                    stop_anchor   = bar_low,      # sweep wick low — stop goes below this + buffer
                     target_1      = swing_low + target_dist,
                     target_2      = swing_low + target_dist * 1.5,
                     clarity       = clarity,
@@ -882,6 +902,7 @@ class PatternDetector:
                 entry_zone_low=entry_low,
                 entry_zone_high=entry_high,
                 stop_loss=stop,
+                stop_anchor=c_high,       # consolidation ceiling — stop goes above this + buffer
                 target_1=target_1,
                 target_2=target_2,
                 clarity=clarity,
@@ -919,6 +940,7 @@ class PatternDetector:
                 entry_zone_low=entry_low,
                 entry_zone_high=entry_high,
                 stop_loss=stop,
+                stop_anchor=c_low,        # consolidation floor — stop goes below this + buffer
                 target_1=target_1,
                 target_2=target_2,
                 clarity=clarity,
