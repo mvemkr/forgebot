@@ -823,13 +823,12 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     dd_killswitch_blocks: int = 0   # count of entries blocked by 40% DD killswitch
     _eval_calls: int = 0            # performance counter: evaluate() call count
     _eval_ms:    float = 0.0        # total ms spent in evaluate()
-    # Regime hysteresis is NOT tracked entry-to-entry.
-    # Alex's ~1 trade/week frequency means entries are too sparse for the
-    # 2-bar consecutive requirement to ever accumulate across entries.
-    # Instead: ALL-4 conditions evaluated instantaneously at each entry.
-    # Hysteresis (2-bar consecutive) is only meaningful in the H4 time-sampling
-    # loop which iterates at true H4 granularity.
-    # Entry evaluations always receive consec=1 (bypass) + demote=0 (clean slate).
+    # Regime mode at entry: instantaneous snapshot (no hysteresis state).
+    # Alex's ~1 trade/week cadence is too sparse for 2-bar consecutive
+    # accumulation across entries.  compute_risk_mode(instantaneous=True)
+    # grants HIGH/EXTREME immediately when ALL conditions are met at the
+    # entry bar — no consec/demote state carried between entries.
+    # 2-bar hysteresis runs only in the H4 time-sampling loop below.
 
     # ── Alex small-account gate counters ───────────────────────────────────
     _weekly_trade_counts:   dict = {}  # {(iso_year, iso_week): count} — opened trades
@@ -1606,13 +1605,12 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     recent_trades         = trades,      # closed trades so far
                     loss_streak           = consecutive_losses,
                     dd_pct                = _dd_pct_entry,
-                    # Bypass 2-bar hysteresis at entry level: Alex's ~1 trade/week
-                    # frequency means entries are too sparse for the consecutive
-                    # bar requirement to accumulate. Pass consec=1 so ALL-4
-                    # conditions alone determine mode — no state needed across entries.
-                    # 2-bar hysteresis is enforced in the H4 time-sampling loop only.
-                    consecutive_high_bars = 1,
-                    demotion_streak       = 0,
+                    # Instantaneous evaluation: Alex's ~1 trade/week cadence is too
+                    # sparse for 2-bar consecutive accumulation across entries.
+                    # HIGH/EXTREME granted immediately when ALL conditions are met at
+                    # this exact bar — no state carried between entries.
+                    # 2-bar hysteresis runs only in the H4 time-sampling loop.
+                    instantaneous         = True,
                 )
                 # Debug: log every HIGH/EXTREME promotion with full inputs.
                 if _rms_entry.promotion_note:

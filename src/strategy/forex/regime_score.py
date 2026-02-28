@@ -384,6 +384,7 @@ def compute_risk_mode(
     dd_pct:                float = 0.0,
     consecutive_high_bars: int   = 0,
     demotion_streak:       int   = 0,
+    instantaneous:         bool  = False,
 ) -> RegimeModeScore:
     """Compute risk mode from four conditions + promotion/demotion hysteresis.
 
@@ -394,11 +395,13 @@ def compute_risk_mode(
       4. Loss streak <= 1    – allows one-loss streaks through (EXTREME still requires 0)
       5. Promotion hysteresis – ALL conditions must hold for ≥2 consecutive evals
                                 (caller persists consecutive_high_bars across calls)
+                                *Skipped when instantaneous=True*
 
     Demotion hysteresis (from HIGH):
       - Soft demotion: requires 2 consecutive failing H4 bars to demote HIGH→MED
         (caller persists demotion_streak across calls)
       - Immediate demotion: loss_streak ≥ 2 hard-resets both counters at once
+      *Skipped when instantaneous=True*
 
     ATR hysteresis band:
       - Promote: atr_ratio >= 1.10 (ATR_RATIO_THRESH)
@@ -408,6 +411,13 @@ def compute_risk_mode(
     EXTREME promotion: HIGH eligible + score==4 (all 4 booleans True, forces streak==0)
       + last10_sum_R >= 1.5 + dd < 10%
 
+    instantaneous=True — pure snapshot, no hysteresis (for entry-time use):
+      At ~1 trade/week, entries are too sparse for 2-bar consecutive accumulation.
+      HIGH eligible iff ALL conditions met right now AND no hard-reset trigger.
+      EXTREME eligible iff HIGH eligible + score==4 + last10 + DD gates.
+      consecutive_high_bars and demotion_streak are passed through unchanged.
+      2-bar hysteresis is enforced only in the H4 time-sampling loop.
+
     Args:
         trend_weekly, trend_daily : bias strings ("bullish" / "bearish" / ...)
         df_h4                     : H4 OHLC DataFrame, ≥21 bars for ATR
@@ -416,6 +426,7 @@ def compute_risk_mode(
         dd_pct                    : current drawdown % from peak (EXTREME gate)
         consecutive_high_bars     : qualifying-bar count from previous call (persisted)
         demotion_streak           : consecutive failing bars from previous call (persisted)
+        instantaneous             : if True, skip all hysteresis — pure snapshot evaluation
 
     Returns:
         RegimeModeScore with updated consecutive_high_bars + demotion_streak for caller to store.
@@ -474,45 +485,57 @@ def compute_risk_mode(
     # ── Immediate hard reset: loss_streak ≥ 2 or severe ATR compression ──
     _hard_reset = loss_streak >= 2 or atr_ratio < ATR_DEMOTE_THRESH
 
-    # ── Hysteresis counter update ─────────────────────────────────────────
-    # Promotion counter:
-    #   +1 each qualifying bar; hard-reset to 0 on immediate demote;
-    #   held (frozen) during soft-demotion grace period so re-promotion
-    #   requires fresh 2-bar accumulation after full demotion.
-    # Demotion counter:
-    #   increments while conditions fail (no hard-reset), resets on qualifying bar.
-    #   When demotion_streak_out >= 2, promotion counter is also zeroed.
-    if _hard_reset:
-        consec_out  = 0
-        demote_out  = 0
-    elif high_conds_met:
-        consec_out  = consecutive_high_bars + 1
-        demote_out  = 0
-    elif consecutive_high_bars >= 2:
-        # Previously promoted — enter/continue soft-demotion grace period
-        demote_out  = demotion_streak + 1
-        if demote_out >= 2:
-            # Grace expired: zero promotion counter so re-promotion needs fresh run
-            consec_out = 0
-        else:
-            consec_out = consecutive_high_bars   # hold during grace bar
+    # ── Instantaneous path (entry-time use; no hysteresis) ───────────────
+    # At ~1 trade/week cadence, entries are too sparse for 2-bar consecutive
+    # accumulation.  When instantaneous=True we skip all counter state and
+    # evaluate purely from the current snapshot: HIGH eligible iff all
+    # conditions are met AND no hard-reset trigger fires right now.
+    # consecutive_high_bars / demotion_streak are passed through unchanged.
+    if instantaneous:
+        consec_out    = consecutive_high_bars   # passthrough — not modified
+        demote_out    = demotion_streak         # passthrough — not modified
+        _in_grace     = False
+        high_eligible = high_conds_met and not _hard_reset
     else:
-        # Never entered HIGH zone — just a plain failing bar
-        consec_out  = 0
-        demote_out  = 0
+        # ── Hysteresis counter update ──────────────────────────────────────
+        # Promotion counter:
+        #   +1 each qualifying bar; hard-reset to 0 on immediate demote;
+        #   held (frozen) during soft-demotion grace period so re-promotion
+        #   requires fresh 2-bar accumulation after full demotion.
+        # Demotion counter:
+        #   increments while conditions fail (no hard-reset), resets on qualifying bar.
+        #   When demotion_streak_out >= 2, promotion counter is also zeroed.
+        if _hard_reset:
+            consec_out  = 0
+            demote_out  = 0
+        elif high_conds_met:
+            consec_out  = consecutive_high_bars + 1
+            demote_out  = 0
+        elif consecutive_high_bars >= 2:
+            # Previously promoted — enter/continue soft-demotion grace period
+            demote_out  = demotion_streak + 1
+            if demote_out >= 2:
+                # Grace expired: zero promotion counter so re-promotion needs fresh run
+                consec_out = 0
+            else:
+                consec_out = consecutive_high_bars   # hold during grace bar
+        else:
+            # Never entered HIGH zone — just a plain failing bar
+            consec_out  = 0
+            demote_out  = 0
 
-    # ── HIGH eligibility ──────────────────────────────────────────────────
-    # Promotion path: conditions met for 2+ consecutive bars
-    _promoting = high_conds_met and consecutive_high_bars >= 1 and not _hard_reset
+        # ── HIGH eligibility ───────────────────────────────────────────────
+        # Promotion path: conditions met for 2+ consecutive bars
+        _promoting = high_conds_met and consecutive_high_bars >= 1 and not _hard_reset
 
-    # Grace path: was in HIGH zone (consec_in >= 2), soft-failing, < 2 fail bars
-    _in_grace  = (
-        not high_conds_met
-        and not _hard_reset
-        and consecutive_high_bars >= 2     # was previously promoted
-        and demote_out < 2                 # still within 1-bar grace window
-    )
-    high_eligible = _promoting or _in_grace
+        # Grace path: was in HIGH zone (consec_in >= 2), soft-failing, < 2 fail bars
+        _in_grace  = (
+            not high_conds_met
+            and not _hard_reset
+            and consecutive_high_bars >= 2     # was previously promoted
+            and demote_out < 2                 # still within 1-bar grace window
+        )
+        high_eligible = _promoting or _in_grace
 
     # ── EXTREME eligibility ───────────────────────────────────────────────
     # score==4 requires streak_clear (loss_streak==0), keeping EXTREME strict.
@@ -538,7 +561,7 @@ def compute_risk_mode(
     # ── Promotion debug note ──────────────────────────────────────────────
     promotion_note = ""
     if mode in (RiskMode.HIGH, RiskMode.EXTREME):
-        _grace_tag = " [GRACE]" if _in_grace else ""
+        _mode_tag = " [INSTANT]" if instantaneous else (" [GRACE]" if _in_grace else "")
         promotion_note = (
             f"W={trend_weekly[:4] if trend_weekly else '?'} "
             f"D={trend_daily[:4] if trend_daily else '?'} "
@@ -548,7 +571,7 @@ def compute_risk_mode(
             f"dd={dd_pct:.1f}% "
             f"consec={consecutive_high_bars}→{consec_out} "
             f"demote={demotion_streak}→{demote_out} "
-            f"score={score}{_grace_tag}"
+            f"score={score}{_mode_tag}"
         )
 
     return RegimeModeScore(
