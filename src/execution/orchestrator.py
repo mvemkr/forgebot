@@ -645,12 +645,13 @@ class ForexOrchestrator:
                     recent_trades         = _recent_trades,
                     loss_streak           = self._consecutive_losses,
                     dd_pct                = _live_dd_pct,
-                    consecutive_high_bars = self._consec_high_live,
-                    demotion_streak       = self._demote_streak_live,
+                    # Bypass 2-bar hysteresis for live entry evaluation.
+                    # Hourly evaluations are too infrequent (vs H4 bar pace) for
+                    # the consecutive requirement to be meaningful. ALL-4 conditions
+                    # are the gate; the wd_aligned check differentiates regimes.
+                    consecutive_high_bars = 1,
+                    demotion_streak       = 0,
                 )
-                # Persist both hysteresis counters for next evaluation.
-                self._consec_high_live   = _rms.consecutive_high_bars
-                self._demote_streak_live = _rms.demotion_streak
                 if _rms.promotion_note:
                     logger.info(f"🔺 REGIME PROMOTION: {_rms.mode.value} | {_rms.promotion_note}")
                 self._last_regime_score.update(_rms.to_dict())

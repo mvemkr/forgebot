@@ -823,10 +823,13 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     dd_killswitch_blocks: int = 0   # count of entries blocked by 40% DD killswitch
     _eval_calls: int = 0            # performance counter: evaluate() call count
     _eval_ms:    float = 0.0        # total ms spent in evaluate()
-    # Regime hysteresis state: consecutive H4 evaluations where HIGH conditions held.
-    # Persisted entry-to-entry (approximation of H4-bar hysteresis for entries).
-    _consec_high_entry:  int = 0
-    _demote_streak_entry: int = 0
+    # Regime hysteresis is NOT tracked entry-to-entry.
+    # Alex's ~1 trade/week frequency means entries are too sparse for the
+    # 2-bar consecutive requirement to ever accumulate across entries.
+    # Instead: ALL-4 conditions evaluated instantaneously at each entry.
+    # Hysteresis (2-bar consecutive) is only meaningful in the H4 time-sampling
+    # loop which iterates at true H4 granularity.
+    # Entry evaluations always receive consec=1 (bypass) + demote=0 (clean slate).
 
     # ── Alex small-account gate counters ───────────────────────────────────
     _weekly_trade_counts:   dict = {}  # {(iso_year, iso_week): count} — opened trades
@@ -1603,12 +1606,14 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     recent_trades         = trades,      # closed trades so far
                     loss_streak           = consecutive_losses,
                     dd_pct                = _dd_pct_entry,
-                    consecutive_high_bars = _consec_high_entry,
-                    demotion_streak       = _demote_streak_entry,
+                    # Bypass 2-bar hysteresis at entry level: Alex's ~1 trade/week
+                    # frequency means entries are too sparse for the consecutive
+                    # bar requirement to accumulate. Pass consec=1 so ALL-4
+                    # conditions alone determine mode — no state needed across entries.
+                    # 2-bar hysteresis is enforced in the H4 time-sampling loop only.
+                    consecutive_high_bars = 1,
+                    demotion_streak       = 0,
                 )
-                # Persist both hysteresis counters for next entry evaluation.
-                _consec_high_entry   = _rms_entry.consecutive_high_bars
-                _demote_streak_entry = _rms_entry.demotion_streak
                 # Debug: log every HIGH/EXTREME promotion with full inputs.
                 if _rms_entry.promotion_note:
                     print(f"  🔺 {ts_utc.strftime('%Y-%m-%d')} {pair} → {_rms_entry.mode.value}"
@@ -1616,8 +1621,6 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                 # force_risk_mode pins mode for every entry (used in comparison runs).
                 risk.set_regime_mode(force_risk_mode or _rms_entry.mode.value)
             except Exception:
-                _consec_high_entry   = 0
-                _demote_streak_entry = 0
                 _rms_entry = None
                 risk.set_regime_mode(force_risk_mode or None)
 
