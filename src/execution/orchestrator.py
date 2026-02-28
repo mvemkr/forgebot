@@ -288,6 +288,9 @@ class ForexOrchestrator:
         # Loaded from saved state on startup; updated when positions close.
         # A ratchet exit near 0R counts as a win (doesn't increment streak).
         self._consecutive_losses:  int               = 0
+        # Hysteresis: consecutive H4 evals where ALL HIGH conditions held.
+        # Persisted across hourly regime evaluations (stateful, not per-entry).
+        self._consec_high_live:    int               = 0
 
         # ── Crash recovery — restore full state from last save ───────────
         # Reconciles saved state with OANDA live data:
@@ -627,13 +630,26 @@ class ForexOrchestrator:
                 if _primary_pair and hasattr(self.strategy, "_last_weekly_trend"):
                     _trend_w = getattr(self.strategy, "_last_weekly_trend", {}).get(_primary_pair, "")
                     _trend_d = getattr(self.strategy, "_last_daily_trend",  {}).get(_primary_pair, "")
+                _live_dd_pct = 0.0
+                if self.account.peak_equity and self.account.equity:
+                    _live_dd_pct = max(
+                        0.0,
+                        (self.account.peak_equity - float(self.account.equity))
+                        / self.account.peak_equity * 100,
+                    )
                 _rms = compute_risk_mode(
-                    trend_weekly  = _trend_w,
-                    trend_daily   = _trend_d,
-                    df_h4         = _primary_h4,
-                    recent_trades = _recent_trades,
-                    loss_streak   = self._consecutive_losses,
+                    trend_weekly          = _trend_w,
+                    trend_daily           = _trend_d,
+                    df_h4                 = _primary_h4,
+                    recent_trades         = _recent_trades,
+                    loss_streak           = self._consecutive_losses,
+                    dd_pct                = _live_dd_pct,
+                    consecutive_high_bars = self._consec_high_live,
                 )
+                # Persist hysteresis counter for next evaluation.
+                self._consec_high_live = _rms.consecutive_high_bars
+                if _rms.promotion_note:
+                    logger.info(f"🔺 REGIME PROMOTION: {_rms.mode.value} | {_rms.promotion_note}")
                 self._last_regime_score.update(_rms.to_dict())
 
                 # ── Risk-mode source: control.json pin wins over dynamic ──

@@ -823,6 +823,9 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     dd_killswitch_blocks: int = 0   # count of entries blocked by 40% DD killswitch
     _eval_calls: int = 0            # performance counter: evaluate() call count
     _eval_ms:    float = 0.0        # total ms spent in evaluate()
+    # Regime hysteresis state: consecutive H4 evaluations where HIGH conditions held.
+    # Persisted entry-to-entry (approximation of H4-bar hysteresis).
+    _consec_high_entry: int = 0
 
     # ── Alex small-account gate counters ───────────────────────────────────
     _weekly_trade_counts:   dict = {}  # {(iso_year, iso_week): count} — opened trades
@@ -1581,25 +1584,36 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                 continue
 
             # ── Risk mode: compute dynamically at each entry ─────────────
-            # Mirrors live orchestrator: score 4 components, map to LOW/MED/HIGH/EXTREME.
-            # Mode is applied to risk manager BEFORE sizing so DD/streak caps
-            # and the multiplier are mode-aware.
+            # Mirrors live orchestrator: ALL-4 conditions required for HIGH,
+            # plus 2-bar hysteresis.  force_risk_mode pins mode (comparison runs).
+            _dd_pct_entry = (
+                (peak_balance - balance) / peak_balance * 100
+                if peak_balance > 0 else 0.0
+            )
             try:
                 _rms_entry = compute_risk_mode(
-                    trend_weekly  = (decision.trend_weekly.value
-                                     if hasattr(decision.trend_weekly, "value")
-                                     else str(decision.trend_weekly or "")),
-                    trend_daily   = (decision.trend_daily.value
-                                     if hasattr(decision.trend_daily, "value")
-                                     else str(decision.trend_daily or "")),
-                    df_h4         = hist_4h,
-                    recent_trades = trades,          # closed trades so far
-                    loss_streak   = consecutive_losses,
+                    trend_weekly          = (decision.trend_weekly.value
+                                             if hasattr(decision.trend_weekly, "value")
+                                             else str(decision.trend_weekly or "")),
+                    trend_daily           = (decision.trend_daily.value
+                                             if hasattr(decision.trend_daily, "value")
+                                             else str(decision.trend_daily or "")),
+                    df_h4                 = hist_4h,
+                    recent_trades         = trades,      # closed trades so far
+                    loss_streak           = consecutive_losses,
+                    dd_pct                = _dd_pct_entry,
+                    consecutive_high_bars = _consec_high_entry,
                 )
+                # Persist hysteresis counter for next entry evaluation.
+                _consec_high_entry = _rms_entry.consecutive_high_bars
+                # Debug: log every HIGH/EXTREME promotion with full inputs.
+                if _rms_entry.promotion_note:
+                    print(f"  🔺 {ts_utc.strftime('%Y-%m-%d')} {pair} → {_rms_entry.mode.value}"
+                          f" | {_rms_entry.promotion_note}")
                 # force_risk_mode pins mode for every entry (used in comparison runs).
-                # AUTO = None → use compute_risk_mode() result.
                 risk.set_regime_mode(force_risk_mode or _rms_entry.mode.value)
             except Exception:
+                _consec_high_entry = 0
                 _rms_entry = None
                 risk.set_regime_mode(force_risk_mode or None)
 
@@ -1925,6 +1939,13 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     # ── Time-in-mode: H4 bar sampling (computed once, used in print + result) ─
     # Samples compute_risk_mode() at every H4 bar in the window.
     # Gives % of CALENDAR TIME in each mode — independent of entry frequency.
+    # Notes:
+    #   - trend_weekly = trend_daily = H4 proxy (wd_aligned always True in sampling).
+    #     This is a known approximation; real W/D alignment requires full candle data.
+    #     The strict ATR + last5 + streak conditions still gate HIGH/EXTREME correctly.
+    #   - consecutive_high_bars is propagated bar-to-bar within the sampling loop
+    #     so the 2-bar hysteresis is faithfully simulated at H4 granularity.
+    #   - loss_streak is re-derived from closed trades preceding each bar.
     _tim_counts = Counter({"LOW": 0, "MEDIUM": 0, "HIGH": 0, "EXTREME": 0})
     try:
         from src.strategy.forex.pattern_detector import PatternDetector as _PD
@@ -1937,6 +1958,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                          if end_dt else _rep_h4.index[-1])
             _h4_window = _rep_h4[(_rep_h4.index >= _start_ts) &
                                   (_rep_h4.index <  _end_ts)]
+            _tim_consec = 0   # H4-bar-level hysteresis state for sampling loop
             for _hi, (_h4_ts, _) in enumerate(_h4_window.iterrows()):
                 _h4_slice = _h4_window.iloc[max(0, _hi - 80): _hi + 1]
                 if len(_h4_slice) < 21:
@@ -1946,18 +1968,30 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                 except Exception:
                     _h4_trend_str = "neutral"
                 _h4_ts_str = str(_h4_ts)
-                _recent5   = [t for t in trades
-                              if (t.get("exit_ts") or "0") < _h4_ts_str][-5:]
+                _recent_closed = [t for t in trades
+                                  if (t.get("exit_ts") or "0") < _h4_ts_str]
+                _recent5  = _recent_closed[-5:]
+                # Derive loss streak at this H4 bar from most recent closed trades
+                _tim_streak = 0
+                for _rt in reversed(_recent_closed):
+                    if _rt.get("r", 0.0) < 0:
+                        _tim_streak += 1
+                    else:
+                        break
                 try:
                     _rms_h4 = compute_risk_mode(
-                        trend_weekly  = _h4_trend_str,
-                        trend_daily   = _h4_trend_str,
-                        df_h4         = _h4_slice,
-                        recent_trades = _recent5,
-                        loss_streak   = 0,
+                        trend_weekly          = _h4_trend_str,
+                        trend_daily           = _h4_trend_str,  # H4 proxy (see note above)
+                        df_h4                 = _h4_slice,
+                        recent_trades         = _recent5,
+                        loss_streak           = _tim_streak,
+                        dd_pct                = 0.0,            # conservative; no per-bar balance
+                        consecutive_high_bars = _tim_consec,
                     )
+                    _tim_consec = _rms_h4.consecutive_high_bars   # propagate hysteresis
                     _tim_counts[_rms_h4.mode.value] += 1
                 except Exception:
+                    _tim_consec = 0
                     _tim_counts["MEDIUM"] += 1
     except Exception:
         pass   # time-in-mode is diagnostic — never crash the backtest

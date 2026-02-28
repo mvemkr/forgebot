@@ -324,15 +324,18 @@ RISK_MODE_PARAMS: dict[str, dict] = {
     },
 }
 
-ATR_RATIO_THRESH = 1.1    # H4 ATR expansion threshold
-LAST5_SUMR_THRESH = 0.0   # last-5 sum_R threshold
+ATR_RATIO_THRESH   = 1.10  # H4 ATR expansion threshold for HIGH promotion
+ATR_DEMOTE_THRESH  = 1.00  # ATR below this → immediate demotion (hysteresis band: 1.00–1.10)
+LAST5_SUMR_THRESH  = 0.0   # last-5 sum_R must be > this for HIGH
+LAST10_SUMR_EXTREME = 1.5  # last-10 sum_R must be ≥ this for EXTREME
+DD_EXTREME_MAX_PCT  = 10.0  # drawdown % must be < this for EXTREME
 
 
 @dataclass
 class RegimeModeScore:
     """Simplified integer-score regime assessment → RiskMode."""
     wd_aligned:    bool    # Weekly trend == Daily trend
-    atr_expanding: bool    # H4 ATR ratio > ATR_RATIO_THRESH
+    atr_expanding: bool    # H4 ATR ratio ≥ ATR_RATIO_THRESH (1.10)
     edge_positive: bool    # last-5 sum_R > LAST5_SUMR_THRESH
     streak_clear:  bool    # loss_streak == 0
     score:         int     # 0–4
@@ -340,9 +343,15 @@ class RegimeModeScore:
     atr_ratio:     float = 0.0
     last5_sum_r:   float = 0.0
     loss_streak:   int   = 0
+    # ── Hysteresis state (caller must persist and pass back each call) ─────
+    consecutive_high_bars: int   = 0    # output: consecutive bars where high_conds_met=True
+    # ── Extended diagnostics ──────────────────────────────────────────────
+    last10_sum_r:   float = 0.0
+    dd_pct:         float = 0.0
+    promotion_note: str   = ""   # non-empty when mode == HIGH/EXTREME; use for debug logging
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "risk_mode":       self.mode.value,
             "regime_score_v2": self.score,
             "wd_aligned":      self.wd_aligned,
@@ -352,7 +361,11 @@ class RegimeModeScore:
             "atr_ratio":       round(self.atr_ratio, 3),
             "last5_sum_r":     round(self.last5_sum_r, 2),
             "loss_streak":     self.loss_streak,
+            "consec_high":     self.consecutive_high_bars,
         }
+        if self.promotion_note:
+            d["promotion_note"] = self.promotion_note
+        return d
 
     @property
     def params(self) -> dict:
@@ -360,26 +373,43 @@ class RegimeModeScore:
 
 
 def compute_risk_mode(
-    trend_weekly: str,
-    trend_daily:  str,
-    df_h4:        "pd.DataFrame",
-    recent_trades: list,
-    loss_streak:  int,
+    trend_weekly:          str,
+    trend_daily:           str,
+    df_h4:                 "pd.DataFrame",
+    recent_trades:         list,
+    loss_streak:           int,
+    dd_pct:                float = 0.0,
+    consecutive_high_bars: int   = 0,
 ) -> RegimeModeScore:
-    """
-    Compute integer regime score and RiskMode from four independent inputs.
+    """Compute risk mode from four independent conditions + hysteresis state.
+
+    HIGH promotion rules (ALL required — not any-3-of-4):
+      1. W==D aligned        – weekly and daily trend point same direction
+      2. ATR expanding       – ATR_H4 / ATR_H4_20avg >= ATR_RATIO_THRESH (1.10)
+      3. Recent edge         – last-5 sum_R > LAST5_SUMR_THRESH (0.0)
+      4. No loss streak      – loss_streak == 0
+      5. Hysteresis          – conditions held for ≥2 consecutive evaluations
+                               (caller must persist consecutive_high_bars across calls)
+
+    EXTREME promotion: all HIGH conditions + score==4 + last10_sum_R>=1.5 + dd<10%
+
+    Immediate demotion (resets hysteresis counter):
+      W!=D  OR  ATR ratio < ATR_DEMOTE_THRESH (1.00)  OR  loss_streak >= 1
 
     Args:
-        trend_weekly:  weekly trend string ("bullish" / "bearish" / "neutral" / …)
-        trend_daily:   daily trend string
-        df_h4:         H4 OHLC DataFrame (needs ≥ 21 bars for ATR calc)
-        recent_trades: list of trade dicts with 'r' field; last 5 used
-        loss_streak:   consecutive loss count from risk manager
+        trend_weekly, trend_daily : bias strings ("bullish" / "bearish" / ...)
+        df_h4                     : H4 OHLC DataFrame, ≥21 bars for ATR
+        recent_trades             : trade dicts with 'r' field (last 5/10 used)
+        loss_streak               : consecutive loss count from risk manager
+        dd_pct                    : current drawdown % from peak (EXTREME gate)
+        consecutive_high_bars     : number of prior consecutive qualifying bars
+                                    (caller persists from previous call's output)
 
     Returns:
-        RegimeModeScore dataclass
+        RegimeModeScore — note: `consecutive_high_bars` in the result is the
+        UPDATED counter the caller should store for the next call.
     """
-    # ── Component 1: Weekly == Daily alignment ────────────────────────
+    # ── Component 1: Weekly == Daily alignment ────────────────────────────
     def _bull(t: str) -> bool:
         return "bullish" in (t or "").lower()
 
@@ -391,8 +421,8 @@ def compute_risk_mode(
         (_bear(trend_weekly) and _bear(trend_daily))
     )
 
-    # ── Component 2: H4 ATR expansion ────────────────────────────────
-    atr_ratio    = 0.0
+    # ── Component 2: H4 ATR expansion ─────────────────────────────────────
+    atr_ratio     = 0.0
     atr_expanding = False
     if df_h4 is not None and len(df_h4) >= 21:
         try:
@@ -402,47 +432,103 @@ def compute_risk_mode(
             current_atr = float(tr[-1])
             avg_atr     = float(np.mean(tr[-21:-1]))
             if avg_atr > 0:
-                atr_ratio    = current_atr / avg_atr
-                atr_expanding = atr_ratio > ATR_RATIO_THRESH
+                atr_ratio     = current_atr / avg_atr
+                atr_expanding = atr_ratio >= ATR_RATIO_THRESH   # >= 1.10
         except Exception:
             pass
 
-    # ── Component 3: Last-5 sum_R ─────────────────────────────────────
-    last5      = (recent_trades or [])[-5:]
+    # ── Component 3: Last-5 sum_R ─────────────────────────────────────────
+    last5       = (recent_trades or [])[-5:]
     last5_sum_r = sum(t.get("r", 0.0) for t in last5)
     edge_positive = last5_sum_r > LAST5_SUMR_THRESH
 
-    # ── Component 4: Loss streak clear ───────────────────────────────
+    # ── Component 4: Loss streak clear ────────────────────────────────────
     streak_clear = loss_streak == 0
 
-    # ── Total + mode mapping ──────────────────────────────────────────
+    # ── Integer score (0–4) for EXTREME eligibility check ─────────────────
     score = sum([wd_aligned, atr_expanding, edge_positive, streak_clear])
 
-    if score >= 4:
+    # ── HIGH: ALL 4 conditions required (strict gate, replaces any-3-of-4) ─
+    # Every condition must be True — W==D is not just a prerequisite but a
+    # full veto; ATR must exceed the promotion threshold (1.10); edge and
+    # streak together ensure we only scale up during confirmed good conditions.
+    high_conds_met = (
+        wd_aligned
+        and atr_expanding                # atr_ratio >= 1.10
+        and edge_positive                # last5_sum_r > 0
+        and streak_clear                 # loss_streak == 0
+    )
+
+    # ── Immediate demotion: resets hysteresis counter ─────────────────────
+    # Triggers when: W!=D  OR  ATR ratio < ATR_DEMOTE_THRESH (1.00)  OR  streak>=1
+    # ATR hysteresis band: promote at >= 1.10, demote at < 1.00.
+    # Gray zone [1.00, 1.10): not qualifying but no hard demotion → counter
+    # still resets to 0 because high_conds_met is False (atr < 1.10).
+    _immediate_demote = (
+        not wd_aligned
+        or atr_ratio < ATR_DEMOTE_THRESH   # < 1.00
+        or loss_streak >= 1
+    )
+
+    # ── Hysteresis counter update ─────────────────────────────────────────
+    # Increment when conditions met; reset on any demotion signal.
+    # Using _immediate_demote as override ensures ATR < 1.00 and streak
+    # always reset even if somehow high_conds_met were True (defensive).
+    consec_out = (
+        (consecutive_high_bars + 1) if (high_conds_met and not _immediate_demote) else 0
+    )
+
+    # ── HIGH / EXTREME eligibility ────────────────────────────────────────
+    # HIGH: all conditions held for this bar AND at least 1 prior qualifying bar
+    # (i.e., current is the 2nd consecutive qualifying bar).
+    high_eligible = high_conds_met and (consecutive_high_bars >= 1) and not _immediate_demote
+
+    # EXTREME: HIGH eligible + score=4 + sustained performance + low DD
+    last10       = (recent_trades or [])[-10:]
+    last10_sum_r = sum(t.get("r", 0.0) for t in last10)
+    extreme_eligible = (
+        high_eligible
+        and score == 4
+        and last10_sum_r >= LAST10_SUMR_EXTREME   # >= +1.5R across last 10 trades
+        and dd_pct < DD_EXTREME_MAX_PCT            # drawdown < 10%
+    )
+
+    # ── Mode mapping ──────────────────────────────────────────────────────
+    if extreme_eligible:
         mode = RiskMode.EXTREME
-    elif score >= 3:
+    elif high_eligible:
         mode = RiskMode.HIGH
     elif score >= 2:
         mode = RiskMode.MEDIUM
     else:
         mode = RiskMode.LOW
 
-    # ── W==D alignment is a REQUIRED condition for HIGH / EXTREME ────
-    # Rationale: HIGH/EXTREME increase risk size; doing so into a mixed
-    # macro trend (W and D pointing different directions) is not justified
-    # even if ATR and edge score qualify.  Cap at MEDIUM without alignment.
-    # LOW and MEDIUM are unaffected — they do not require alignment.
-    if mode in (RiskMode.HIGH, RiskMode.EXTREME) and not wd_aligned:
-        mode = RiskMode.MEDIUM
+    # ── Promotion debug note ──────────────────────────────────────────────
+    promotion_note = ""
+    if mode in (RiskMode.HIGH, RiskMode.EXTREME):
+        promotion_note = (
+            f"W={trend_weekly[:4] if trend_weekly else '?'} "
+            f"D={trend_daily[:4] if trend_daily else '?'} "
+            f"ATR={atr_ratio:.3f} "
+            f"last5R={last5_sum_r:+.2f} "
+            f"streak={loss_streak} "
+            f"dd={dd_pct:.1f}% "
+            f"consec={consecutive_high_bars}→{consec_out} "
+            f"score={score}"
+        )
 
     return RegimeModeScore(
-        wd_aligned    = wd_aligned,
-        atr_expanding = atr_expanding,
-        edge_positive = edge_positive,
-        streak_clear  = streak_clear,
-        score         = score,
-        mode          = mode,
-        atr_ratio     = atr_ratio,
-        last5_sum_r   = last5_sum_r,
-        loss_streak   = loss_streak,
+        wd_aligned             = wd_aligned,
+        atr_expanding          = atr_expanding,
+        edge_positive          = edge_positive,
+        streak_clear           = streak_clear,
+        score                  = score,
+        mode                   = mode,
+        atr_ratio              = atr_ratio,
+        last5_sum_r            = last5_sum_r,
+        loss_streak            = loss_streak,
+        consecutive_high_bars  = consec_out,
+        last10_sum_r           = last10_sum_r,
+        dd_pct                 = dd_pct,
+        promotion_note         = promotion_note,
     )
