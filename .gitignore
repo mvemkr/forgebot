@@ -41,3 +41,8 @@ backtesting/results/
 htmlcov/
 .schwab_token.json
 .schwab_state.txt
+
+# runtime state (live files ignored; templates tracked)
+runtime_state/
+!runtime_state/*.example.json
+!runtime_state/README.md
