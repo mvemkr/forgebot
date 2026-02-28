@@ -1,1 +1,7 @@
-{}
+{
+  "pause_new_entries": true,
+  "risk_mode": null,
+  "last_updated": null,
+  "updated_by": "bootstrap",
+  "reason": "Initial bootstrap — review and resume via dashboard when ready"
+}

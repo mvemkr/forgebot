@@ -150,6 +150,69 @@ class ControlState:
         label = mode if mode else "AUTO (dynamic)"
         logger.info(f"🎛  risk_mode={label}  by={updated_by}")
 
+    def bootstrap(self, is_live_real: bool) -> None:
+        """
+        Startup guard for a missing control.json.  Call once after __init__,
+        before any trading decisions are made.
+
+        LIVE_PAPER  – creates control.json from example template (or defaults),
+                      forced to pause_new_entries=True, reason="BOOTSTRAP_CREATED".
+        LIVE_REAL   – does NOT create the file; sets in-memory pause only;
+                      logs CRITICAL so ops is alerted.  Existing positions
+                      continue to be managed; only new entries are blocked.
+
+        No-op when control.json already exists.
+        """
+        if self._is_backtest or self._path.exists():
+            return
+
+        if not is_live_real:
+            # ── LIVE_PAPER: auto-create from example, paused ──────────────
+            example = self._path.parent / "control.example.json"
+            if example.exists():
+                try:
+                    raw = json.loads(example.read_text(encoding="utf-8"))
+                    self._state = {**_DEFAULT_STATE, **raw}
+                except Exception:
+                    self._state = dict(_DEFAULT_STATE)
+            else:
+                self._state = dict(_DEFAULT_STATE)
+
+            self._state["pause_new_entries"] = True
+            self._state["reason"]            = "BOOTSTRAP_CREATED"
+            self._state["updated_by"]        = "system:bootstrap"
+            self._state["last_updated"]      = datetime.now(timezone.utc).isoformat()
+            self._persist()
+            self._bootstrap_event = "BOOTSTRAP_CREATED"
+            logger.info(
+                "🆕 [LIVE_PAPER] control.json was missing — created from bootstrap. "
+                "pause_new_entries=True. Resume via dashboard when ready."
+            )
+
+        else:
+            # ── LIVE_REAL: fail-closed, no file creation ──────────────────
+            self._state["pause_new_entries"] = True
+            self._state["reason"]            = "CONTROL_STATE_MISSING"
+            self._state["updated_by"]        = "system:bootstrap"
+            self._state["last_updated"]      = datetime.now(timezone.utc).isoformat()
+            self._control_missing  = True
+            self._bootstrap_event  = "CONTROL_STATE_MISSING"
+            logger.critical(
+                "🚨 [LIVE_REAL] control.json MISSING — new entries BLOCKED. "
+                "Restore runtime_state/control.json from control.example.json "
+                "and restart. Existing positions will continue to be managed."
+            )
+
+    @property
+    def control_missing(self) -> bool:
+        """True when LIVE_REAL started with no control.json (fail-closed state)."""
+        return bool(getattr(self, "_control_missing", False))
+
+    @property
+    def bootstrap_event(self) -> Optional[str]:
+        """'BOOTSTRAP_CREATED' | 'CONTROL_STATE_MISSING' | None (normal startup)."""
+        return getattr(self, "_bootstrap_event", None)
+
     def reload(self) -> None:
         """Re-read control.json from disk (called each orchestrator cycle)."""
         if self._is_backtest:

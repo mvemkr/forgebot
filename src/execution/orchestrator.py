@@ -197,6 +197,7 @@ class ForexOrchestrator:
         # ── Persistent control plane (pause_new_entries) ───────────────
         from .control_state import ControlState
         self.control = ControlState(is_backtest=False)
+        self.control.bootstrap(is_live_real=(exec_mode == AccountMode.LIVE_REAL))
 
         # ── LIVE_REAL safety gate: auto-pause on every startup ──────────────
         # In LIVE_REAL mode entries are paused by default on every restart.
