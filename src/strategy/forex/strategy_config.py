@@ -97,6 +97,16 @@ NO_SUNDAY_TRADES_ENABLED:    bool = True
 NO_THU_FRI_TRADES_ENABLED:   bool = True
 THU_ENTRY_CUTOFF_HOUR_ET:     int  = 9   # 9:00 AM ET = start of block on Thu
 
+# ── Chop Shield ────────────────────────────────────────────────────────────
+# Streak-based loss protection.  Fires when consecutive_losses >= THRESH.
+#   Part A: 48h auto-pause (new entries blocked; open trades managed normally)
+#   Part B: recovery selectivity after pause expires — stricter gates
+CHOP_SHIELD_STREAK_THRESH:    int   = 3      # losses-in-a-row that arms the shield
+CHOP_SHIELD_PAUSE_HOURS:      float = 48.0   # Part A pause duration
+RECOVERY_MIN_RR:              float = 3.0    # Part B: min exec_rr to allow entry
+RECOVERY_CONF_BOOST:          float = 0.05   # Part B: confidence floor += this
+RECOVERY_WEEKLY_CAP:          int   = 1      # Part B: max trades per ISO-week
+
 # ── ATR stop filter ────────────────────────────────────────────────────────
 # Stop must be ≤ ATR_STOP_MULTIPLIER × 14-day ATR.
 # Rejects entries where the pattern stop is wider than typical volatility

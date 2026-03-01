@@ -249,6 +249,26 @@ class TradeJournal:
             "notes": notes,
         })
 
+    def log_chop_event(
+        self,
+        event: str,   # "AUTO_PAUSE_STREAK3" | "RECOVERY_RULES_ACTIVE" | "CHOP_CLEARED"
+        loss_streak: int,
+        expiry_ts: "str | None" = None,
+        notes: str = "",
+    ) -> None:
+        """
+        Record a Chop Shield lifecycle event (not a trade signal).
+          AUTO_PAUSE_STREAK3   — streak≥3 triggered 48h auto-pause
+          RECOVERY_RULES_ACTIVE — pause expired, recovery selectivity now active
+          CHOP_CLEARED          — win reset streak to 0; pause cleared
+        """
+        self._write({
+            "event":       f"CHOP_{event}",
+            "loss_streak": loss_streak,
+            "expiry_ts":   expiry_ts,
+            "notes":       notes,
+        })
+
     def log_reconcile_event(
         self,
         pair: str,
