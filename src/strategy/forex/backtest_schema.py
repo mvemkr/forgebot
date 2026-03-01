@@ -101,6 +101,11 @@ class BacktestResult:
     atr_fallback_pct:  float = 0.0    # % of trades using atr_fallback — >40% = regression
     stop_pips_p50:     float = 0.0    # median initial stop distance in pips (all trades)
 
+    # ── Chop Shield counters (Arm D) ─────────────────────────────────────
+    chop_auto_pauses:     int = 0   # times streak≥3 triggered a 48h auto-pause
+    chop_paused_blocks:   int = 0   # entries blocked during active 48h pause window
+    chop_recovery_blocks: int = 0   # entries blocked by Part B recovery gates
+
     # ── Profiling ────────────────────────────────────────────────────────
     api_calls:     int   = 0
     eval_calls:    int   = 0

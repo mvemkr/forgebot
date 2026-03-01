@@ -415,6 +415,19 @@ TRAIL_ARMS: Dict[str, dict] = {
         "STALL_EXIT_BARS":     5,      # bars after entry to check
         "STALL_EXIT_MFE_R":    0.5,    # if MFE < 0.5R at that point → close
     },
+    # D: Arm C trail + Chop Shield gates (Part A: 48h auto-pause on streak≥3;
+    #    Part B: recovery selectivity — exec_rr≥3.0R, conf+5%, weekly_cap=1).
+    #    Signal/stop/target logic is IDENTICAL to Arm C.
+    "D": {
+        "label":               "Arm D — Arm C trail + Chop Shield (streak≥3 auto-pause + recovery)",
+        "TRAIL_ACTIVATE_R":    2.0,
+        "TRAIL_LOCK_R":        0.5,
+        "TRAIL_STAGE2_R":      3.0,
+        "TRAIL_STAGE2_DIST_R": 1.0,
+        "STALL_EXIT_BARS":     None,
+        "STALL_EXIT_MFE_R":    None,
+        "_chop_shield":        True,   # marker: run_backtest auto-enables chop shield
+    },
 }
 _DEFAULT_ARM = "A"   # used when trail_cfg=None
 
@@ -535,7 +548,8 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                  wd_protrend_htf: bool = False,
                  flat_risk_pct: Optional[float] = None,
                  force_risk_mode: Optional[str] = None,
-                 streak_demotion_thresh: int = 1):
+                 streak_demotion_thresh: int = 1,
+                 chop_shield: bool = False):
     """Run a single backtest simulation.
 
     quiet=True suppresses all stdout (useful when called from compare scripts).
@@ -545,6 +559,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
                    Auto-detected from trail_cfg if omitted.
     force_risk_mode: pin risk mode for every entry ("LOW"|"MEDIUM"|"HIGH"|"EXTREME").
                      None = AUTO (compute dynamically per entry — default).
+    chop_shield: enable Chop Shield gates (auto-detected True when trail_arm_key="D").
     """
     import io, sys as _sys
     # Resolve arm key ↔ trail_cfg (bidirectional)
@@ -558,6 +573,9 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
     if trail_arm_key in TRAIL_ARMS and not trail_cfg:
         # Resolve cfg from key so callers can pass just trail_arm_key="C"
         trail_cfg = TRAIL_ARMS[trail_arm_key]
+    # Auto-detect chop shield from Arm D marker
+    if (trail_cfg or {}).get("_chop_shield"):
+        chop_shield = True
     _orig_stdout = _sys.stdout
     if quiet:
         _sys.stdout = io.StringIO()
@@ -574,6 +592,7 @@ def run_backtest(start_dt: datetime = BACKTEST_START, end_dt: datetime = None,
             flat_risk_pct=flat_risk_pct,
             force_risk_mode=force_risk_mode,
             streak_demotion_thresh=streak_demotion_thresh,
+            chop_shield=chop_shield,
         )
     finally:
         _sys.stdout = _orig_stdout
@@ -593,7 +612,8 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                        wd_protrend_htf: bool = False,
                        flat_risk_pct: Optional[float] = None,
                        force_risk_mode: Optional[str] = None,
-                       streak_demotion_thresh: int = 1):
+                       streak_demotion_thresh: int = 1,
+                       chop_shield: bool = False):
     # PROTREND_ONLY config flag → wd_protrend_htf gate.
     # Config wins when True; explicit True caller arg also wins.
     if getattr(_sc, "PROTREND_ONLY", False) and not wd_protrend_htf:
@@ -844,6 +864,13 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
     _wd_aligned_entries:    int  = 0   # entered trades where W==D agreed with direction
     _countertrend_htf_blocks: int = 0  # blocked by COUNTERTREND_HTF filter
     _time_block_counts:     dict = {}  # {reason_code: count} — Sunday/Thu/Fri blocks
+
+    # ── Chop Shield state (Arm D) ──────────────────────────────────────────
+    # consecutive_losses already tracks the running streak (see line ~845).
+    _bt_chop_pause_until:     Optional[datetime] = None  # None = not in 48h pause
+    _bt_chop_auto_pauses:     int = 0    # times streak≥3 armed the shield
+    _bt_chop_paused_blocks:   int = 0    # entries blocked during active 48h pause
+    _bt_chop_recovery_blocks: int = 0    # entries blocked by Part B recovery gates
 
     def _risk_pct(bal):
         """DD-aware risk. When flat_risk_pct is set, overrides tiers (killswitch still applies)."""
@@ -1186,6 +1213,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     risk_r = (pnl / pos.get("entry_risk_dollars", 1)
                               if pos.get("entry_risk_dollars") else delta / risk_dist if risk_dist else 0)
                     consecutive_losses = 0   # target/weekend win resets streak
+                    _bt_chop_pause_until = None   # win clears chop shield pause
                     trades.append({
                         "pair":        pair,   "direction": direction,
                         "entry":       entry,  "exit":      close_price,
@@ -1253,6 +1281,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                         consecutive_losses += 1
                     else:
                         consecutive_losses = 0
+                        _bt_chop_pause_until = None   # win/scratch clears chop shield
                     trades.append({
                         "pair": pair, "direction": direction,
                         "entry": entry, "exit": exit_p,
@@ -1312,6 +1341,7 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
                     consecutive_losses += 1
                 else:                # win or scratch → reset streak
                     consecutive_losses = 0
+                    _bt_chop_pause_until = None   # win clears chop shield pause
 
                 trades.append({
                     "pair": pair, "direction": direction,
@@ -1650,6 +1680,58 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
             # ── Alex small-account gates (via shared alex_policy module) ──
             # Parity note: live orchestrator calls the same functions from
             # src/strategy/forex/alex_policy.py — single source of truth.
+
+            # ── Chop Shield (Arm D) ──────────────────────────────────────────
+            # Part A: 48h auto-pause when streak first hits THRESH.
+            # Part B: recovery-selectivity after pause expires.
+            # Identical policy to live orchestrator; backtester uses wall-clock
+            # timestamps anchored to the candle bar time (ts_utc) for determinism.
+            if chop_shield:
+                _cs_thresh = getattr(_sc, "CHOP_SHIELD_STREAK_THRESH", 3)
+                _cs_hours  = getattr(_sc, "CHOP_SHIELD_PAUSE_HOURS", 48.0)
+                # Arm the shield on first hit of streak threshold
+                if consecutive_losses >= _cs_thresh and _bt_chop_pause_until is None:
+                    from datetime import timedelta as _td
+                    _bt_chop_pause_until = ts_utc + _td(hours=_cs_hours)
+                    _bt_chop_auto_pauses += 1
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "AUTO_PAUSE_STREAK3",
+                            f"Chop Shield: streak={consecutive_losses} ≥ {_cs_thresh}"
+                            f" — paused until {_bt_chop_pause_until.strftime('%Y-%m-%d %H:%M')} UTC")
+                # Part A: block during active pause window
+                if _bt_chop_pause_until is not None and ts_utc < _bt_chop_pause_until:
+                    _bt_chop_paused_blocks += 1
+                    log_gap(ts_utc, pair, "ENTER", "BLOCKED", "CHOP_PAUSED",
+                            f"Auto-pause active until {_bt_chop_pause_until.strftime('%Y-%m-%d %H:%M')} UTC"
+                            f" (streak={consecutive_losses})")
+                    continue
+                # Part B: recovery gates after pause expires and streak still ≥ thresh
+                if (_bt_chop_pause_until is not None
+                        and ts_utc >= _bt_chop_pause_until
+                        and consecutive_losses >= _cs_thresh):
+                    _rec_rr    = getattr(_sc, "RECOVERY_MIN_RR", 3.0)
+                    _rec_boost = getattr(_sc, "RECOVERY_CONF_BOOST", 0.05)
+                    _rec_wcap  = getattr(_sc, "RECOVERY_WEEKLY_CAP", 1)
+                    _rec_conf  = getattr(_sc, "MIN_CONFIDENCE", 0.60) + _rec_boost
+                    _rec_iso   = ts_utc.isocalendar()[:2]
+                    _rec_wk    = _weekly_trade_counts.get(_rec_iso, 0)
+                    if decision.exec_rr < _rec_rr:
+                        _bt_chop_recovery_blocks += 1
+                        log_gap(ts_utc, pair, "ENTER", "BLOCKED", "RECOVERY_MIN_RR",
+                                f"Recovery: exec_rr={decision.exec_rr:.2f}R < {_rec_rr:.1f}R"
+                                f" (streak={consecutive_losses})")
+                        continue
+                    if decision.confidence < _rec_conf:
+                        _bt_chop_recovery_blocks += 1
+                        log_gap(ts_utc, pair, "ENTER", "BLOCKED", "RECOVERY_CONF",
+                                f"Recovery: conf={decision.confidence:.0%} < {_rec_conf:.0%}"
+                                f" (streak={consecutive_losses})")
+                        continue
+                    if _rec_wk >= _rec_wcap:
+                        _bt_chop_recovery_blocks += 1
+                        log_gap(ts_utc, pair, "ENTER", "BLOCKED", "RECOVERY_WEEKLY_CAP",
+                                f"Recovery: weekly trades={_rec_wk} ≥ cap={_rec_wcap}"
+                                f" (streak={consecutive_losses})")
+                        continue
 
             # Gate 1: Alignment-based MIN_RR
             # Pro-trend (W+D+4H all agree) → 2.5R; non-protrend/mixed → 3.0R
@@ -2551,6 +2633,14 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
 
     print(f"  Results log:  {_results_log}  [{_commit}{'-dirty' if _dirty else ''}]")
 
+    # ── Chop Shield summary (Arm D) ────────────────────────────────────────
+    if chop_shield:
+        print(f"\n  ── Chop Shield (Arm D) ──────────────────────────────────────")
+        print(f"    Auto-pauses fired (streak≥{getattr(_sc,'CHOP_SHIELD_STREAK_THRESH',3)}): {_bt_chop_auto_pauses}x")
+        print(f"    Entries blocked during 48h pause:  {_bt_chop_paused_blocks}x")
+        print(f"    Entries blocked by recovery gates: {_bt_chop_recovery_blocks}x")
+        print(f"    chopped={_bt_chop_auto_pauses}p/{_bt_chop_paused_blocks}b/{_bt_chop_recovery_blocks}r")
+
     # ── Compact comparison line (useful when diffing mult variants) ────────
     try:
         _cmp_low_n  = sum(1 for m in _rm_at_entry if m == "LOW")
@@ -2558,11 +2648,14 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         _cmp_high_n = sum(1 for m in _rm_at_entry if m == "HIGH")
         _cmp_ext_n  = sum(1 for m in _rm_at_entry if m == "EXTREME")
         _low_m = RISK_MODE_PARAMS["LOW"]["risk_mult"]
+        _chop_tag = (f"  chopped={_bt_chop_auto_pauses}p/{_bt_chop_paused_blocks}b"
+                     f"/{_bt_chop_recovery_blocks}r") if chop_shield else ""
         print(f"\n  ▶ SUMMARY  low_mult={_low_m}×"
               f"  ret={ret_pct:+.1f}%  maxDD={_max_dd_pct:.1f}%"
               f"  worst3L={_w3_sum_pct:.1f}%"
               f"  LOW={_cmp_low_n}  MED={_cmp_med_n}"
-              f"  HIGH={_cmp_high_n}  EXT={_cmp_ext_n}")
+              f"  HIGH={_cmp_high_n}  EXT={_cmp_ext_n}"
+              f"{_chop_tag}")
     except Exception:
         pass  # compact summary is optional — never crash the run
 
@@ -2651,6 +2744,10 @@ def _run_backtest_body(start_dt: datetime = BACKTEST_START, end_dt: datetime = N
         time_in_mode_pct_medium  = _tim_pct_medium,
         time_in_mode_pct_high    = _tim_pct_high,
         time_in_mode_pct_extreme = _tim_pct_extreme,
+        # ── Chop Shield ──────────────────────────────────────────────
+        chop_auto_pauses     = _bt_chop_auto_pauses,
+        chop_paused_blocks   = _bt_chop_paused_blocks,
+        chop_recovery_blocks = _bt_chop_recovery_blocks,
         # ── Profiling ────────────────────────────────────────────────
         api_calls     = _api_call_count,
         eval_calls    = _eval_calls,
@@ -2695,8 +2792,10 @@ Examples:
     parser.add_argument("--news-filter", action="store_true", default=False,
                         help="Enable historical news filter (CSV from data/news/). Alex never used this.")
     parser.add_argument("--arm",   default="A",
-                        help="Trail arm: A | B | C | all  (default: A). "
-                             "A=activate1R trail0.5R  B=activate1.5R  C=2-stage 2R+3R")
+                        help="Trail arm: A | B | C | C1 | C2 | C3 | D | all  (default: A). "
+                             "D=Arm C + Chop Shield. all=run every arm.")
+    parser.add_argument("--chop-shield", action="store_true", default=False,
+                        help="Enable Chop Shield gates (auto-enabled for --arm D).")
     parser.add_argument("--cache", action="store_true", default=False,
                         help="No-op (kept for backward compat). Cache is ON by default. "
                              "Use --no-cache to disable.")
@@ -2805,8 +2904,9 @@ Examples:
 
     # ── Validate --arm ────────────────────────────────────────────────────────
     _arm_arg = args.arm.upper()
-    if _arm_arg not in ("A", "B", "C", "ALL"):
-        parser.error(f"--arm must be A | B | C | all, got '{args.arm}'")
+    _valid_arms = set(TRAIL_ARMS.keys()) | {"ALL"}
+    if _arm_arg not in _valid_arms:
+        parser.error(f"--arm must be one of {sorted(_valid_arms)}, got '{args.arm}'")
     _arms_to_run = list(TRAIL_ARMS.keys()) if _arm_arg == "ALL" else [_arm_arg]
 
     # ── Cache mode ────────────────────────────────────────────────────────────
@@ -2847,6 +2947,7 @@ Examples:
         _force_mode = _force_mode_raw.upper() if _force_mode_raw else None
         if _force_mode and _force_mode not in ("LOW", "MEDIUM", "HIGH", "EXTREME"):
             parser.error(f"--force-mode must be LOW|MEDIUM|HIGH|EXTREME, got '{_force_mode_raw}'")
+        _chop_flag = getattr(args, "chop_shield", False) or bool(_tcfg.get("_chop_shield"))
         result = run_backtest(
             start_dt=start, end_dt=end, starting_bal=args.balance,
             notes=_arm_notes, trail_cfg=_tcfg, trail_arm_key=_arm_key,
@@ -2855,6 +2956,7 @@ Examples:
             wd_protrend_htf=_protrend_flag,
             force_risk_mode=_force_mode,
             streak_demotion_thresh=_streak_demote_thresh,
+            chop_shield=_chop_flag,
         )
         _t_run_elapsed = time.perf_counter() - _t_run
 

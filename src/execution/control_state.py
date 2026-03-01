@@ -33,7 +33,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +51,7 @@ _DEFAULT_STATE: dict = {
     "last_updated":      None,
     "updated_by":        "startup",
     "reason":            "",
+    "pause_expiry_ts":   None,   # ISO-8601 UTC — set by chop_pause(); cleared on resume/win
 }
 
 
@@ -99,6 +100,11 @@ class ControlState:
     def updated_by(self) -> str:
         return str(self._state.get("updated_by", "unknown"))
 
+    @property
+    def pause_expiry_ts(self) -> Optional[str]:
+        """ISO-8601 UTC deadline for a chop-shield auto-pause; None = no expiry."""
+        return self._state.get("pause_expiry_ts")
+
     def to_dict(self) -> dict:
         return {
             "pause_new_entries": self.pause_new_entries,
@@ -106,6 +112,7 @@ class ControlState:
             "last_updated":      self.last_updated,
             "updated_by":        self.updated_by,
             "reason":            self.reason,
+            "pause_expiry_ts":   self.pause_expiry_ts,
         }
 
     # ── Write ──────────────────────────────────────────────────────────
@@ -118,11 +125,54 @@ class ControlState:
         logger.info(f"⏸  pause_new_entries=True  by={updated_by}  reason={reason!r}")
 
     def resume(self, reason: str = "", updated_by: str = "api") -> None:
-        """Allow new entries again."""
+        """Allow new entries again.  Clears any chop-shield expiry timestamp."""
         if self._is_backtest:
             return
+        self._state["pause_expiry_ts"] = None   # clear chop expiry on any resume
         self._update(pause_new_entries=False, reason=reason, updated_by=updated_by)
         logger.info(f"▶  pause_new_entries=False  by={updated_by}  reason={reason!r}")
+
+    def chop_pause(self, duration_hours: float = 48.0, updated_by: str = "bot") -> None:
+        """
+        Part A of the Chop Shield: pause new entries for ``duration_hours`` and
+        stamp the expiry time so _tick() can auto-resume when it lapses.
+
+        Sets:
+            pause_new_entries = True
+            reason            = "AUTO_PAUSE_STREAK3"
+            pause_expiry_ts   = now + duration_hours (ISO-8601 UTC)
+        """
+        if self._is_backtest:
+            return
+        expiry = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
+        self._state["pause_expiry_ts"] = expiry.isoformat()
+        self._update(
+            pause_new_entries=True,
+            reason="AUTO_PAUSE_STREAK3",
+            updated_by=updated_by,
+        )
+        logger.warning(
+            f"🛑  chop_pause: pause_new_entries=True  expiry={expiry.isoformat()}  "
+            f"by={updated_by}"
+        )
+
+    def chop_pause_expired(self) -> bool:
+        """
+        Return True when a chop-shield pause is active AND its deadline has passed.
+        Used by _tick() to decide when to auto-resume into recovery mode.
+        Returns False when no expiry is set, or the deadline is still in the future.
+        """
+        ts = self._state.get("pause_expiry_ts")
+        if not ts:
+            return False
+        try:
+            expiry = datetime.fromisoformat(ts)
+            # Ensure timezone-aware comparison
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) >= expiry
+        except Exception:
+            return False
 
     def set_risk_mode(
         self,
@@ -230,10 +280,14 @@ class ControlState:
     # ── Internal ───────────────────────────────────────────────────────
 
     def _update(self, pause_new_entries: bool, reason: str, updated_by: str) -> None:
-        # Preserve risk_mode across pause/resume operations
+        # Preserve risk_mode and pause_expiry_ts across pause/resume operations.
+        # pause_expiry_ts is cleared by resume() BEFORE calling _update(), so by
+        # the time we reach here it already carries the correct value (None on resume,
+        # set value on chop_pause).
         self._state = {
             "pause_new_entries": pause_new_entries,
-            "risk_mode":         self._state.get("risk_mode"),   # preserved
+            "risk_mode":         self._state.get("risk_mode"),          # preserved
+            "pause_expiry_ts":   self._state.get("pause_expiry_ts"),    # preserved
             "last_updated":      datetime.now(timezone.utc).isoformat(),
             "updated_by":        updated_by,
             "reason":            reason,
