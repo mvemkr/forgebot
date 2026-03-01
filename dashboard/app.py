@@ -278,6 +278,27 @@ def api_status():
         )
     )
 
+    # ── Control-plane derived fields ──────────────────────────────────────
+    _ctrl_fields        = _load_control_state()   # pause_new_entries, risk_mode(pin), pause_expiry_ts, etc.
+    _pne                = _ctrl_fields.get("pause_new_entries", False)
+    _expiry_ts          = _ctrl_fields.get("pause_expiry_ts")
+    _chop_active        = False
+    if _expiry_ts:
+        try:
+            _chop_active = datetime.now(timezone.utc) < datetime.fromisoformat(_expiry_ts)
+        except Exception:
+            pass
+    _bot_mode_paused    = (mode == "paused")
+    _effective_paused   = _bot_mode_paused or _pne or _chop_active
+
+    # Drift: the two planes disagree — one says stop, the other says go
+    if not _bot_mode_paused and _pne:
+        _control_drift = "ACTIVE_BUT_PNE_SET"    # BotMode running but soft gate still blocking
+    elif _bot_mode_paused and not _pne:
+        _control_drift = "PAUSED_BUT_PNE_CLEAR"  # BotMode stopped but soft gate is open
+    else:
+        _control_drift = None
+
     return jsonify({
         "heartbeat":          merged_hb,
         "account":            account,
@@ -336,8 +357,11 @@ def api_status():
         "max_concurrent_live":          MAX_CONCURRENT_TRADES_LIVE,
         "max_concurrent_backtest":      MAX_CONCURRENT_TRADES_BACKTEST,
         "regime_score":                 bot_stats.get("regime_score"),  # dict or None
-        # ── Control plane (pause_new_entries) ────────────────────────────
-        **_load_control_state(),
+        # ── Control plane ─────────────────────────────────────────────────
+        **_ctrl_fields,          # pause_new_entries, risk_mode (pin), last_updated, reason, pause_expiry_ts
+        "bot_mode":             mode,          # raw BotMode string: active/paused/regroup/sleeping
+        "effective_paused":     _effective_paused,
+        "control_drift":        _control_drift,
         # ── Regime / risk mode ────────────────────────────────────────────
         "risk_mode":                    bot_stats.get("risk_mode"),
         "risk_mode_mult":               bot_stats.get("risk_mode_mult"),
@@ -359,7 +383,8 @@ _SENTINEL = object()   # used as default sentinel in _write_control_state
 def _load_control_state() -> dict:
     """Read runtime_state/control.json; return safe default if missing/corrupt."""
     default = {"pause_new_entries": False, "risk_mode": None,
-               "last_updated": None, "updated_by": "system", "reason": ""}
+               "last_updated": None, "updated_by": "system", "reason": "",
+               "pause_expiry_ts": None}
     if not RUNTIME_CONTROL_FILE.exists():
         return default
     try:
@@ -369,25 +394,30 @@ def _load_control_state() -> dict:
 
 
 def _write_control_state(pause: bool, reason: str, updated_by: str = "dashboard",
-                          risk_mode: str | None = _SENTINEL) -> dict:
+                          risk_mode: str | None = _SENTINEL,
+                          pause_expiry_ts: str | None = _SENTINEL) -> dict:
     """Write runtime_state/control.json atomically; return new state.
     risk_mode=_SENTINEL (default) preserves existing risk_mode from disk.
     risk_mode=None clears the pin (AUTO).  risk_mode="HIGH" pins the mode.
+    pause_expiry_ts=_SENTINEL preserves existing value.  None clears it.
     """
     import os, tempfile
-    # Preserve existing risk_mode unless explicitly passed
+    # Preserve existing fields unless explicitly passed
     existing = _load_control_state()
     if risk_mode is _SENTINEL:
         risk_mode = existing.get("risk_mode")   # type: ignore[assignment]
     _VALID_RISK_MODES = {"LOW", "MEDIUM", "HIGH", "EXTREME"}
     if risk_mode not in _VALID_RISK_MODES:
         risk_mode = None
+    if pause_expiry_ts is _SENTINEL:
+        pause_expiry_ts = existing.get("pause_expiry_ts")  # type: ignore[assignment]
     state = {
         "pause_new_entries": pause,
         "risk_mode":         risk_mode,
         "last_updated":      datetime.now(timezone.utc).isoformat(),
         "updated_by":        updated_by,
         "reason":            reason,
+        "pause_expiry_ts":   pause_expiry_ts,
     }
     RUNTIME_STATE_DIR.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=RUNTIME_STATE_DIR, suffix=".tmp", prefix="control_")
@@ -414,30 +444,63 @@ def _write_control_audit(command: str, reason: str):
         pass
 
 
+def _do_pause(reason: str, updated_by: str = "dashboard") -> dict:
+    """
+    Authoritative pause: sets BotMode=PAUSED (via bot_control.json one-shot)
+    AND sets pause_new_entries=True in runtime_state/control.json.
+    Both planes are always updated together to prevent drift.
+    """
+    _write_control_audit("pause", reason)
+    CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONTROL_FILE.write_text(json.dumps({"command": "pause", "reason": reason}))
+    state = _write_control_state(pause=True, reason=reason, updated_by=updated_by)
+    return state
+
+
+def _do_resume(reason: str, updated_by: str = "dashboard") -> dict:
+    """
+    Authoritative resume: sets BotMode=ACTIVE (via bot_control.json one-shot)
+    AND sets pause_new_entries=False AND clears pause_expiry_ts in control.json.
+    Both planes are always updated together to prevent drift.
+    """
+    _write_control_audit("resume", reason)
+    CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONTROL_FILE.write_text(json.dumps({"command": "resume", "reason": reason}))
+    # Clear pause_expiry_ts (chop-shield expiry) on any manual resume
+    state = _write_control_state(pause=False, reason=reason, updated_by=updated_by,
+                                  pause_expiry_ts=None)
+    return state
+
+
 @app.route("/api/pause", methods=["POST"])
 def api_pause():
-    """Write a pause command to bot_control.json. Orchestrator picks it up next cycle."""
+    """
+    Authoritative pause — sets BotMode=PAUSED AND pause_new_entries=True.
+    Orchestrator picks up BotMode change on the next tick (~1 min).
+    """
     data   = request.get_json() or {}
     reason = data.get("reason", "Dashboard pause request")
     try:
-        _write_control_audit("pause", reason)
-        CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONTROL_FILE.write_text(json.dumps({"command": "pause", "reason": reason}))
-        return jsonify({"status": "ok", "command": "pause", "reason": reason})
+        state = _do_pause(reason)
+        return jsonify({"status": "ok", "command": "pause", "reason": reason,
+                        "pause_new_entries": True, "last_updated": state["last_updated"]})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/api/resume", methods=["POST"])
 def api_resume():
-    """Write a resume command to bot_control.json. Orchestrator picks it up next cycle."""
+    """
+    Authoritative resume — sets BotMode=ACTIVE AND pause_new_entries=False
+    AND clears pause_expiry_ts.
+    Orchestrator picks up BotMode change on the next tick (~1 min).
+    """
     data   = request.get_json() or {}
     reason = data.get("reason", "Dashboard resume request")
     try:
-        _write_control_audit("resume", reason)
-        CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONTROL_FILE.write_text(json.dumps({"command": "resume", "reason": reason}))
-        return jsonify({"status": "ok", "command": "resume", "reason": reason})
+        state = _do_resume(reason)
+        return jsonify({"status": "ok", "command": "resume", "reason": reason,
+                        "pause_new_entries": False, "last_updated": state["last_updated"]})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -445,17 +508,16 @@ def api_resume():
 @app.route("/api/pause_entries", methods=["POST"])
 def api_pause_entries():
     """
-    Pause NEW entries only.
-    Open positions continue to be managed (trail, stop, exits unaffected).
-    Persists in runtime_state/control.json — survives restarts.
+    DEPRECATED — now delegates to /api/pause (authoritative).
+    Kept for backward compatibility; callers should migrate to /api/pause.
     """
     data   = request.get_json() or {}
     reason = data.get("reason", "Dashboard pause request")
     try:
-        _write_control_audit("pause_entries", reason)
-        state = _write_control_state(pause=True, reason=reason, updated_by="dashboard")
+        state = _do_pause(reason)
         return jsonify({"status": "ok", "pause_new_entries": True, "reason": reason,
-                        "last_updated": state["last_updated"]})
+                        "last_updated": state["last_updated"],
+                        "deprecated": "use /api/pause instead"})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -463,16 +525,16 @@ def api_pause_entries():
 @app.route("/api/resume_entries", methods=["POST"])
 def api_resume_entries():
     """
-    Resume new entries after pause_entries.
-    Persistent — survives restarts until explicitly paused again.
+    DEPRECATED — now delegates to /api/resume (authoritative).
+    Kept for backward compatibility; callers should migrate to /api/resume.
     """
     data   = request.get_json() or {}
     reason = data.get("reason", "Dashboard resume")
     try:
-        _write_control_audit("resume_entries", reason)
-        state = _write_control_state(pause=False, reason=reason, updated_by="dashboard")
+        state = _do_resume(reason)
         return jsonify({"status": "ok", "pause_new_entries": False, "reason": reason,
-                        "last_updated": state["last_updated"]})
+                        "last_updated": state["last_updated"],
+                        "deprecated": "use /api/resume instead"})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
