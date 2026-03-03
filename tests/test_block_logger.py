@@ -466,3 +466,217 @@ class TestFailOpen:
         bad_ctx = {"pause_expiry_ts": "NOT_A_DATE", "candidate_confidence": "banana"}
         result = bl.log_block("GBP/USD", "CONFIDENCE_BLOCK", bad_ctx)
         assert isinstance(result, bool)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CANDIDATE_WAIT tests  (classes 13–15)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Class 13: CANDIDATE_WAIT basic emission ───────────────────────────────────
+
+class TestCandidateWaitBasic:
+
+    def test_wait_emits_candidate_wait_event(self, tmp_path):
+        """log_wait writes event=CANDIDATE_WAIT (not CANDIDATE_BLOCKED)."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(
+            pattern="double_top",
+            direction="short",
+            candidate_confidence=0.60,
+            confidence_threshold=0.77,
+        )
+        result = bl.log_wait("USD/JPY", ["no_zone_touch"], ctx)
+        assert result is True
+        records = _read_records(f)
+        assert len(records) == 1
+        assert records[0]["event"] == "CANDIDATE_WAIT"
+
+    def test_wait_conf_gap_computed_correctly(self, tmp_path):
+        """conf_gap = confidence_threshold - candidate_confidence."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(
+            pattern="double_top",
+            direction="short",
+            candidate_confidence=0.60,
+            confidence_threshold=0.77,
+        )
+        bl.log_wait("USD/JPY", [], ctx)
+        r = _read_records(f)[0]
+        assert r["conf_gap"] == pytest.approx(0.17, abs=0.001)
+        assert r["candidate_confidence"] == 0.60
+        assert r["confidence_threshold"] == 0.77
+
+    def test_wait_conf_below_min_in_wait_reasons(self, tmp_path):
+        """CONFIDENCE_BELOW_MIN added when confidence < threshold."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(
+            pattern="double_top",
+            direction="short",
+            candidate_confidence=0.60,
+            confidence_threshold=0.77,
+        )
+        bl.log_wait("USD/JPY", [], ctx)
+        r = _read_records(f)[0]
+        assert "CONFIDENCE_BELOW_MIN" in r["wait_reasons"]
+
+    def test_wait_no_zone_touch_filter_mapped(self, tmp_path):
+        """no_zone_touch failed_filter → NO_ZONE_TOUCH wait reason."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="head_and_shoulders", direction="short",
+                   candidate_confidence=0.80, confidence_threshold=0.77)
+        bl.log_wait("GBP/JPY", ["no_zone_touch"], ctx)
+        r = _read_records(f)[0]
+        assert "NO_ZONE_TOUCH" in r["wait_reasons"]
+
+    def test_wait_zone_touch_flag_false_when_filter_present(self, tmp_path):
+        """zone_touch=False when no_zone_touch in failed_filters."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.80, confidence_threshold=0.77)
+        ctx["zone_touch"] = False
+        bl.log_wait("USD/JPY", ["no_zone_touch"], ctx)
+        r = _read_records(f)[0]
+        assert r["zone_touch"] is False
+
+    def test_wait_htf_not_aligned_mapped(self, tmp_path):
+        """trend_alignment failed_filter → HTF_NOT_ALIGNED."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.80, confidence_threshold=0.77)
+        bl.log_wait("EUR/USD", ["trend_alignment"], ctx)
+        r = _read_records(f)[0]
+        assert "HTF_NOT_ALIGNED" in r["wait_reasons"]
+
+    def test_wait_awaiting_trigger_mapped(self, tmp_path):
+        """no_entry_signal → AWAITING_TRIGGER."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_bottom", direction="long",
+                   candidate_confidence=0.82, confidence_threshold=0.77)
+        bl.log_wait("GBP/USD", ["no_entry_signal"], ctx)
+        r = _read_records(f)[0]
+        assert "AWAITING_TRIGGER" in r["wait_reasons"]
+
+    def test_wait_multiple_reasons_combined(self, tmp_path):
+        """Multiple failed_filters produce multiple wait reasons."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="head_and_shoulders", direction="short",
+                   candidate_confidence=0.55, confidence_threshold=0.77)
+        bl.log_wait("USD/CHF", ["no_zone_touch", "trend_alignment"], ctx)
+        r = _read_records(f)[0]
+        reasons = r["wait_reasons"]
+        assert "CONFIDENCE_BELOW_MIN" in reasons
+        assert "NO_ZONE_TOUCH" in reasons
+        assert "HTF_NOT_ALIGNED" in reasons
+
+    def test_wait_regime_fields_written(self, tmp_path):
+        """wd_aligned and atr_ratio written when provided in context."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.60, confidence_threshold=0.77)
+        ctx["wd_aligned"] = False
+        ctx["atr_ratio"]  = 0.84
+        bl.log_wait("USD/JPY", [], ctx)
+        r = _read_records(f)[0]
+        assert r["wd_aligned"] is False
+        assert r["atr_ratio"] == pytest.approx(0.84)
+
+    def test_wait_rr_gap_computed(self, tmp_path):
+        """rr_gap = min_rr_threshold - candidate_rr when both provided."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.60, confidence_threshold=0.77,
+                   candidate_rr=1.8, min_rr_threshold=2.5)
+        bl.log_wait("USD/JPY", [], ctx)
+        r = _read_records(f)[0]
+        assert r["rr_gap"] == pytest.approx(0.70, abs=0.001)
+
+    def test_wait_returns_false_on_write_error(self, tmp_path):
+        """log_wait returns False on write failure, never raises."""
+        blocker = tmp_path / "is_a_file"
+        blocker.write_text("x")
+        bad_path = blocker / "sub" / "decision_log.jsonl"
+        bl = CandidateBlockLogger(decisions_file=bad_path)
+        result = bl.log_wait("USD/JPY", ["no_zone_touch"],
+                             _ctx(pattern="double_top", direction="short",
+                                  candidate_confidence=0.60, confidence_threshold=0.77))
+        assert result is False
+
+
+# ── Class 14: CANDIDATE_BLOCKED unaffected by WAIT addition ──────────────────
+
+class TestBlockedUnaffectedByWait:
+
+    def test_blocked_still_emits_candidate_blocked(self, tmp_path):
+        """Adding log_wait must not change CANDIDATE_BLOCKED behavior."""
+        bl, f = _logger(tmp_path)
+        bl.log_block("USD/JPY", "CONFIDENCE_BLOCK", _ctx(
+            pattern="double_top",
+            direction="short",
+            candidate_confidence=0.60,
+            confidence_threshold=0.77,
+        ))
+        records = _read_records(f)
+        assert len(records) == 1
+        assert records[0]["event"] == "CANDIDATE_BLOCKED"
+
+    def test_wait_and_blocked_are_independent_events(self, tmp_path):
+        """Both log_wait and log_block can write for the same pair without interfering."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.60, confidence_threshold=0.77)
+        # Write a WAIT, then a BLOCKED (different throttle-key events → both land)
+        bl.log_wait("USD/JPY", ["no_zone_touch"], ctx)
+        bl.log_block("USD/JPY", "CONFIDENCE_BLOCK", ctx)
+        records = _read_records(f)
+        events = {r["event"] for r in records}
+        assert "CANDIDATE_WAIT" in events
+        assert "CANDIDATE_BLOCKED" in events
+
+
+# ── Class 15: throttle applies to WAIT ───────────────────────────────────────
+
+class TestWaitThrottle:
+
+    def test_same_wait_key_suppressed_within_1h(self, tmp_path):
+        """Second log_wait with identical key within 1h returns False."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.60, confidence_threshold=0.77)
+        r1 = bl.log_wait("USD/JPY", ["no_zone_touch"], ctx)
+        r2 = bl.log_wait("USD/JPY", ["no_zone_touch"], ctx)
+        assert r1 is True
+        assert r2 is False
+        assert len(_read_records(f)) == 1
+
+    def test_different_wait_reasons_not_throttled(self, tmp_path):
+        """Changed wait reasons = different throttle key → both written."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.60, confidence_threshold=0.77)
+        r1 = bl.log_wait("USD/JPY", ["no_zone_touch"], ctx)
+        r2 = bl.log_wait("USD/JPY", ["no_entry_signal"], ctx)
+        assert r1 is True
+        assert r2 is True
+        assert len(_read_records(f)) == 2
+
+    def test_different_pair_not_throttled(self, tmp_path):
+        """Different pair = different throttle key → both written."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.60, confidence_threshold=0.77)
+        r1 = bl.log_wait("USD/JPY", ["no_zone_touch"], ctx)
+        r2 = bl.log_wait("GBP/JPY", ["no_zone_touch"], ctx)
+        assert r1 is True
+        assert r2 is True
+
+    def test_wait_and_block_throttle_keys_independent(self, tmp_path):
+        """log_wait and log_block use separate throttle namespaces."""
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(pattern="double_top", direction="short",
+                   candidate_confidence=0.60, confidence_threshold=0.77)
+        # WAIT written, then BLOCK for same pair — block should still land
+        bl.log_wait("USD/JPY", ["no_zone_touch"], ctx)
+        r2 = bl.log_block("USD/JPY", "CONFIDENCE_BLOCK", ctx)
+        assert r2 is True
+        records = _read_records(f)
+        assert len(records) == 2

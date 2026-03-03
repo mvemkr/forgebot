@@ -1,13 +1,16 @@
 """
 CandidateBlockLogger
 ====================
-Writes structured CANDIDATE_BLOCKED records to decision_log.jsonl when a
-pre-gate ENTER signal exists but is rejected by an existing gate.
+Writes two structured event types to decision_log.jsonl:
+
+  CANDIDATE_WAIT     — strategy found a pattern but returned WAIT before ENTER
+                        (logged at pattern-detection stage; zero broker risk)
+  CANDIDATE_BLOCKED  — strategy returned ENTER but a post-signal gate rejected it
 
 Contract:
   - Does NOT change any gate logic, threshold, or execution flow.
-  - One record per (pair, pattern, direction, block_reason) per hour.
-    Throttle key: (pair, pattern, direction, frozenset(block_reasons)).
+  - One record per (pair, pattern, direction, frozenset(reasons)) per hour.
+    Throttle key: (pair, pattern, direction, frozenset(reasons)).
     Same key within 1 hour → suppressed.  Different key → logged immediately.
   - Fails silently — never raises, never blocks entry path.
   - Writes to decision_log.jsonl (decision feed) ONLY.
@@ -19,7 +22,18 @@ Output path:
   Callers should pass the module-level DECISIONS_FILE constant from orchestrator
   so both share exactly one path definition.
 
-Block reason enums (12 total):
+CANDIDATE_WAIT reason codes (9 total):
+  CONFIDENCE_BELOW_MIN  candidate_confidence < confidence_threshold
+  NO_ZONE_TOUCH         price not in neckline zone on 1H
+  AWAITING_TRIGGER      pattern+zone ok but no engulfing entry signal yet
+  HTF_NOT_ALIGNED       weekly/daily trend opposes signal direction
+  SESSION_CLOSED        outside allowed session window
+  NEWS_BLACKOUT         high-impact news window
+  MAX_CONCURRENT        already at max open positions
+  CURRENCY_OVERLAP      currency already exposed in open position
+  STOP_COOLDOWN         recently stopped out on this pair
+
+CANDIDATE_BLOCKED reason codes (12 total):
   CONFIDENCE_BLOCK      candidate_confidence < confidence_threshold
   RR_BLOCK              candidate_rr < min_rr_threshold (2.5R/3.0R from alex_policy)
   SESSION_BLOCK         outside allowed session window (TIME_BLOCK alias)
@@ -56,7 +70,7 @@ logger = logging.getLogger(__name__)
 _LOG_DIR        = Path.home() / "trading-bot" / "logs"
 _DECISIONS_FILE = _LOG_DIR / "decision_log.jsonl"
 
-# All valid block-reason enum values
+# ── CANDIDATE_BLOCKED reason enums ───────────────────────────────────────────
 BLOCK_REASONS = frozenset({
     "CONFIDENCE_BLOCK",
     "RR_BLOCK",
@@ -72,7 +86,7 @@ BLOCK_REASONS = frozenset({
     "RECONCILE_PAUSE_BLOCK",
 })
 
-# Alias map: internal gate names → canonical enum values
+# Alias map: internal gate names → canonical CANDIDATE_BLOCKED enum values
 _REASON_ALIASES: Dict[str, str] = {
     "TIME_BLOCK":          "SESSION_BLOCK",
     "RR_MIN":              "RR_BLOCK",
@@ -89,6 +103,33 @@ _REASON_ALIASES: Dict[str, str] = {
     "PAUSED":              "PAUSE_BLOCK",
     "CHOP_PAUSE":          "CHOP_SHIELD_BLOCK",
     "RECONCILE":           "RECONCILE_PAUSE_BLOCK",
+}
+
+# ── CANDIDATE_WAIT reason enums ───────────────────────────────────────────────
+WAIT_REASONS = frozenset({
+    "CONFIDENCE_BELOW_MIN",  # confidence < threshold (pattern found but not strong enough)
+    "NO_ZONE_TOUCH",         # price not within neckline zone on 1H
+    "AWAITING_TRIGGER",      # pattern + zone ok, waiting for engulfing candle
+    "HTF_NOT_ALIGNED",       # weekly/daily trend opposes signal direction
+    "SESSION_CLOSED",        # outside allowed session window
+    "NEWS_BLACKOUT",         # high-impact news window active
+    "MAX_CONCURRENT",        # already at max open positions
+    "CURRENCY_OVERLAP",      # currency already exposed in an open position
+    "STOP_COOLDOWN",         # recently stopped out on this pair
+})
+
+# Map strategy failed_filter codes → canonical CANDIDATE_WAIT reason codes
+_WAIT_FILTER_MAP: Dict[str, str] = {
+    "no_zone_touch":    "NO_ZONE_TOUCH",
+    "no_entry_signal":  "AWAITING_TRIGGER",
+    "trend_alignment":  "HTF_NOT_ALIGNED",
+    "COUNTERTREND_HTF": "HTF_NOT_ALIGNED",
+    "session":          "SESSION_CLOSED",
+    "news_blackout":    "NEWS_BLACKOUT",
+    "max_concurrent":   "MAX_CONCURRENT",
+    "currency_overlap": "CURRENCY_OVERLAP",
+    "stop_cooldown":    "STOP_COOLDOWN",
+    "winner_rule":      "MAX_CONCURRENT",   # winner-running = another position open
 }
 
 _THROTTLE_SECS = 3600  # suppress identical (pair, pattern, direction, reasons) within 1 hour
@@ -151,6 +192,129 @@ class CandidateBlockLogger:
         except Exception as e:
             logger.debug(f"CandidateBlockLogger.log_block failed (non-fatal): {e}")
             return False
+
+    # ------------------------------------------------------------------
+    def log_wait(
+        self,
+        pair: str,
+        failed_filters: list,
+        context: Dict[str, Any],
+    ) -> bool:
+        """
+        Emit one CANDIDATE_WAIT record when the strategy found a pattern but
+        returned decision=WAIT before reaching the ENTER stage.
+
+        Only call this when decision.pattern is not None — callers are
+        responsible for that guard; log_wait does not re-check.
+
+        Parameters
+        ----------
+        pair           : e.g. "USD/JPY"
+        failed_filters : decision.failed_filters list from the strategy
+        context        : dict with all available gate-context fields
+
+        Returns True if written, False if throttled or write failed.
+        """
+        try:
+            wait_reasons = self._map_wait_reasons(failed_filters, context)
+            reasons_set  = frozenset(wait_reasons) if wait_reasons else frozenset({"BUILDING_SETUP"})
+            pattern      = str(context.get("pattern") or "")
+            direction    = str(context.get("direction") or "")
+            throttle_key = (pair, pattern, direction, reasons_set)
+
+            now    = datetime.now(timezone.utc)
+            cached = self._throttle.get(throttle_key)
+            if cached is not None:
+                age = (now - cached).total_seconds()
+                if age < _THROTTLE_SECS:
+                    return False  # same key within 1h — suppress
+
+            record = self._build_wait_record(pair, list(reasons_set), context, now)
+            ok = self._write(record)
+            if ok:
+                self._throttle[throttle_key] = now
+            return ok
+        except Exception as e:
+            logger.debug(f"CandidateBlockLogger.log_wait failed (non-fatal): {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    def _map_wait_reasons(
+        self, failed_filters: list, context: Dict[str, Any]
+    ) -> list:
+        """
+        Convert strategy failed_filters + computed confidence check into
+        canonical WAIT_REASONS codes. Order: confidence first, then filters.
+        """
+        reasons: list = []
+
+        # Computed confidence check — runs even if not in failed_filters
+        thr  = context.get("confidence_threshold")
+        cand = context.get("candidate_confidence")
+        if thr is not None and cand is not None and float(cand) < float(thr):
+            reasons.append("CONFIDENCE_BELOW_MIN")
+
+        # Map each failed_filter to a canonical wait reason
+        seen: set = set()
+        for filt in (failed_filters or []):
+            mapped = _WAIT_FILTER_MAP.get(filt)
+            if mapped and mapped not in seen:
+                reasons.append(mapped)
+                seen.add(mapped)
+
+        return reasons
+
+    # ------------------------------------------------------------------
+    def _build_wait_record(
+        self,
+        pair: str,
+        wait_reasons: list,
+        ctx: Dict[str, Any],
+        now: datetime,
+    ) -> dict:
+        thr  = ctx.get("confidence_threshold")
+        cand = ctx.get("candidate_confidence")
+        conf_gap = (float(thr) - float(cand)) if (thr is not None and cand is not None) else None
+
+        rr_thr  = self._rr_threshold(ctx)
+        rr_cand = ctx.get("candidate_rr")
+        rr_gap  = (float(rr_thr) - float(rr_cand)) if (rr_thr is not None and rr_cand is not None) else None
+
+        return {
+            "ts":                    now.isoformat(),
+            "event":                 "CANDIDATE_WAIT",
+            "pair":                  pair,
+            "pattern":               ctx.get("pattern"),
+            "direction":             ctx.get("direction"),
+            "wait_reasons":          wait_reasons,
+            # confidence proximity
+            "candidate_confidence":  cand,
+            "confidence_threshold":  thr,
+            "conf_gap":              round(conf_gap, 4) if conf_gap is not None else None,
+            # RR proximity
+            "candidate_rr":          rr_cand,
+            "min_rr_threshold":      rr_thr,
+            "rr_gap":                round(rr_gap, 4) if rr_gap is not None else None,
+            # zone
+            "zone_touch":            ctx.get("zone_touch", False),
+            # HTF flags
+            "htf_aligned":           ctx.get("htf_aligned"),
+            "trend_weekly":          ctx.get("trend_weekly"),
+            "trend_daily":           ctx.get("trend_daily"),
+            "trend_4h":              ctx.get("trend_4h"),
+            # regime
+            "wd_aligned":            ctx.get("wd_aligned"),
+            "atr_ratio":             ctx.get("atr_ratio"),
+            # session
+            "session_allowed":       ctx.get("session_allowed"),
+            "session_reason":        ctx.get("session_reason", ""),
+            # control plane / pause state
+            "pause_new_entries":     ctx.get("pause_new_entries", False),
+            "effective_paused":      ctx.get("effective_paused", False),
+            # chop shield
+            "loss_streak":           ctx.get("loss_streak"),
+            "paused_by_chop":        ctx.get("paused_by_chop", False),
+        }
 
     # ------------------------------------------------------------------
     def _normalise(self, reason: str) -> str:
