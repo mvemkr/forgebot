@@ -94,6 +94,7 @@ from ..strategy.forex.strategy_config import (
 )
 from ..strategy.forex import alex_policy   # shared Alex small-account gate logic
 from .account_state import AccountMode, AccountState  # execution-mode + equity tracking
+from .block_logger import CandidateBlockLogger         # structured near-miss block logging
 
 
 class ForexOrchestrator:
@@ -282,6 +283,10 @@ class ForexOrchestrator:
         # Pass reconciler to PositionMonitor so it can call reconcile_light()
         # before modifying stops (broker state may have drifted since last check)
         self.monitor.reconciler = self.reconciler
+
+        # Near-miss block-reason logger — writes CANDIDATE_BLOCKED records to
+        # decision_log.jsonl when an ENTER signal exists but is rejected by a gate.
+        self._block_logger = CandidateBlockLogger()
 
         self._last_hourly:          Optional[datetime] = None
         self._last_4h:              Optional[datetime] = None
@@ -953,6 +958,10 @@ class ForexOrchestrator:
                     f"Conf {decision.confidence:.0%} < {MIN_CONFIDENCE:.0%} required",
                     "CONFIDENCE",
                 )
+                self._block_logger.log_block(pair, "CONFIDENCE_BLOCK", self._block_ctx(decision, {
+                    "confidence_threshold": MIN_CONFIDENCE,
+                    "session_allowed": True,
+                }))
                 return
 
             # ── Global pause gate ─────────────────────────────────────────
@@ -966,6 +975,10 @@ class ForexOrchestrator:
                     f"Entries paused: {self.control.reason or 'manual hold'}",
                     "PAUSE_BLOCK",
                 )
+                self._block_logger.log_block(pair, "PAUSE_BLOCK", self._block_ctx(decision, {
+                    "confidence_threshold": MIN_CONFIDENCE,
+                    "effective_paused": True,
+                }))
                 return
 
             # ── Chop Shield Part B: recovery-selectivity filters ─────────
@@ -991,6 +1004,11 @@ class ForexOrchestrator:
                         f"Recovery mode: exec_rr {decision.exec_rr:.2f}R < {_rec_rr:.1f}R",
                         "RECOVERY_MIN_RR",
                     )
+                    self._block_logger.log_block(pair, "RECOVERY_RULES_BLOCK", self._block_ctx(decision, {
+                        "confidence_threshold": _rec_conf,
+                        "min_rr_threshold":     _rec_rr,
+                        "recovery_rules_active": True,
+                    }))
                     return
                 # Confidence gate
                 if decision.confidence < _rec_conf:
@@ -1004,6 +1022,11 @@ class ForexOrchestrator:
                         f"Recovery mode: conf {decision.confidence:.0%} < {_rec_conf:.0%}",
                         "RECOVERY_CONF",
                     )
+                    self._block_logger.log_block(pair, "RECOVERY_RULES_BLOCK", self._block_ctx(decision, {
+                        "confidence_threshold": _rec_conf,
+                        "min_rr_threshold":     _rec_rr,
+                        "recovery_rules_active": True,
+                    }))
                     return
                 # Weekly cap gate (stricter than normal during recovery)
                 try:
@@ -1019,6 +1042,13 @@ class ForexOrchestrator:
                             f"Recovery mode: weekly_cap={_rec_wcap} reached",
                             "RECOVERY_WEEKLY_CAP",
                         )
+                        self._block_logger.log_block(pair, "RECOVERY_RULES_BLOCK", self._block_ctx(decision, {
+                            "confidence_threshold": _rec_conf,
+                            "min_rr_threshold":     _rec_rr,
+                            "weekly_cap_remaining": 0,
+                            "weekly_cap_limit":     _rec_wcap,
+                            "recovery_rules_active": True,
+                        }))
                         return
                 except Exception:
                     pass
@@ -1040,6 +1070,9 @@ class ForexOrchestrator:
                         f"signal wants {decision.direction}",
                         "THEME_CONFLICT",
                     )
+                    self._block_logger.log_block(pair, "THEME_CONFLICT_BLOCK", self._block_ctx(decision, {
+                        "confidence_threshold": MIN_CONFIDENCE,
+                    }))
                     return
 
             # ── Alex small-account gates (live parity via alex_policy) ──
@@ -1063,6 +1096,10 @@ class ForexOrchestrator:
                     _rr_rsn,
                     "RR_MIN",
                 )
+                self._block_logger.log_block(pair, "RR_BLOCK", self._block_ctx(decision, {
+                    "confidence_threshold": MIN_CONFIDENCE,
+                    "htf_aligned":          _htf_aligned_flag,
+                }))
                 return
 
             # Gate 2: Weekly trade punch-card
@@ -1077,6 +1114,15 @@ class ForexOrchestrator:
                     _wk_rsn,
                     "WEEKLY_TRADE_LIMIT",
                 )
+                _wk_cap = (_sc.MAX_TRADES_PER_WEEK_SMALL
+                           if self.account_balance < _sc.SMALL_ACCOUNT_THRESHOLD
+                           else _sc.MAX_TRADES_PER_WEEK_STANDARD)
+                self._block_logger.log_block(pair, "WEEKLY_CAP_BLOCK", self._block_ctx(decision, {
+                    "confidence_threshold": MIN_CONFIDENCE,
+                    "weekly_cap_remaining": 0,
+                    "weekly_cap_limit":     _wk_cap,
+                    "htf_aligned":          _htf_aligned_flag,
+                }))
                 return
 
             # ── Winner rule: don't compete with your winner ───────────────
@@ -1113,6 +1159,10 @@ class ForexOrchestrator:
             if win_blocked:
                 logger.info(f"⚠ {pair}: ENTER BLOCKED — {win_reason}")
                 self._set_block_reason(pair, "BLOCKED", win_reason, "WINNER_RUNNING")
+                self._block_logger.log_block(pair, "WINNER_RUNNING_BLOCK", self._block_ctx(decision, {
+                    "confidence_threshold": MIN_CONFIDENCE,
+                    "htf_aligned":          _htf_aligned_flag,
+                }))
                 return
 
             # ── Session gate — only auto-execute during London session ────
@@ -1126,6 +1176,12 @@ class ForexOrchestrator:
                     "Outside London session (3–8 AM ET) — signal logged, not auto-executed",
                     "TIME_BLOCK",
                 )
+                self._block_logger.log_block(pair, "SESSION_BLOCK", self._block_ctx(decision, {
+                    "confidence_threshold": MIN_CONFIDENCE,
+                    "htf_aligned":          _htf_aligned_flag,
+                    "session_allowed":      False,
+                    "session_reason":       "OUTSIDE_LONDON_SESSION",
+                }))
                 self.notifier.send(
                     f"⏰ <b>{pair} signal (non-London)</b> — {decision.direction} @ "
                     f"{decision.entry_price:.5f if decision.entry_price else '?'} | "
@@ -1151,6 +1207,12 @@ class ForexOrchestrator:
                             f"({ATR_STOP_MULTIPLIER:.0f}×ATR)")
                     logger.info(f"⚠ {pair}: ENTER BLOCKED — {_msg}")
                     self._set_block_reason(pair, "BLOCKED", _msg, "STOP_WIDE")
+                    self._block_logger.log_block(pair, "STOP_WIDE_BLOCK", self._block_ctx(decision, {
+                        "confidence_threshold": MIN_CONFIDENCE,
+                        "htf_aligned":          _htf_aligned_flag,
+                        "stop_distance_pips":   round(dist / pip),
+                        "atr_max_pips":         round(atr * ATR_STOP_MULTIPLIER / pip),
+                    }))
                     return
                 if dist < atr * ATR_MIN_MULTIPLIER:
                     _msg = (f"Stop too tight: {dist/pip:.0f}p < "
@@ -1158,6 +1220,12 @@ class ForexOrchestrator:
                             f"({ATR_MIN_MULTIPLIER:.2f}×ATR) — micro-stop")
                     logger.info(f"⚠ {pair}: ENTER BLOCKED — {_msg}")
                     self._set_block_reason(pair, "BLOCKED", _msg, "STOP_TIGHT")
+                    self._block_logger.log_block(pair, "STOP_TIGHT_BLOCK", self._block_ctx(decision, {
+                        "confidence_threshold": MIN_CONFIDENCE,
+                        "htf_aligned":          _htf_aligned_flag,
+                        "stop_distance_pips":   round(dist / pip),
+                        "atr_min_pips":         round(atr * ATR_MIN_MULTIPLIER / pip),
+                    }))
                     return
 
             # ── Pre-order reconcile: validate broker state before committing ──
@@ -1174,6 +1242,11 @@ class ForexOrchestrator:
                     if _pre_recon.pause_triggered:
                         # Reconciler already paused entries; don't place this order.
                         logger.warning(f"⚠ {pair}: entry aborted — reconciler paused entries")
+                        self._block_logger.log_block(pair, "RECONCILE_PAUSE_BLOCK", self._block_ctx(decision, {
+                            "confidence_threshold": MIN_CONFIDENCE,
+                            "htf_aligned":          _htf_aligned_flag,
+                            "effective_paused":     True,
+                        }))
                         return
             except Exception as _re:
                 logger.debug(f"Pre-order reconcile failed (fail-open): {_re}")
@@ -1424,6 +1497,45 @@ class ForexOrchestrator:
         except Exception as e:
             logger.warning(f"{pair}/{granularity}: Data fetch failed: {e}")
             return None
+
+    # ── Block-reason logging helpers ──────────────────────────────────────
+
+    def _block_ctx(self, decision, extra: dict | None = None) -> dict:
+        """
+        Assemble common gate-context dict for CandidateBlockLogger.log_block().
+        Merges orchestrator state with per-gate extras.  Never raises.
+        """
+        try:
+            chop_thresh = getattr(__import__(
+                "src.strategy.forex.strategy_config", fromlist=["_sc"]
+            ), "_sc", None)
+            _sc_mod = getattr(chop_thresh, "CHOP_SHIELD_STREAK_THRESH", 3) if chop_thresh else 3
+        except Exception:
+            _sc_mod = 3
+        streak = self._consecutive_losses
+        chop_paused = (
+            self.control.pause_expiry_ts is not None
+            and not self.control.chop_pause_expired()
+        )
+        ctx = {
+            # pattern / signal
+            "pattern":               getattr(decision, "pattern", None),
+            "direction":             getattr(decision, "direction", None),
+            "candidate_confidence":  getattr(decision, "confidence", None),
+            "candidate_rr":          getattr(decision, "exec_rr", None),
+            # control plane
+            "bot_mode":              self.risk._mode.value
+                                     if hasattr(self.risk, "_mode") else "unknown",
+            "pause_new_entries":     self.control.pause_new_entries,
+            "pause_expiry_ts":       self.control.pause_expiry_ts,
+            # chop shield
+            "loss_streak":           streak,
+            "paused_by_chop":        chop_paused,
+            "recovery_rules_active": streak >= _sc_mod and not chop_paused,
+        }
+        if extra:
+            ctx.update(extra)
+        return ctx
 
     # ── Schedule Logic ─────────────────────────────────────────────────
 
