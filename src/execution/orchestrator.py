@@ -947,6 +947,17 @@ class ForexOrchestrator:
         # is waiting for before the bot will enter.
         self._capture_confluence(pair, decision, macro_theme)
 
+        # ── CANDIDATE_WAIT logging ────────────────────────────────────────
+        # Log structured near-miss data when the strategy detected a pattern
+        # but returned WAIT before reaching the ENTER stage.  Pure observability
+        # — does NOT touch any gate, threshold, or execution path.
+        if decision.decision.value == "WAIT" and decision.pattern is not None:
+            self._block_logger.log_wait(
+                pair,
+                decision.failed_filters or [],
+                self._wait_ctx(decision),
+            )
+
         if decision.decision.value == "ENTER":
             # ── Confidence gate (matches backtester MIN_CONFIDENCE=65%) ──
             if decision.confidence < MIN_CONFIDENCE:
@@ -1537,6 +1548,68 @@ class ForexOrchestrator:
         if extra:
             ctx.update(extra)
         return ctx
+
+    # ------------------------------------------------------------------
+    def _wait_ctx(self, decision) -> dict:
+        """
+        Assemble full context dict for CandidateBlockLogger.log_wait().
+        Extends _block_ctx with regime state, HTF alignment, trend fields,
+        and zone-touch flag.  Never raises.
+        """
+        try:
+            from ..strategy.forex import strategy_config as _sc_wc
+            from ..strategy.forex.alex_policy import AlexPolicy as _ap_cls
+
+            # Base context from _block_ctx (pattern, direction, confidence, RR,
+            # control-plane state, chop-shield state)
+            ctx = self._block_ctx(decision)
+
+            # ── Confidence threshold ──────────────────────────────────────
+            ctx["confidence_threshold"] = MIN_CONFIDENCE
+
+            # ── Pattern name (string, not object) ────────────────────────
+            if decision.pattern is not None:
+                ctx["pattern"] = getattr(decision.pattern, "pattern_type", None)
+
+            # ── Zone touch: "no_zone_touch" absent from failed_filters ───
+            ctx["zone_touch"] = "no_zone_touch" not in (decision.failed_filters or [])
+
+            # ── HTF alignment ─────────────────────────────────────────────
+            try:
+                _ap = _ap_cls()
+                ctx["htf_aligned"] = _ap.htf_aligned(
+                    decision.direction or "",
+                    decision.trend_weekly,
+                    decision.trend_daily,
+                    decision.trend_4h,
+                )
+            except Exception:
+                ctx["htf_aligned"] = None
+
+            # ── Trend strings ─────────────────────────────────────────────
+            ctx["trend_weekly"] = decision.trend_weekly.value if decision.trend_weekly else None
+            ctx["trend_daily"]  = decision.trend_daily.value  if decision.trend_daily  else None
+            ctx["trend_4h"]     = decision.trend_4h.value     if decision.trend_4h     else None
+
+            # ── Regime state (wd_aligned, atr_ratio) ─────────────────────
+            _rs = getattr(self, "_last_regime_score", {}) or {}
+            ctx["wd_aligned"] = _rs.get("wd_aligned")
+            ctx["atr_ratio"]  = _rs.get("atr_ratio")
+
+            # ── Session state ─────────────────────────────────────────────
+            try:
+                _sf = self.strategy.session_filter
+                _sa, _sr = _sf.is_allowed()
+                ctx["session_allowed"] = _sa
+                ctx["session_reason"]  = _sr or ""
+            except Exception:
+                pass
+
+            return ctx
+        except Exception as e:
+            logger.debug(f"_wait_ctx failed (non-fatal): {e}")
+            # Fall back to minimal context so log_wait doesn't crash
+            return self._block_ctx(decision)
 
     # ── Schedule Logic ─────────────────────────────────────────────────
 
