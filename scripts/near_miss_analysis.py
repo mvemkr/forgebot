@@ -96,11 +96,11 @@ def section_d(records: list) -> None:
     else:
         print("    (none)")
 
-    # Top pairs
-    pair_ctr: Counter = Counter(r.get("pair", "?") for r in records)
-    print("\n  Top 10 pairs by candidate count:")
-    if pair_ctr:
-        for pair, cnt in pair_ctr.most_common(10):
+    # Top pairs by WAIT count
+    wait_pair_ctr: Counter = Counter(r.get("pair", "?") for r in wait_recs)
+    print("\n  Top 10 pairs by WAIT count:")
+    if wait_pair_ctr:
+        for pair, cnt in wait_pair_ctr.most_common(10):
             print(f"    {pair:<14} {cnt}")
     else:
         print("    (none)")
@@ -179,6 +179,8 @@ def section_f(records: list, top_n: int = 20) -> None:
     conf_pool = [r for r in records
                  if (r["event"] == "CANDIDATE_WAIT" and "CONFIDENCE_BELOW_MIN" in r.get("wait_reasons", []))
                  or (r["event"] == "CANDIDATE_BLOCKED" and "CONFIDENCE_BLOCK" in r.get("block_reasons", []))]
+    # Keep only true misses (gap > 0 means confidence is below threshold)
+    conf_pool = [r for r in conf_pool if conf_gap_val(r) > 0]
     conf_sorted = sorted(conf_pool, key=conf_gap_val)[:top_n]
 
     print(f"\n  Confidence closest misses — top {top_n} (n={len(conf_pool)} total)")
@@ -209,9 +211,10 @@ def section_f(records: list, top_n: int = 20) -> None:
         return v if v is not None else float("inf")
 
     rr_pool = [r for r in records
-               if (r["event"] == "CANDIDATE_WAIT" and r.get("rr_gap") is not None
-                   and r.get("rr_gap", float("inf")) < float("inf"))
+               if (r["event"] == "CANDIDATE_WAIT" and r.get("rr_gap") is not None)
                or (r["event"] == "CANDIDATE_BLOCKED" and "RR_BLOCK" in r.get("block_reasons", []))]
+    # Keep only true misses (gap > 0 means RR is below threshold)
+    rr_pool = [r for r in rr_pool if rr_gap_val(r) > 0]
     rr_sorted = sorted(rr_pool, key=rr_gap_val)[:top_n]
 
     print(f"\n  RR closest misses — top {top_n} (n={len(rr_pool)} total)")
