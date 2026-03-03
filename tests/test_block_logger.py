@@ -195,11 +195,12 @@ class TestUnknownReason:
             assert records[0]["block_reasons"] == ["CUSTOM_GATE_XYZ"]
 
 
-# ── Class 4: Throttle — suppress same pair/pattern within 1 hour ──────────
+# ── Class 4: Throttle — suppress same (pair, pattern, direction, reasons) ─
 
 class TestThrottleSuppression:
 
     def test_duplicate_within_hour_suppressed(self, tmp_path):
+        """Identical key (pair+pattern+direction+reasons) within 1h → suppressed."""
         bl, f = _logger(tmp_path)
         r1 = bl.log_block("GBP/USD", "CONFIDENCE_BLOCK", _ctx())
         r2 = bl.log_block("GBP/USD", "CONFIDENCE_BLOCK", _ctx())
@@ -221,37 +222,50 @@ class TestThrottleSuppression:
         assert r2 is True
         assert len(_read_records(f)) == 2
 
+    def test_different_direction_not_suppressed(self, tmp_path):
+        """Direction is part of the throttle key — long vs short → both logged."""
+        bl, f = _logger(tmp_path)
+        bl.log_block("GBP/USD", "CONFIDENCE_BLOCK", _ctx(direction="short"))
+        r2 = bl.log_block("GBP/USD", "CONFIDENCE_BLOCK", _ctx(direction="long"))
+        assert r2 is True
+        assert len(_read_records(f)) == 2
 
-# ── Class 5: Throttle reset on block_reason change ────────────────────────
+
+# ── Class 5: Throttle — different block_reason = different key ────────────
 
 class TestThrottleResetOnReasonChange:
 
-    def test_new_reason_bypasses_throttle(self, tmp_path):
+    def test_new_reason_is_different_key(self, tmp_path):
+        """block_reasons is part of the throttle key — different reason → different key → logged."""
         bl, f = _logger(tmp_path)
         bl.log_block("USD/JPY", "CONFIDENCE_BLOCK", _ctx())
         r2 = bl.log_block("USD/JPY", "RR_BLOCK", _ctx())
         assert r2 is True
         assert len(_read_records(f)) == 2
 
-    def test_reverted_reason_written_again_after_change(self, tmp_path):
+    def test_same_reason_reverted_suppressed_within_hour(self, tmp_path):
+        """
+        CONFIDENCE → RR_BLOCK → CONFIDENCE within 1h:
+        Third call has same key as first → suppressed (key was cached at attempt 1).
+        """
         bl, f = _logger(tmp_path)
-        bl.log_block("USD/JPY", "CONFIDENCE_BLOCK", _ctx())
-        bl.log_block("USD/JPY", "RR_BLOCK", _ctx())        # reason changed → written
-        r3 = bl.log_block("USD/JPY", "CONFIDENCE_BLOCK", _ctx())  # reason changed back → written
-        assert r3 is True
-        assert len(_read_records(f)) == 3
+        bl.log_block("USD/JPY", "CONFIDENCE_BLOCK", _ctx())   # key A → logged
+        bl.log_block("USD/JPY", "RR_BLOCK", _ctx())            # key B → logged
+        r3 = bl.log_block("USD/JPY", "CONFIDENCE_BLOCK", _ctx())  # key A again, <1h → suppressed
+        assert r3 is False
+        assert len(_read_records(f)) == 2
 
 
-# ── Class 6: Throttle reset after 1 hour ──────────────────────────────────
+# ── Class 6: Throttle expiry after 1 hour ────────────────────────────────
 
 class TestThrottleExpiry:
 
-    def test_same_reason_written_after_throttle_expires(self, tmp_path):
+    def test_same_key_written_after_throttle_expires(self, tmp_path):
         bl, f = _logger(tmp_path)
         bl.log_block("GBP/CHF", "CONFIDENCE_BLOCK", _ctx())
-        # Manually backdate the throttle entry by > 1 hour
-        key = ("GBP/CHF", "double_top")
-        bl._throttle[key]["ts"] = (
+        # Throttle key now maps to a datetime directly
+        key = ("GBP/CHF", "double_top", "short", frozenset({"CONFIDENCE_BLOCK"}))
+        bl._throttle[key] = (
             datetime.now(timezone.utc) - timedelta(seconds=_THROTTLE_SECS + 1)
         )
         r2 = bl.log_block("GBP/CHF", "CONFIDENCE_BLOCK", _ctx())
@@ -282,19 +296,20 @@ class TestConfidenceBlockValues:
         assert r["candidate_confidence"] < r["confidence_threshold"]
 
 
-# ── Class 8: RR_BLOCK values ──────────────────────────────────────────────
+# ── Class 8: RR_BLOCK values + auto-threshold derivation ──────────────────
 
 class TestRRBlockValues:
 
-    def test_rr_and_threshold_written(self, tmp_path):
+    def test_explicit_min_rr_threshold_wins(self, tmp_path):
+        """Explicit ctx override of min_rr_threshold is written as-is."""
         bl, f = _logger(tmp_path)
         bl.log_block("USD/CAD", "RR_BLOCK", _ctx(
             candidate_rr=0.9,
-            min_rr_threshold=1.5,
+            min_rr_threshold=2.5,
         ))
         r = _read_records(f)[0]
         assert r["candidate_rr"] == pytest.approx(0.9)
-        assert r["min_rr_threshold"] == pytest.approx(1.5)
+        assert r["min_rr_threshold"] == pytest.approx(2.5)
         assert r["block_reasons"] == ["RR_BLOCK"]
 
     def test_htf_aligned_written_with_rr_block(self, tmp_path):
@@ -302,6 +317,43 @@ class TestRRBlockValues:
         bl.log_block("EUR/USD", "RR_BLOCK", _ctx(htf_aligned=False))
         r = _read_records(f)[0]
         assert r["htf_aligned"] is False
+
+    def test_min_rr_auto_derived_from_strategy_config_htf_true(self, tmp_path):
+        """No explicit threshold → derived from strategy_config.MIN_RR_STANDARD."""
+        from src.strategy.forex import strategy_config as _sc
+        expected = float(getattr(_sc, "MIN_RR_STANDARD", 2.5))
+        bl, f = _logger(tmp_path)
+        # no min_rr_threshold in ctx → auto-derive
+        ctx = _ctx(htf_aligned=True)
+        ctx.pop("min_rr_threshold", None)
+        bl.log_block("GBP/CHF", "RR_BLOCK", ctx)
+        r = _read_records(f)[0]
+        assert r["min_rr_threshold"] == pytest.approx(expected)
+
+    def test_min_rr_auto_derived_from_strategy_config_htf_false(self, tmp_path):
+        """No explicit threshold + htf_aligned=False → MIN_RR_COUNTERTREND."""
+        from src.strategy.forex import strategy_config as _sc
+        expected = float(getattr(_sc, "MIN_RR_COUNTERTREND", 2.5))
+        bl, f = _logger(tmp_path)
+        ctx = _ctx(htf_aligned=False)
+        ctx.pop("min_rr_threshold", None)
+        bl.log_block("EUR/CHF", "RR_BLOCK", ctx)
+        r = _read_records(f)[0]
+        assert r["min_rr_threshold"] == pytest.approx(expected)
+
+    def test_recovery_min_rr_explicit_override(self, tmp_path):
+        """RECOVERY_RULES_BLOCK passes RECOVERY_MIN_RR (3.0) explicitly."""
+        from src.strategy.forex import strategy_config as _sc
+        rec_rr = float(getattr(_sc, "RECOVERY_MIN_RR", 3.0))
+        bl, f = _logger(tmp_path)
+        bl.log_block("USD/JPY", "RECOVERY_RULES_BLOCK", _ctx(
+            candidate_rr=1.8,
+            min_rr_threshold=rec_rr,
+            recovery_rules_active=True,
+        ))
+        r = _read_records(f)[0]
+        assert r["min_rr_threshold"] == pytest.approx(rec_rr)
+        assert r["recovery_rules_active"] is True
 
 
 # ── Class 9: SESSION_BLOCK fields ─────────────────────────────────────────

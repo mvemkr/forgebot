@@ -286,7 +286,8 @@ class ForexOrchestrator:
 
         # Near-miss block-reason logger — writes CANDIDATE_BLOCKED records to
         # decision_log.jsonl when an ENTER signal exists but is rejected by a gate.
-        self._block_logger = CandidateBlockLogger()
+        # Pass the module-level DECISIONS_FILE so both share one path definition.
+        self._block_logger = CandidateBlockLogger(decisions_file=DECISIONS_FILE)
 
         self._last_hourly:          Optional[datetime] = None
         self._last_4h:              Optional[datetime] = None
