@@ -24,16 +24,28 @@ Options
 
 Output sections
 ---------------
+  S  SCAN_SUMMARY  — aggregate scan stats (SCAN_HEARTBEAT events); shown
+                     separately, NEVER mixed into candidate totals.
+                     Pairs with no_pattern appear ONLY here.
   D  CANDIDATE_WAIT + CANDIDATE_BLOCKED counts by reason / pair
+     *** Counts derived ONLY from CANDIDATE_WAIT / CANDIDATE_BLOCKED events.
+     *** Records with no_pattern cannot appear here: the orchestrator emits
+         CANDIDATE_WAIT only when decision.pattern is not None.
   E  Proximity buckets (conf gap, RR gap)
+     rr_unavailable count shown separately (entry not reached → exec_rr=0.0).
   F  Top-N closest misses sorted by gap ascending
+     Negative-gap rows excluded (gap must be > 0).
+     rr_unavailable rows excluded from RR closest misses.
 
 Notes
 -----
-  - CANDIDATE_WAIT is the primary data source (fires when pattern found but
-    decision=WAIT — captures near-miss data before the ENTER stage).
-  - CANDIDATE_BLOCKED supplements (fires when decision=ENTER but downstream
-    gate rejected it).
+  - CANDIDATE_WAIT fires when pattern found but decision=WAIT, BEFORE ENTER
+    stage.  Zero broker risk.
+  - CANDIDATE_BLOCKED fires when decision=ENTER but a post-signal gate blocked
+    it.
+  - rr_unavailable=True means the WAIT record has a pattern but RR was not
+    computed (entry signal absent → _calculate_entry never ran → exec_rr=0.0
+    default).  These appear in CONFIDENCE proximity but NOT in RR proximity.
   - Throttle dedup (1h/same key) is enforced by the logger; this script reports
     raw counts as-is.
 """
@@ -51,6 +63,11 @@ def _ts(r: dict) -> str:
 
 
 def load_records(log_path: Path, ts_from: str, ts_to: str) -> list:
+    """Load only CANDIDATE_WAIT / CANDIDATE_BLOCKED events in window.
+
+    Invariant: these events are emitted by the orchestrator only when
+    decision.pattern is not None, so no_pattern rows can never appear here.
+    """
     records = []
     with open(log_path) as f:
         for line in f:
@@ -65,8 +82,61 @@ def load_records(log_path: Path, ts_from: str, ts_to: str) -> list:
                 continue
             ts = _ts(r)
             if ts and ts_from <= ts <= ts_to:
+                # Defensive: drop any record that somehow has no pattern
+                # (should never happen, but guard analysis correctness).
+                if r.get("pattern") is None:
+                    continue
                 records.append(r)
     return records
+
+
+def load_scan_records(log_path: Path, ts_from: str, ts_to: str) -> list:
+    """Load SCAN_HEARTBEAT events in window (for SCAN_SUMMARY section only)."""
+    records = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("event") != "SCAN_HEARTBEAT":
+                continue
+            ts = _ts(r)
+            if ts and ts_from <= ts <= ts_to:
+                records.append(r)
+    return records
+
+
+def section_s(scan_records: list) -> None:
+    """SCAN_SUMMARY — aggregate totals from SCAN_HEARTBEAT events.
+
+    Displayed BEFORE candidate sections.  Pairs with no_pattern appear ONLY here.
+    These numbers are never mixed into D/E/F candidate counts.
+    """
+    print("══════════════════════════════════════════════")
+    print("S) SCAN SUMMARY  (SCAN_HEARTBEAT — not candidate data)")
+    print("══════════════════════════════════════════════")
+    if not scan_records:
+        print("  No SCAN_HEARTBEAT events in window.")
+        return
+
+    total_scans   = len(scan_records)
+    total_pairs   = sum(r.get("pairs_scanned", 0) for r in scan_records)
+    total_wait    = sum(r.get("wait_count",    0) for r in scan_records)
+    total_enter   = sum(r.get("enter_count",   0) for r in scan_records)
+    total_blocked = sum(r.get("blocked_count", 0) for r in scan_records)
+
+    print(f"  Scans in window       : {total_scans}")
+    print(f"  Pair-scans total      : {total_pairs}  (includes no_pattern placeholders)")
+    print(f"  Aggregate WAIT        : {total_wait}")
+    print(f"  Aggregate ENTER       : {total_enter}")
+    print(f"  Aggregate BLOCKED     : {total_blocked}")
+    print()
+    print("  ⚠ SCAN totals include no_pattern pairs (conf=0.30 placeholders).")
+    print("    True near-miss candidates are in section D below (CANDIDATE events only).")
 
 
 def section_d(records: list) -> None:
@@ -136,16 +206,28 @@ def section_e(records: list) -> None:
     for b, cnt in bc.items():
         print(f"    {b:<14} {cnt}")
 
-    # RR proximity — WAIT uses rr_gap directly; BLOCKED derives it
+    # RR proximity — WAIT uses rr_gap directly; BLOCKED derives it.
+    # rr_unavailable=True → entry not reached, exec_rr was 0.0 default.
+    # These rows MUST be excluded from RR buckets — they have no meaningful gap.
     def get_rr_gap(r: dict):
         if r["event"] == "CANDIDATE_WAIT":
+            if r.get("rr_unavailable", False):
+                return None   # exclude: RR not computed
             return r.get("rr_gap")
         thr  = r.get("min_rr_threshold")
         cand = r.get("candidate_rr")
         return (float(thr) - float(cand)) if thr is not None and cand is not None else None
 
+    # Count rr_unavailable separately before building the bucket pool
+    rr_unavailable_count = sum(
+        1 for r in records
+        if r["event"] == "CANDIDATE_WAIT" and r.get("rr_unavailable", False)
+    )
+
     rr_recs = [r for r in records
-               if (r["event"] == "CANDIDATE_WAIT" and r.get("rr_gap") is not None)
+               if (r["event"] == "CANDIDATE_WAIT"
+                   and not r.get("rr_unavailable", False)
+                   and r.get("rr_gap") is not None)
                or (r["event"] == "CANDIDATE_BLOCKED" and "RR_BLOCK" in r.get("block_reasons", []))]
     br = {"[0–0.2]": 0, "(0.2–0.5]": 0, "(0.5–1.0]": 0, ">1.0": 0}
     for r in rr_recs:
@@ -159,6 +241,9 @@ def section_e(records: list) -> None:
     print(f"\n  RR gap (threshold − rr)                  [n={len(rr_recs)}]")
     for b, cnt in br.items():
         print(f"    {b:<14} {cnt}")
+    if rr_unavailable_count:
+        print(f"    rr_unavailable    {rr_unavailable_count}  "
+              f"(entry not reached → exec_rr=0.0; excluded from buckets)")
 
 
 def section_f(records: list, top_n: int = 20) -> None:
@@ -203,6 +288,8 @@ def section_f(records: list, top_n: int = 20) -> None:
     # ── RR closest misses ─────────────────────────────────────────────────────
     def rr_gap_val(r: dict):
         if r["event"] == "CANDIDATE_WAIT":
+            if r.get("rr_unavailable", False):
+                return float("inf")   # not computed — sort to the back / exclude
             v = r.get("rr_gap")
         else:
             thr  = r.get("min_rr_threshold")
@@ -211,7 +298,9 @@ def section_f(records: list, top_n: int = 20) -> None:
         return v if v is not None else float("inf")
 
     rr_pool = [r for r in records
-               if (r["event"] == "CANDIDATE_WAIT" and r.get("rr_gap") is not None)
+               if (r["event"] == "CANDIDATE_WAIT"
+                   and not r.get("rr_unavailable", False)   # exclude uncalculated RR
+                   and r.get("rr_gap") is not None)
                or (r["event"] == "CANDIDATE_BLOCKED" and "RR_BLOCK" in r.get("block_reasons", []))]
     # Keep only true misses (gap > 0 means RR is below threshold)
     rr_pool = [r for r in rr_pool if rr_gap_val(r) > 0]
@@ -269,7 +358,11 @@ def main() -> None:
     print(f"\nWindow : {ts_from} → {ts_to}")
     print(f"Log    : {log_path}\n")
 
-    records = load_records(log_path, ts_from, ts_to)
+    scan_records = load_scan_records(log_path, ts_from, ts_to)
+    records      = load_records(log_path, ts_from, ts_to)
+
+    section_s(scan_records)
+    print()
     section_d(records)
     section_e(records)
     section_f(records, top_n=args.top)

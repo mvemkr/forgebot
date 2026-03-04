@@ -276,9 +276,16 @@ class CandidateBlockLogger:
         cand = ctx.get("candidate_confidence")
         conf_gap = (float(thr) - float(cand)) if (thr is not None and cand is not None) else None
 
-        rr_thr  = self._rr_threshold(ctx)
-        rr_cand = ctx.get("candidate_rr")
-        rr_gap  = (float(rr_thr) - float(rr_cand)) if (rr_thr is not None and rr_cand is not None) else None
+        rr_thr        = self._rr_threshold(ctx)
+        rr_cand       = ctx.get("candidate_rr")          # None when rr_unavailable
+        rr_unavailable = ctx.get("rr_unavailable", rr_cand is None)
+
+        # rr_gap: only compute when both values exist (i.e. RR was actually computed).
+        # Never synthesise a gap from a null/zero RR — that would pollute proximity buckets.
+        if not rr_unavailable and rr_thr is not None and rr_cand is not None:
+            rr_gap: Optional[float] = float(rr_thr) - float(rr_cand)
+        else:
+            rr_gap = None
 
         return {
             "ts":                    now.isoformat(),
@@ -291,10 +298,13 @@ class CandidateBlockLogger:
             "candidate_confidence":  cand,
             "confidence_threshold":  thr,
             "conf_gap":              round(conf_gap, 4) if conf_gap is not None else None,
-            # RR proximity
+            # RR proximity — rr_unavailable=True means entry was never reached so
+            # exec_rr was 0.0 (default).  candidate_rr and rr_gap will be null.
+            # Consumers MUST exclude rr_unavailable=True rows from RR gap buckets.
             "candidate_rr":          rr_cand,
             "min_rr_threshold":      rr_thr,
             "rr_gap":                round(rr_gap, 4) if rr_gap is not None else None,
+            "rr_unavailable":        rr_unavailable,
             # zone
             "zone_touch":            ctx.get("zone_touch", False),
             # HTF flags

@@ -1529,12 +1529,19 @@ class ForexOrchestrator:
             self.control.pause_expiry_ts is not None
             and not self.control.chop_pause_expired()
         )
+        # exec_rr=0.0 is the dataclass default — it means RR was never computed
+        # (e.g. entry signal absent so _calculate_entry was never reached).
+        # Distinguish "no RR computed" (→ null + rr_unavailable=True) from a
+        # genuine non-zero RR so downstream analysis never treats 0.0 as a real gap.
+        _raw_exec_rr  = getattr(decision, "exec_rr", 0.0) or 0.0
+        _rr_computed  = _raw_exec_rr > 0.0
         ctx = {
             # pattern / signal
             "pattern":               getattr(decision, "pattern", None),
             "direction":             getattr(decision, "direction", None),
             "candidate_confidence":  getattr(decision, "confidence", None),
-            "candidate_rr":          getattr(decision, "exec_rr", None),
+            "candidate_rr":          float(_raw_exec_rr) if _rr_computed else None,
+            "rr_unavailable":        not _rr_computed,
             # control plane
             "bot_mode":              self.risk._mode.value
                                      if hasattr(self.risk, "_mode") else "unknown",
