@@ -41,10 +41,94 @@ if str(_ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(_ROOT / ".env")
 
-from backtesting.oanda_backtest_v2 import _fetch_range, _resample_weekly
+from backtesting.oanda_backtest_v2 import _fetch_range, _resample_weekly, _oanda_client
 from src.strategy.forex.set_and_forget import SetAndForgetStrategy
 from src.strategy.forex.session_filter import SessionFilter, ET
 from src.strategy.forex import strategy_config as _cfg
+
+# ── M5 paginated fetch ────────────────────────────────────────────────────────
+# _fetch_range in oanda_backtest_v2 defaults to 1H delta for unknown granularities.
+# For M5 over 45 days (~12 960 bars) that causes a single over-limit request that
+# OANDA rejects.  This function paginates correctly with a 5-minute step.
+
+import requests as _requests
+import time as _sleep_mod
+
+def _fetch_m5_range(
+    pair: str,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> Optional[pd.DataFrame]:
+    """
+    Paginated M5 candle fetch.  Steps forward by 5-minute delta so each page
+    stays within OANDA's 5 000-bar limit.
+    """
+    from backtesting.oanda_backtest_v2 import INSTRUMENT_MAP  # noqa: PLC0415
+    instrument = INSTRUMENT_MAP.get(pair, pair)
+    delta = timedelta(minutes=5)
+    page_bars = 4900          # stay under 5 000-bar hard limit with margin
+
+    all_rows: List[dict] = []
+    cur = from_dt
+    final = to_dt
+
+    while cur < final:
+        tentative_end = cur + delta * page_bars
+        if tentative_end >= final:
+            # last page — use from+to (OK because ≤ page_bars)
+            params = {
+                "granularity": "M5",
+                "from":  cur.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "to":    final.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "price": "M",
+            }
+        else:
+            params = {
+                "granularity": "M5",
+                "from":  cur.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "count": page_bars,
+                "price": "M",
+            }
+
+        try:
+            resp = _requests.get(
+                f"{_oanda_client.base}/v3/instruments/{instrument}/candles",
+                headers=_oanda_client.headers,
+                params=params,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"    ⚠ M5 fetch HTTP {resp.status_code} for {pair}: {resp.text[:200]}")
+                break
+            candles = resp.json().get("candles", [])
+            if not candles:
+                break
+            for c in candles:
+                mid = c.get("mid", {})
+                all_rows.append({
+                    "time":   pd.Timestamp(c["time"]).tz_localize(None),
+                    "open":   float(mid.get("o", 0)),
+                    "high":   float(mid.get("h", 0)),
+                    "low":    float(mid.get("l", 0)),
+                    "close":  float(mid.get("c", 0)),
+                    "volume": int(c.get("volume", 0)),
+                })
+            last_ts = pd.Timestamp(candles[-1]["time"]).tz_localize(None)
+            if "to" in params or len(candles) < page_bars:
+                break
+            cur = (last_ts.to_pydatetime() + delta).replace(tzinfo=timezone.utc)
+            _sleep_mod.sleep(0.25)
+        except Exception as exc:
+            print(f"    ⚠ M5 fetch error {pair}: {exc}")
+            break
+
+    if not all_rows:
+        return None
+    df = pd.DataFrame(all_rows).set_index("time")
+    df = df[~df.index.duplicated(keep="last")]
+    df.sort_index(inplace=True)
+    return df
+
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ALEX_PAIRS = [
@@ -167,7 +251,7 @@ def load_candles(
             continue
 
         _time.sleep(0.35)
-        df_m5 = _fetch_range(pair, "M5", from_dt=m5_start, to_dt=end)
+        df_m5 = _fetch_m5_range(pair, from_dt=m5_start, to_dt=end)
         if df_m5 is not None and len(df_m5) > 0:
             pair_data["M5"] = df_m5
             print(f"    M5: {len(df_m5)} bars")
@@ -492,7 +576,7 @@ def generate_report(
         elif tt == "body":
             body_counts[b] += 1
     total_nz = len(no_zone) or 1
-    ordered = DIST_BUCKET_LABELS + [">50p", "unknown"]
+    ordered = DIST_BUCKET_LABELS + ["unknown"]   # DIST_BUCKET_LABELS already ends with >50p
     a(f"| Bucket | Count | % | Wick | Body |")
     a(f"|--------|------:|--:|-----:|-----:|")
     for b in ordered:
