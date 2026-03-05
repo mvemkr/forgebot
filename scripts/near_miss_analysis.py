@@ -110,6 +110,32 @@ def load_scan_records(log_path: Path, ts_from: str, ts_to: str) -> list:
     return records
 
 
+def load_pre_candidate_records(log_path: Path, ts_from: str, ts_to: str) -> list:
+    """Load PRE_CANDIDATE events in window.
+
+    PRE_CANDIDATE fires when pattern detector found a forming pattern below
+    the recognition floor (clarity < min_pattern_clarity=0.4) AND
+    decision.pattern is None (formal recognition never occurred).
+    These are distinct from CANDIDATE_WAIT which requires decision.pattern != None.
+    """
+    records = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("event") != "PRE_CANDIDATE":
+                continue
+            ts = _ts(r)
+            if ts and ts_from <= ts <= ts_to:
+                records.append(r)
+    return records
+
+
 def section_s(scan_records: list) -> None:
     """SCAN_SUMMARY — aggregate totals from SCAN_HEARTBEAT events.
 
@@ -137,6 +163,70 @@ def section_s(scan_records: list) -> None:
     print()
     print("  ⚠ SCAN totals include no_pattern pairs (conf=0.30 placeholders).")
     print("    True near-miss candidates are in section D below (CANDIDATE events only).")
+
+
+def section_p(pre_records: list) -> None:
+    """P) PRE_CANDIDATE SUMMARY — patterns below recognition floor.
+
+    These are DISTINCT from CANDIDATE_WAIT:
+      PRE_CANDIDATE  → decision.pattern is None (clarity < recognition_floor)
+      CANDIDATE_WAIT → decision.pattern is not None (formally recognized, but WAIT)
+
+    The gap_to_floor buckets mirror section E's conf_gap buckets so the two
+    populations can be visually compared.
+    """
+    print("══════════════════════════════════════════════")
+    print("P) PRE_CANDIDATE SUMMARY  (below recognition floor)")
+    print("══════════════════════════════════════════════")
+    if not pre_records:
+        print("  PRE_CANDIDATE events : 0  (no sub-threshold patterns in window)")
+        return
+
+    print(f"  PRE_CANDIDATE events : {len(pre_records)}")
+    print()
+
+    # ── gap_to_floor buckets ──────────────────────────────────────────
+    pb = {"[0–0.02]": [], "(0.02–0.05]": [], "(0.05–0.10]": [], ">0.10": []}
+    for r in pre_records:
+        g = r.get("confidence_gap_to_floor")
+        if g is None or g <= 0:
+            continue
+        if   g <= 0.02: pb["[0–0.02]"].append(r)
+        elif g <= 0.05: pb["(0.02–0.05]"].append(r)
+        elif g <= 0.10: pb["(0.05–0.10]"].append(r)
+        else:           pb[">0.10"].append(r)
+
+    print("  gap_to_floor buckets (recognition_floor − raw_confidence):")
+    for bucket, items in pb.items():
+        pairs_str = ", ".join(f"{r.get('pair','?')}({r.get('confidence_gap_to_floor',0):.3f})"
+                              for r in items[:5])
+        print(f"    {bucket:<14} {len(items):3d}  {pairs_str}")
+    print()
+
+    # ── Top 20 closest PRE_CANDIDATE (smallest gap > 0) ──────────────
+    pool = [r for r in pre_records
+            if r.get("confidence_gap_to_floor") is not None
+            and r.get("confidence_gap_to_floor") > 0]
+    pool_sorted = sorted(pool, key=lambda r: r["confidence_gap_to_floor"])[:20]
+
+    print(f"  Top {min(20, len(pool_sorted))} closest PRE_CANDIDATE  (n={len(pool)} total, gap>0)")
+    if pool_sorted:
+        hdr = (f"  {'pair':<12} {'pattern_type':<22} {'dir':<6} "
+               f"{'raw_conf':>8} {'floor':>6} {'gap':>7} {'session':<6}")
+        print(hdr)
+        print("  " + "─" * (len(hdr) - 2))
+        for r in pool_sorted:
+            pair  = r.get("pair", "?")
+            ptype = str(r.get("pattern_type") or "?")
+            dirn  = str(r.get("direction") or "?")
+            rc    = r.get("raw_confidence", 0)
+            fl    = r.get("recognition_floor", 0.4)
+            gap   = r.get("confidence_gap_to_floor", 0)
+            sess  = "yes" if r.get("session_allowed") else "no"
+            print(f"  {pair:<12} {ptype:<22} {dirn:<6} "
+                  f"{rc:>7.4f}  {fl:>5.2f}  {gap:>+6.4f}  {sess}")
+    else:
+        print("  (none)")
 
 
 def section_d(records: list) -> None:
@@ -360,8 +450,11 @@ def main() -> None:
 
     scan_records = load_scan_records(log_path, ts_from, ts_to)
     records      = load_records(log_path, ts_from, ts_to)
+    pre_records  = load_pre_candidate_records(log_path, ts_from, ts_to)
 
     section_s(scan_records)
+    print()
+    section_p(pre_records)
     print()
     section_d(records)
     section_e(records)

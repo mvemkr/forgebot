@@ -134,6 +134,17 @@ _WAIT_FILTER_MAP: Dict[str, str] = {
 
 _THROTTLE_SECS = 3600  # suppress identical (pair, pattern, direction, reasons) within 1 hour
 
+# ── PRE_CANDIDATE fields ──────────────────────────────────────────────────────
+# Emitted when pattern detector found a forming pattern below the recognition
+# floor (PatternResult.clarity < SetAndForgetStrategy.min_pattern_clarity = 0.4).
+# Fields added to every PRE_CANDIDATE record:
+#   recognition_floor       → the actual min_pattern_clarity constant in use
+#   raw_confidence          → PatternResult.clarity (raw detector score, 0-1)
+#   confidence_gap_to_floor → recognition_floor − raw_confidence (always > 0)
+#   trigger_state           → "BELOW_RECOGNITION_FLOOR" (always; entry not reached)
+#   atr_ratio, wd_aligned   → from last regime score
+#   session_allowed, session_reason → from session filter
+
 
 class CandidateBlockLogger:
     """
@@ -237,6 +248,86 @@ class CandidateBlockLogger:
         except Exception as e:
             logger.debug(f"CandidateBlockLogger.log_wait failed (non-fatal): {e}")
             return False
+
+    # ------------------------------------------------------------------
+    def log_pre_candidate(
+        self,
+        pair: str,
+        sub_threshold_patterns: list,
+        context: Dict[str, Any],
+    ) -> int:
+        """
+        Emit one PRE_CANDIDATE record per sub-threshold pattern in
+        sub_threshold_patterns.  Throttled per (pair, pattern_type, direction)
+        at 1h — same window as CANDIDATE_WAIT.
+
+        Parameters
+        ----------
+        pair                  : e.g. "USD/JPY"
+        sub_threshold_patterns: list of PatternResult objects with
+                                clarity < recognition_floor
+        context               : dict from orchestrator._pre_candidate_ctx()
+
+        Returns number of records actually written (0-N).
+        """
+        written = 0
+        try:
+            now = datetime.now(timezone.utc)
+            for pat in sub_threshold_patterns:
+                try:
+                    pattern_type = getattr(pat, "pattern_type", str(pat))
+                    direction    = getattr(pat, "direction", None)
+                    throttle_key = (pair, pattern_type, direction, frozenset(["PRE_CANDIDATE"]))
+
+                    cached = self._throttle.get(throttle_key)
+                    if cached is not None and (now - cached).total_seconds() < _THROTTLE_SECS:
+                        continue
+
+                    record = self._build_pre_candidate_record(pair, pat, context, now)
+                    ok = self._write(record)
+                    if ok:
+                        self._throttle[throttle_key] = now
+                        written += 1
+                except Exception as e:
+                    logger.debug(f"log_pre_candidate inner failed for {pair}: {e}")
+        except Exception as e:
+            logger.debug(f"CandidateBlockLogger.log_pre_candidate failed (non-fatal): {e}")
+        return written
+
+    # ------------------------------------------------------------------
+    def _build_pre_candidate_record(
+        self,
+        pair: str,
+        pat,          # PatternResult
+        ctx: Dict[str, Any],
+        now: datetime,
+    ) -> dict:
+        recognition_floor  = ctx.get("recognition_floor", 0.4)
+        raw_confidence     = float(getattr(pat, "clarity", 0.0))
+        gap_to_floor       = round(recognition_floor - raw_confidence, 4)
+        return {
+            "ts":                     now.isoformat(),
+            "event":                  "PRE_CANDIDATE",
+            "pair":                   pair,
+            "pattern_type":           getattr(pat, "pattern_type", None),
+            "direction":              getattr(pat, "direction", None),
+            # proximity to recognition floor
+            "raw_confidence":         round(raw_confidence, 4),
+            "recognition_floor":      recognition_floor,
+            "confidence_gap_to_floor": gap_to_floor,
+            # trigger state — always BELOW_RECOGNITION_FLOOR at this layer;
+            # entry signal check is never reached for sub-threshold patterns.
+            "trigger_state":          "BELOW_RECOGNITION_FLOOR",
+            # regime context
+            "atr_ratio":              ctx.get("atr_ratio"),
+            "wd_aligned":             ctx.get("wd_aligned"),
+            # session context
+            "session_allowed":        ctx.get("session_allowed"),
+            "session_reason":         ctx.get("session_reason", ""),
+            # pattern geometry (informational)
+            "neckline":               getattr(pat, "neckline", None),
+            "pattern_level":          getattr(pat, "pattern_level", None),
+        }
 
     # ------------------------------------------------------------------
     def _map_wait_reasons(
