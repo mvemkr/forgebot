@@ -336,6 +336,80 @@ def section_e(records: list) -> None:
               f"(entry not reached → exec_rr=0.0; excluded from buckets)")
 
 
+def section_z(records: list) -> None:
+    """Z) ZONE PROXIMITY DISTRIBUTION — NO_ZONE_TOUCH events only.
+
+    Only CANDIDATE_WAIT records where 'NO_ZONE_TOUCH' is in wait_reasons
+    and zone_min_distance_pips is not null are included.
+    """
+    print("══════════════════════════════════════════════")
+    print("Z) ZONE PROXIMITY DISTRIBUTION  (NO_ZONE_TOUCH events)")
+    print("══════════════════════════════════════════════")
+
+    nzt = [
+        r for r in records
+        if r.get("event") == "CANDIDATE_WAIT"
+        and "NO_ZONE_TOUCH" in r.get("wait_reasons", [])
+    ]
+    if not nzt:
+        print("  NO_ZONE_TOUCH events : 0  (none in window)")
+        return
+
+    print(f"  NO_ZONE_TOUCH events : {len(nzt)}")
+    with_dist = [r for r in nzt if r.get("zone_min_distance_pips") is not None]
+    print(f"  with distance data   : {len(with_dist)}")
+    if not with_dist:
+        print("  (zone_min_distance_pips not populated — needs new bot code)")
+        return
+    print()
+
+    # ── Distance buckets ──────────────────────────────────────────────
+    buckets = {"[0–2]": [], "(2–5]": [], "(5–10]": [], "(10–25]": [], ">25": []}
+    for r in with_dist:
+        d = r["zone_min_distance_pips"]
+        if   d <= 2:  buckets["[0–2]"].append(r)
+        elif d <= 5:  buckets["(2–5]"].append(r)
+        elif d <= 10: buckets["(5–10]"].append(r)
+        elif d <= 25: buckets["(10–25]"].append(r)
+        else:         buckets[">25"].append(r)
+
+    print("  zone_min_distance_pips buckets:")
+    for bkt, items in buckets.items():
+        pairs_str = ", ".join(
+            f"{r.get('pair','?')}({r['zone_min_distance_pips']:.1f}p)"
+            for r in items[:5]
+        )
+        print(f"    {bkt:<10} {len(items):3d}  {pairs_str}")
+    print()
+
+    # ── touch type seen distribution ──────────────────────────────────
+    type_counts: dict = {}
+    for r in with_dist:
+        t = r.get("zone_touch_type_seen") or "null"
+        type_counts[t] = type_counts.get(t, 0) + 1
+    print("  zone_touch_type_seen distribution:")
+    for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
+        print(f"    {c:3d}  {t}")
+    print()
+
+    # ── Top 10 closest zone misses ────────────────────────────────────
+    pool = sorted(with_dist, key=lambda r: r["zone_min_distance_pips"])[:10]
+    print(f"  Top 10 closest zone misses  (n={len(with_dist)} total):")
+    print(f"  {'pair':<12} {'pattern':<22} {'dir':<6} {'dist_pips':>9} "
+          f"{'type':<6} {'lookback':>8} {'conf':>6}")
+    print("  " + "─" * 74)
+    for r in pool:
+        print(
+            f"  {r.get('pair','?'):<12} "
+            f"{str(r.get('pattern') or '?'):<22} "
+            f"{str(r.get('direction') or '?'):<6} "
+            f"{r['zone_min_distance_pips']:>9.1f} "
+            f"{str(r.get('zone_touch_type_seen') or '?'):<6} "
+            f"{str(r.get('zone_lookback_bars') or '?'):>8} "
+            f"{r.get('candidate_confidence', 0):>6.2f}"
+        )
+
+
 def section_f(records: list, top_n: int = 20) -> None:
     print("\n══════════════════════════════════════════════")
     print("F) TOP CLOSEST MISSES")
@@ -458,6 +532,7 @@ def main() -> None:
     print()
     section_d(records)
     section_e(records)
+    section_z(records)
     section_f(records, top_n=args.top)
 
 

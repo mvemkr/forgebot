@@ -145,6 +145,13 @@ class TradeDecision:
     # Pattern memory — needed to mark formation exhausted when trade closes
     neckline_ref: Optional[float]          = None   # key level price used as pattern key
 
+    # ── Zone proximity telemetry (populated when no_zone_touch fires) ─────────
+    # Pure observability — set when FILTER 4.5 returns WAIT/no_zone_touch.
+    # Never read by any gate, threshold, or execution path.
+    zone_min_distance_pips: Optional[float] = None  # closest any lookback bar got to neckline (pips)
+    zone_touch_type_seen:   Optional[str]   = None  # "none" | "wick" | "body"
+    zone_lookback_bars:     Optional[int]   = None  # actual N bars examined (≤ ZONE_TOUCH_LOOKBACK_BARS)
+
     # Macro theme stacking flag — set True when this is a theme-driven stacked trade.
     # Passed to trade_executor so check_entry_eligibility can apply STACK_MAX + waive
     # currency overlap (matching backtester _entry_eligible() logic exactly).
@@ -1430,6 +1437,35 @@ class SetAndForgetStrategy:
                 if not _touched:
                     pip = 0.01 if "JPY" in pair else 0.0001
                     failed_filters.append("no_zone_touch")
+
+                    # ── Zone proximity telemetry (observability only) ─────────
+                    # Compute how close the lookback bars came to the neckline.
+                    # Does NOT change thresholds, tolerance, or any return value
+                    # other than populating the three telemetry fields below.
+                    _zone_min_dist_pips: Optional[float] = None
+                    _zone_touch_type:    str             = "none"
+                    try:
+                        _bar_dists: list  = []   # (wick_dist_pips, touch_type) per bar
+                        for _, _row in _recent.iterrows():
+                            _wick_dist = min(
+                                abs(float(_row['high']) - _level),
+                                abs(float(_row['low'])  - _level),
+                            )
+                            _body_dist = min(
+                                abs(float(_row.get('open',  _row['close'])) - _level),
+                                abs(float(_row['close']) - _level),
+                            )
+                            # closest component of this bar: wick (high/low) vs body (open/close)
+                            _closest_dist = min(_wick_dist, _body_dist)
+                            _bar_type     = "body" if _body_dist < _wick_dist else "wick"
+                            _bar_dists.append((_closest_dist / pip, _bar_type))
+                        if _bar_dists:
+                            _best = min(_bar_dists, key=lambda x: x[0])
+                            _zone_min_dist_pips = round(_best[0], 1)
+                            _zone_touch_type    = _best[1]
+                    except Exception:
+                        pass   # telemetry failure must never affect the decision
+
                     return TradeDecision(
                         decision=Decision.WAIT,
                         pair=pair,
@@ -1446,6 +1482,9 @@ class SetAndForgetStrategy:
                         trend_weekly=trend_w,
                         trend_daily=trend_d,
                         trend_4h=trend_4,
+                        zone_min_distance_pips=_zone_min_dist_pips,
+                        zone_touch_type_seen=_zone_touch_type,
+                        zone_lookback_bars=_lookback,
                     )
 
         # ─────────────────────────────────────────────

@@ -400,7 +400,11 @@ class CandidateBlockLogger:
             "rr_gap":                round(rr_gap, 4) if rr_gap is not None else None,
             "rr_unavailable":        rr_unavailable,
             # zone
-            "zone_touch":            ctx.get("zone_touch", False),
+            "zone_touch":              ctx.get("zone_touch", False),
+            # zone proximity telemetry — non-null only when no_zone_touch fired
+            "zone_min_distance_pips":  ctx.get("zone_min_distance_pips"),
+            "zone_touch_type_seen":    ctx.get("zone_touch_type_seen"),
+            "zone_lookback_bars":      ctx.get("zone_lookback_bars"),
             # HTF flags
             "htf_aligned":           ctx.get("htf_aligned"),
             "trend_weekly":          ctx.get("trend_weekly"),
