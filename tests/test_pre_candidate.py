@@ -73,6 +73,8 @@ def _make_pre_candidate_record(pair="USD/JPY", pattern_type="double_top",
     }
 
 
+import logging
+
 from scripts.near_miss_analysis import (
     load_pre_candidate_records,
     load_records,
@@ -290,3 +292,208 @@ class TestLoadPreCandidateRecords:
         pre = load_pre_candidate_records(log, _TS_IN, _TS_OUT)
         assert len(pre) == 1
         assert pre[0]["pair"] == "GBP/USD"
+
+
+# ── Test 5: JSON serialization safety ────────────────────────────────────────
+
+class TestJSONSerializationSafety:
+    """
+    All fields written to decision_log.jsonl must be JSON-serialisable
+    primitives.  No PatternResult or other custom objects may reach the logger.
+
+    Tests call json.dumps(record) explicitly on the raw dict produced by
+    _build_pre_candidate_record and _build_wait_record.
+    """
+
+    def _make_logger(self, tmp_path):
+        log_file = tmp_path / "decision_log.jsonl"
+        return CandidateBlockLogger(log_file), log_file
+
+    def test_pre_candidate_record_is_json_serialisable(self, tmp_path):
+        """_build_pre_candidate_record must produce a fully serialisable dict."""
+        logger, _ = self._make_logger(tmp_path)
+        pat = _make_pattern_result(clarity=0.28)
+        ctx = {
+            "recognition_floor": 0.4,
+            "wd_aligned": False,
+            "atr_ratio": 0.75,
+            "session_allowed": True,
+            "session_reason": "",
+        }
+        now = datetime.now(timezone.utc)
+        record = logger._build_pre_candidate_record("USD/JPY", pat, ctx, now)
+
+        # Must not raise — any PatternResult object would cause TypeError here
+        try:
+            serialised = json.dumps(record)
+        except (TypeError, ValueError) as e:
+            pytest.fail(f"PRE_CANDIDATE record is not JSON-serialisable: {e}\nRecord: {record}")
+
+        # Round-trip: re-parse and check key fields
+        parsed = json.loads(serialised)
+        assert parsed["event"] == "PRE_CANDIDATE"
+        assert isinstance(parsed["pattern_type"], str)
+        assert isinstance(parsed["raw_confidence"], float)
+        assert isinstance(parsed["recognition_floor"], float)
+        assert isinstance(parsed["confidence_gap_to_floor"], float)
+        # Confirm no raw objects leaked — all values must be JSON-native
+        _JSON_SCALARS = (str, float, int, bool, type(None))
+        for key, value in parsed.items():
+            assert isinstance(value, (*_JSON_SCALARS, list, dict)), (
+                f"Non-JSON-native value for key '{key}': {type(value)} = {value!r}"
+            )
+
+    def test_candidate_wait_record_is_json_serialisable(self, tmp_path):
+        """_build_wait_record must produce a fully serialisable dict (no PatternResult)."""
+        logger, _ = self._make_logger(tmp_path)
+        ctx = {
+            "pattern":               "double_top",   # string, not PatternResult
+            "direction":             "short",
+            "candidate_confidence":  0.70,
+            "confidence_threshold":  0.77,
+            "candidate_rr":          None,
+            "rr_unavailable":        True,
+            "min_rr_threshold":      2.5,
+            "zone_touch":            False,
+            "htf_aligned":           True,
+            "trend_weekly":          "bullish",
+            "trend_daily":           "neutral",
+            "trend_4h":              "bullish",
+            "wd_aligned":            False,
+            "atr_ratio":             1.04,
+            "session_allowed":       True,
+            "session_reason":        "",
+            "pause_new_entries":     False,
+            "effective_paused":      False,
+            "loss_streak":           0,
+            "paused_by_chop":        False,
+        }
+        now = datetime.now(timezone.utc)
+        record = logger._build_wait_record("USD/JPY", ["CONFIDENCE_BELOW_MIN"], ctx, now)
+
+        try:
+            serialised = json.dumps(record)
+        except (TypeError, ValueError) as e:
+            pytest.fail(f"CANDIDATE_WAIT record is not JSON-serialisable: {e}\nRecord: {record}")
+
+        parsed = json.loads(serialised)
+        assert parsed["event"] == "CANDIDATE_WAIT"
+        assert isinstance(parsed["pattern"], (str, type(None)))
+        # All values must be JSON-native types (scalar, list, dict — no custom objects)
+        _JSON_SCALARS = (str, float, int, bool, type(None))
+        for key, value in parsed.items():
+            assert isinstance(value, (*_JSON_SCALARS, list, dict)), (
+                f"Non-JSON-native value for key '{key}': {type(value)} = {value!r}"
+            )
+            # Lists must contain only scalars (no PatternResult etc.)
+            if isinstance(value, list):
+                for item in value:
+                    assert isinstance(item, _JSON_SCALARS), (
+                        f"List '{key}' contains non-scalar item: {type(item)} = {item!r}"
+                    )
+
+    def test_block_ctx_pattern_is_string_not_object(self):
+        """_block_ctx must extract pattern_type string, never store PatternResult."""
+        # Build a minimal mock orchestrator with a decision that has a PatternResult
+        orch = MagicMock()
+        orch._consecutive_losses = 0
+        orch.control.pause_expiry_ts = None
+        orch.control.chop_pause_expired.return_value = True
+        orch.control.pause_new_entries = False
+        orch.risk._mode.value = "live_paper"
+
+        mock_pattern = MagicMock()
+        mock_pattern.pattern_type = "double_top"
+
+        mock_decision = MagicMock()
+        mock_decision.pattern   = mock_pattern
+        mock_decision.direction = "short"
+        mock_decision.confidence = 0.70
+        mock_decision.exec_rr   = 0.0
+
+        from src.execution.orchestrator import ForexOrchestrator
+        ctx = ForexOrchestrator._block_ctx(orch, mock_decision)
+
+        # pattern key must be the string "double_top", not the mock object
+        assert ctx["pattern"] == "double_top", (
+            f"Expected string 'double_top', got {type(ctx['pattern'])}: {ctx['pattern']!r}"
+        )
+        # Must be JSON-serialisable
+        try:
+            json.dumps(ctx)
+        except (TypeError, ValueError) as e:
+            pytest.fail(f"_block_ctx result is not JSON-serialisable: {e}")
+
+
+# ── Test 6: write failure visibility ─────────────────────────────────────────
+
+class TestWriteFailureVisibility:
+    """
+    _write failures must:
+      1. Emit WARNING with event type and pair.
+      2. Increment candidate_log_failures counter.
+      3. Return False.
+    """
+
+    def test_failure_increments_counter(self, tmp_path):
+        """candidate_log_failures counter increments on write error."""
+        log_file = tmp_path / "readonly_dir" / "decision_log.jsonl"
+        # Parent dir doesn't exist and we won't create it — but mkdir is called
+        # inside _write. Force failure by making the file path a directory.
+        log_file.parent.mkdir(parents=True)
+        log_file.mkdir()  # make it a directory so open() fails
+
+        bl = CandidateBlockLogger(log_file)
+        assert bl.candidate_log_failures == 0
+
+        # Attempt a write — must fail because log_file is a directory
+        ok = bl._write({"event": "PRE_CANDIDATE", "pair": "USD/JPY", "ts": "x"})
+        assert ok is False
+        assert bl.candidate_log_failures == 1
+
+    def test_multiple_failures_accumulate(self, tmp_path):
+        """Each failure increments the counter independently."""
+        log_file = tmp_path / "bad"
+        log_file.mkdir()
+        bl = CandidateBlockLogger(log_file)
+        bl._write({"event": "PRE_CANDIDATE", "pair": "P1", "ts": "x"})
+        bl._write({"event": "CANDIDATE_WAIT", "pair": "P2", "ts": "x"})
+        assert bl.candidate_log_failures == 2
+
+    def test_failure_emits_warning_with_event_and_pair(self, tmp_path, caplog):
+        """WARNING log must include event type and pair."""
+        log_file = tmp_path / "bad_dir"
+        log_file.mkdir()
+        bl = CandidateBlockLogger(log_file)
+
+        with caplog.at_level(logging.WARNING, logger="src.execution.block_logger"):
+            bl._write({"event": "PRE_CANDIDATE", "pair": "GBP/JPY", "ts": "x"})
+
+        assert any(
+            "PRE_CANDIDATE" in r.message and "GBP/JPY" in r.message
+            for r in caplog.records
+        ), f"Expected WARNING with 'PRE_CANDIDATE' and 'GBP/JPY'. Got: {[r.message for r in caplog.records]}"
+
+    def test_serialisation_error_increments_counter_and_warns(self, tmp_path, caplog):
+        """A non-serialisable value must increment counter and emit WARNING."""
+        log_file = tmp_path / "decision_log.jsonl"
+        bl = CandidateBlockLogger(log_file)
+
+        # Inject a non-serialisable object
+        bad_record = {
+            "event": "CANDIDATE_WAIT",
+            "pair":  "USD/CHF",
+            "ts":    "x",
+            "pattern": object(),   # not JSON serialisable
+        }
+        with caplog.at_level(logging.WARNING, logger="src.execution.block_logger"):
+            ok = bl._write(bad_record)
+
+        assert ok is False
+        assert bl.candidate_log_failures == 1
+        assert any(
+            "CANDIDATE_WAIT" in r.message and "USD/CHF" in r.message
+            for r in caplog.records
+        ), f"Expected WARNING with event+pair. Got: {[r.message for r in caplog.records]}"
+        # File must be empty — no partial write
+        assert not log_file.exists() or log_file.read_text().strip() == ""

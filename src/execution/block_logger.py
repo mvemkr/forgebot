@@ -162,6 +162,9 @@ class CandidateBlockLogger:
         self._file = decisions_file or _DECISIONS_FILE
         # throttle: (pair, pattern, direction, frozenset(block_reasons)) → last write datetime
         self._throttle: Dict[tuple, datetime] = {}
+        # Cumulative count of _write failures (JSON errors + IO errors).
+        # Readable by tests and monitoring; never resets across instance lifetime.
+        self.candidate_log_failures: int = 0
 
     # ------------------------------------------------------------------
     def log_block(
@@ -506,12 +509,27 @@ class CandidateBlockLogger:
 
     # ------------------------------------------------------------------
     def _write(self, record: dict) -> bool:
-        """Write record; return True on success, False on any error."""
+        """Write record; return True on success, False on any error.
+
+        Failures are never silent:
+          - WARNING logged with event type, pair, and error detail.
+          - candidate_log_failures counter incremented so callers and
+            tests can assert failure visibility.
+        """
+        event = record.get("event", "UNKNOWN")
+        pair  = record.get("pair",  "UNKNOWN")
         try:
+            # Validate serializability before touching the file — raises
+            # TypeError immediately if any value is a non-primitive object.
+            payload = json.dumps(record)
             self._file.parent.mkdir(parents=True, exist_ok=True)
             with open(self._file, "a") as f:
-                f.write(json.dumps(record) + "\n")
+                f.write(payload + "\n")
             return True
         except Exception as e:
-            logger.warning(f"CandidateBlockLogger._write failed: {e}")
+            self.candidate_log_failures += 1
+            logger.warning(
+                f"CandidateBlockLogger._write failed "
+                f"[event={event} pair={pair}]: {e}"
+            )
             return False
