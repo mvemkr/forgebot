@@ -958,6 +958,22 @@ class ForexOrchestrator:
                 self._wait_ctx(decision),
             )
 
+        # ── PRE_CANDIDATE logging ─────────────────────────────────────────
+        # Emit observability events for patterns that were COMPUTED by the
+        # pattern detector but fell below the recognition floor
+        # (PatternResult.clarity < min_pattern_clarity=0.4), so decision.pattern
+        # was never set.  Fires only when the strategy returned no formal
+        # pattern (decision.pattern is None).
+        # Pure observability — no gate, threshold, or execution path touched.
+        if decision.pattern is None:
+            _sub_thresh = getattr(self.strategy, "_pre_candidate_data", {}).get(pair, [])
+            if _sub_thresh:
+                self._block_logger.log_pre_candidate(
+                    pair,
+                    _sub_thresh,
+                    self._pre_candidate_ctx(decision),
+                )
+
         if decision.decision.value == "ENTER":
             # ── Confidence gate (matches backtester MIN_CONFIDENCE=65%) ──
             if decision.confidence < MIN_CONFIDENCE:
@@ -1535,9 +1551,16 @@ class ForexOrchestrator:
         # genuine non-zero RR so downstream analysis never treats 0.0 as a real gap.
         _raw_exec_rr  = getattr(decision, "exec_rr", 0.0) or 0.0
         _rr_computed  = _raw_exec_rr > 0.0
+        # Convert PatternResult object → pattern_type string here so that ANY
+        # code path that returns _block_ctx directly (e.g. the _wait_ctx fallback)
+        # is guaranteed to be JSON-serialisable.  _wait_ctx still overrides this
+        # with the same value, so behaviour is unchanged when _wait_ctx succeeds.
+        _pat_obj  = getattr(decision, "pattern", None)
+        _pat_str  = getattr(_pat_obj, "pattern_type", None) if _pat_obj is not None else None
+
         ctx = {
             # pattern / signal
-            "pattern":               getattr(decision, "pattern", None),
+            "pattern":               _pat_str,
             "direction":             getattr(decision, "direction", None),
             "candidate_confidence":  getattr(decision, "confidence", None),
             "candidate_rr":          float(_raw_exec_rr) if _rr_computed else None,
@@ -1617,6 +1640,38 @@ class ForexOrchestrator:
             logger.debug(f"_wait_ctx failed (non-fatal): {e}")
             # Fall back to minimal context so log_wait doesn't crash
             return self._block_ctx(decision)
+
+    # ------------------------------------------------------------------
+    def _pre_candidate_ctx(self, decision) -> dict:
+        """
+        Assemble context dict for CandidateBlockLogger.log_pre_candidate().
+        Contains only fields available when decision.pattern is None.
+        Never raises.
+        """
+        try:
+            _rs = getattr(self, "_last_regime_score", {}) or {}
+            ctx: dict = {
+                # recognition floor — sourced from the actual strategy constant
+                "recognition_floor": getattr(
+                    self.strategy, "min_pattern_clarity", 0.4
+                ),
+                # regime context
+                "wd_aligned":        _rs.get("wd_aligned"),
+                "atr_ratio":         _rs.get("atr_ratio"),
+            }
+            # session state
+            try:
+                _sf = self.strategy.session_filter
+                _sa, _sr = _sf.is_allowed()
+                ctx["session_allowed"] = _sa
+                ctx["session_reason"]  = _sr or ""
+            except Exception:
+                ctx["session_allowed"] = None
+                ctx["session_reason"]  = ""
+            return ctx
+        except Exception as e:
+            logger.debug(f"_pre_candidate_ctx failed (non-fatal): {e}")
+            return {"recognition_floor": 0.4}
 
     # ── Schedule Logic ─────────────────────────────────────────────────
 

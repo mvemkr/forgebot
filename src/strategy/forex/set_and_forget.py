@@ -243,6 +243,13 @@ class SetAndForgetStrategy:
         self.pattern_detector = PatternDetector()
         self.signal_detector  = EntrySignalDetector(min_body_ratio=0.45)
 
+        # PRE_CANDIDATE observability — keyed by pair.
+        # Set to the list of PatternResult objects that were COMPUTED but fell
+        # below the min_pattern_clarity floor and therefore never reached the
+        # main decision loop.  Pure side-effect; does NOT change any gate or
+        # threshold.  Orchestrator reads this after every evaluate() call.
+        self._pre_candidate_data: dict = {}
+
         # Track open positions (one at a time rule)
         self.open_positions: Dict[str, dict] = {}
 
@@ -1086,6 +1093,16 @@ class SetAndForgetStrategy:
                     -p.clarity,          # tiebreak: higher clarity first
                 ),
             )
+
+        # ── PRE_CANDIDATE capture (observability only) ───────────────────────
+        # Store patterns that are below the recognition floor so the orchestrator
+        # can emit PRE_CANDIDATE events.  Set BEFORE the loop so the dict is
+        # always populated even when the loop returns early.
+        # Contract: read by orchestrator._evaluate_pair immediately after evaluate().
+        # Does NOT change min_pattern_clarity, loop logic, or any return path.
+        self._pre_candidate_data[pair] = [
+            p for p in patterns if 0.0 < p.clarity < self.min_pattern_clarity
+        ]
 
         for p in patterns:
             if p.clarity < self.min_pattern_clarity:
