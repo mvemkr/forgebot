@@ -1604,6 +1604,11 @@ class ForexOrchestrator:
             # ── Zone touch: "no_zone_touch" absent from failed_filters ───
             ctx["zone_touch"] = "no_zone_touch" not in (decision.failed_filters or [])
 
+            # ── Zone proximity telemetry (populated when no_zone_touch fires) ─
+            ctx["zone_min_distance_pips"] = getattr(decision, "zone_min_distance_pips", None)
+            ctx["zone_touch_type_seen"]   = getattr(decision, "zone_touch_type_seen",   None)
+            ctx["zone_lookback_bars"]     = getattr(decision, "zone_lookback_bars",      None)
+
             # ── HTF alignment ─────────────────────────────────────────────
             try:
                 _ap = _ap_cls()
