@@ -106,45 +106,82 @@ class SessionFilter:
         # Asian (avoid new entries)
         return "ASIAN", 0.3
 
-    def next_entry_window(self, dt: datetime = None) -> tuple[str, int]:
+    def next_entry_window(self, dt: datetime = None) -> tuple[str, int, datetime]:
         """
-        Returns (session_name, minutes_until_open).
+        Returns (session_name, minutes_until_open, next_session_ts_utc).
         minutes_until_open = 0 if currently inside a valid entry window.
-        Scans up to 7 days ahead to find the next London open.
+
+        Probes two candidate times per day:
+          • 03:00 ET  — London open (LONDON_OPEN_ET)
+          • 08:00 ET  — London-NY overlap start / MONDAY_WICK_GUARD expiry
+
+        The old implementation only probed 03:00 ET, causing it to skip
+        Monday 08:00 ET entirely (blocked at 03:00 by MONDAY_WICK_GUARD) and
+        report Tuesday as the next session — off by ~19 hours.
+
+        Both candidates are tested per day; the earliest allowed one wins.
         """
-        from datetime import timedelta
+        from datetime import timedelta, datetime as dt_cls
+        import pytz as _pytz
+
         if dt is None:
             dt = datetime.now(ET)
         dt_et = dt.astimezone(ET)
 
         allowed, _ = self.is_entry_allowed(dt_et)
         if allowed:
-            # Inside a valid window — figure out which one and return 0
             q, _ = self.session_quality(dt_et)
-            return q, 0
+            ts_utc = dt_et.astimezone(_pytz.utc)
+            return q, 0, ts_utc
 
-        # Walk forward in 1-minute steps? No — use candidate windows.
-        # Check today's and tomorrow's London open (3:00 AM ET) and NY (8:00 AM ET).
-        windows = [
-            ("London", self.LONDON_OPEN_ET.hour, self.LONDON_OPEN_ET.minute),
+        # Candidate session-open times to probe (ET hour, minute, label)
+        # Order matters: earlier in the day first so we return the soonest slot.
+        _candidates = [
+            (self.LONDON_OPEN_ET.hour,    self.LONDON_OPEN_ET.minute,    "London"),
+            (self.NY_OPEN_ET.hour,        self.NY_OPEN_ET.minute,        "London_NY_Overlap"),
         ]
+
         today = dt_et.date()
+        best_candidate = None
+        best_mins      = None
+
         for days_ahead in range(8):
             candidate_date = today + timedelta(days=days_ahead)
-            for session_name, hour, minute in windows:
-                from datetime import datetime as dt_cls
+            day_best = None
+            day_best_mins = None
+
+            for hour, minute, label in _candidates:
                 candidate = ET.localize(dt_cls(
                     candidate_date.year, candidate_date.month, candidate_date.day,
-                    hour, minute, 0
+                    hour, minute, 0,
                 ))
                 if candidate <= dt_et:
-                    continue  # already past
+                    continue   # already past
                 allowed, _ = self.is_entry_allowed(candidate)
-                if allowed:
-                    mins = int((candidate - dt_et).total_seconds() / 60)
-                    return session_name, mins
+                if not allowed:
+                    continue
+                mins = int((candidate - dt_et).total_seconds() / 60)
+                # Take the earliest allowed slot on this day
+                if day_best_mins is None or mins < day_best_mins:
+                    day_best      = candidate
+                    day_best_mins = mins
+                    day_label     = label
 
-        return "London", 999  # fallback
+            if day_best is not None:
+                # First day that has any allowed slot wins overall
+                if best_mins is None or day_best_mins < best_mins:
+                    best_candidate = day_best
+                    best_mins      = day_best_mins
+                    best_label     = day_label
+                break   # found the nearest day — no need to look further
+
+        if best_candidate is not None:
+            ts_utc = best_candidate.astimezone(_pytz.utc)
+            return best_label, best_mins, ts_utc
+
+        # Fallback — should never be reached
+        fallback_ts = (dt_et + timedelta(days=7)).astimezone(_pytz.utc)
+        return "London", 999, fallback_ts
 
     def is_entry_allowed(self, dt: datetime = None) -> tuple[bool, str]:
         """
