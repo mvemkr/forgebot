@@ -1991,12 +1991,13 @@ class ForexOrchestrator:
             sf = self.strategy.session_filter
             now = datetime.now(timezone.utc)
             allowed, reason = sf.is_entry_allowed(now)
-            next_session, mins_until = sf.next_entry_window(now)
+            next_session, mins_until, next_ts_utc = sf.next_entry_window(now)
             return {
                 "session_allowed":     allowed,
                 "session_reason":      reason if not allowed else "",
                 "next_session":        next_session,
                 "next_session_mins":   mins_until,
+                "next_session_ts_utc": next_ts_utc.isoformat() if next_ts_utc else None,
             }
         except Exception:
             return {"session_allowed": True, "session_reason": "", "next_session": "", "next_session_mins": 0}
