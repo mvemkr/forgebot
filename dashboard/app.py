@@ -240,8 +240,9 @@ def api_status():
     peak_source        = bot_stats.get("peak_source",        merged_hb.get("peak_source", "broker"))
     session_allowed    = bot_stats.get("session_allowed",    merged_hb.get("session_allowed", True))
     session_reason     = bot_stats.get("session_reason",     merged_hb.get("session_reason", ""))
-    next_session       = bot_stats.get("next_session",       merged_hb.get("next_session", "London"))
-    next_session_mins  = bot_stats.get("next_session_mins",  merged_hb.get("next_session_mins", 0))
+    next_session        = bot_stats.get("next_session",        merged_hb.get("next_session", "London"))
+    next_session_mins   = bot_stats.get("next_session_mins",   merged_hb.get("next_session_mins", 0))
+    next_session_ts_utc = bot_stats.get("next_session_ts_utc", merged_hb.get("next_session_ts_utc"))
 
     # Win rate from stats
     wr      = stats.get("win_rate", 0) if isinstance(stats, dict) else 0
@@ -323,8 +324,9 @@ def api_status():
         "peak_source":        peak_source,
         "session_allowed":    session_allowed,
         "session_reason":     session_reason,
-        "next_session":       next_session,
-        "next_session_mins":  next_session_mins,
+        "next_session":        next_session,
+        "next_session_mins":   next_session_mins,
+        "next_session_ts_utc": next_session_ts_utc,
         # risk decomposition
         "risk_pct":           final_risk_pct,
         "base_risk_pct":      base_risk_pct,
