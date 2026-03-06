@@ -1949,6 +1949,7 @@ class ForexOrchestrator:
                     "session_reason":      session_info["session_reason"],
                     "next_session":        session_info["next_session"],
                     "next_session_mins":   session_info["next_session_mins"],
+                    "next_session_ts_utc": session_info.get("next_session_ts_utc"),
                     "traded_pattern_keys": list(self.strategy.traded_patterns.keys()),
                     "regime_score":        self._last_regime_score,
                     # ── Control plane ─────────────────────────────────
@@ -2039,6 +2040,7 @@ class ForexOrchestrator:
                 "session_reason":      session_info["session_reason"],
                 "next_session":        session_info["next_session"],
                 "next_session_mins":   session_info["next_session_mins"],
+                "next_session_ts_utc": session_info.get("next_session_ts_utc"),
             }, indent=2))
         except Exception:
             pass
