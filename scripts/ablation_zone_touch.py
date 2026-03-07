@@ -46,10 +46,9 @@ atexit.register(_reset_zone_touch_mode)
 from backtesting.oanda_backtest_v2 import run_backtest, BacktestResult   # noqa: E402
 
 # ──────────────────────────────────────────────────────────────────────────────
-WINDOW_START   = "2026-02-01"
-WINDOW_END     = "2026-03-04"
+WINDOW_START   = datetime(2026, 2, 1,  tzinfo=timezone.utc)
+WINDOW_END     = datetime(2026, 3, 4,  tzinfo=timezone.utc)
 CAPITAL        = 8_000.0
-ALEX_PAIRS     = ["GBP_JPY", "USD_JPY", "USD_CHF", "GBP_CHF", "USD_CAD", "EUR_USD", "GBP_USD"]
 REPORT_PATH    = REPO / "backtesting/results/ablation_zone_touch.md"
 
 VARIANTS: List[Tuple[str, str, str]] = [
@@ -71,7 +70,7 @@ def _trade_key(t: Dict) -> str:
 
 
 def _realised_r(t: Dict) -> float:
-    for k in ("realised_r", "result_r", "r"):
+    for k in ("r", "realised_r", "result_r"):
         v = t.get(k)
         if v is not None:
             try:
@@ -145,20 +144,19 @@ def run_variant(
 
     _sc.ZONE_TOUCH_MODE = mode
 
-    kwargs: Dict = dict(
-        start_date=WINDOW_START,
-        end_date=WINDOW_END,
-        initial_capital=CAPITAL,
-        pairs=ALEX_PAIRS,
-        verbose=verbose,
+    result = run_backtest(
+        start_dt              = WINDOW_START,
+        end_dt                = WINDOW_END,
+        starting_bal          = CAPITAL,
+        notes                 = f"ablation_zt_{label}_{mode}",
+        trail_arm_key         = f"zt_{label}",
+        preloaded_candle_data = preloaded,
+        use_cache             = True,
+        quiet                 = not verbose,
     )
-    if preloaded is not None:
-        kwargs["preloaded_candle_data"] = preloaded
-
-    result = run_backtest(**kwargs)
 
     # Capture candle cache from variant A for reuse
-    cache = getattr(result, "candle_cache", None) or getattr(result, "_candle_data", None)
+    cache = getattr(result, "candle_data", None)
     return result, cache
 
 
@@ -247,8 +245,10 @@ def build_report(
     lines: List[str] = []
     a = lambda *args: lines.extend(args)
 
+    _ws = WINDOW_START.strftime("%Y-%m-%d")
+    _we = WINDOW_END.strftime("%Y-%m-%d")
     a(f"# Zone-Touch Gate Ablation Study",
-      f"Window: {WINDOW_START} → {WINDOW_END} | Pairs: {len(ALEX_PAIRS)} (Alex universe)",
+      f"Window: {_ws} → {_we} | Pairs: 7 (Alex universe)",
       f"Generated: {now_utc}",
       "",
       "## Variant Definitions",
@@ -279,18 +279,16 @@ def build_report(
 
     # ── primary metrics table ─────────────────────────────────────────────────
     def _m(r: BacktestResult):
-        ts = r.trades
-        n  = len(ts)
-        wins = sum(1 for t in ts if _is_win(t))
-        wr   = int(round(wins / n * 100)) if n else 0
-        rs   = [_realised_r(t) for t in ts]
-        avg  = sum(rs) / len(rs) if rs else 0.0
+        n    = r.n_trades
+        wr   = int(round(getattr(r, "win_rate", 0.0) * 100))
+        avg  = getattr(r, "avg_r", 0.0) or 0.0
         ret  = r.return_pct
-        dd   = getattr(r, "max_drawdown_pct", 0.0) or 0.0
+        dd   = r.max_dd_pct or 0.0
+        rs   = [_realised_r(t) for t in r.trades]
         worst3 = sorted(rs)[:3]
         w3r  = sum(worst3)
-        best = max(rs) if rs else 0.0
-        worst = min(rs) if rs else 0.0
+        best  = getattr(r, "best_r",  max(rs) if rs else 0.0) or 0.0
+        worst = getattr(r, "worst_r", min(rs) if rs else 0.0) or 0.0
         return n, wr, avg, ret, dd, w3r, best, worst
 
     ra = results["A"]
@@ -553,7 +551,9 @@ def _count_total_blocks(result: BacktestResult) -> int:
 def main(verbose: bool = False) -> None:
     print("=" * 70)
     print(" Zone-Touch Gate Ablation Study")
-    print(f" Window: {WINDOW_START} → {WINDOW_END} | {len(ALEX_PAIRS)} pairs")
+    _ws = WINDOW_START.strftime("%Y-%m-%d")
+    _we = WINDOW_END.strftime("%Y-%m-%d")
+    print(f" Window: {_ws} → {_we} | 7 pairs")
     print(" Variants: A (full) / B (near_2pip) / C (near_5pip) / D (wide)")
     print("=" * 70)
 
@@ -591,7 +591,7 @@ def main(verbose: bool = False) -> None:
 
     print(f"\n{'=' * 70}")
     print(f" Report: {REPORT_PATH}")
-    print(f" A: {len(ra.trades)} trades | B: {len(rb.trades)} | C: {len(rc.trades)} | D: {len(rd.trades)}")
+    print(f" A: {ra.n_trades} trades | B: {rb.n_trades} | C: {rc.n_trades} | D: {rd.n_trades}")
     print(f" Newly unlocked — B: {ul_b} | C: {ul_c} | D: {ul_d}")
     print(f"{'=' * 70}\n")
 
