@@ -209,6 +209,14 @@ ENTRY_TRIGGER_MODE: str = "engulf_only"
 # Do not set ENGULFING_ONLY directly; change ENTRY_TRIGGER_MODE instead.
 ENGULFING_ONLY: bool = (ENTRY_TRIGGER_MODE == "engulf_only")
 
+# ── Engulfing confirmation look-back window (ablation research only) ──────────
+# Controls how many recent 1H bars the EntrySignalDetector scans for a trigger.
+# Production value MUST remain 2 — any other value is for offline replay only.
+#   2  — current production: check current bar + 1 prior (default)
+#   3  — extended: check current bar + 2 prior bars ("within N bars" variant)
+# atexit in ablation scripts MUST reset this to 2.
+ENGULF_CONFIRM_LOOKBACK_BARS: int = 2
+
 # ── Pin bar entry spec ─────────────────────────────────────────────────────
 # Only active when ENTRY_TRIGGER_MODE == "engulf_or_pin".
 PIN_BAR_MIN_WICK_BODY_RATIO: float = 2.0   # wick ≥ 2× body
@@ -740,6 +748,9 @@ def get_model_tags(trail_arm: str = "", pairs_hash: str = "") -> list:
     tags.append(_mode_tag)
     if m.ENTRY_TRIGGER_MODE == "engulf_or_pin":
         tags.append(f"pin_wick_{m.PIN_BAR_MIN_WICK_BODY_RATIO:.1f}x")
+    _engulf_lb = getattr(m, "ENGULF_CONFIRM_LOOKBACK_BARS", 2)
+    if _engulf_lb != 2:
+        tags.append(f"engulf_lb{_engulf_lb}")   # e.g. engulf_lb3
 
     # ── Zone touch gate ──────────────────────────────────────────────────────
     if not m.ZONE_REQUIRE_TOUCH:
