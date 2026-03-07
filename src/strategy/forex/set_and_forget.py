@@ -248,7 +248,10 @@ class SetAndForgetStrategy:
         self.news_filter     = NewsFilter()
         self.level_detector  = LevelDetector(min_confluence=min_level_score)
         self.pattern_detector = PatternDetector()
-        self.signal_detector  = EntrySignalDetector(min_body_ratio=0.45)
+        self.signal_detector  = EntrySignalDetector(
+            min_body_ratio=0.45,
+            lookback_candles=getattr(_cfg, "ENGULF_CONFIRM_LOOKBACK_BARS", 2),
+        )
 
         # PRE_CANDIDATE observability — keyed by pair.
         # Set to the list of PatternResult objects that were COMPUTED but fell
