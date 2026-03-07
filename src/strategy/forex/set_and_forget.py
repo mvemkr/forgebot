@@ -1426,6 +1426,15 @@ class SetAndForgetStrategy:
                 _is_cross   = "USD" not in _pair_ccys
                 _zone_mult  = _cfg.ZONE_TOUCH_ATR_MULT_CROSS if _is_cross else _cfg.ZONE_TOUCH_ATR_MULT
                 _zone_tol   = _atr_1h * _zone_mult
+                pip         = 0.01 if "JPY" in pair else 0.0001
+                # ── Zone-touch mode (ablation only; default="full" = no change) ──
+                _zt_mode = getattr(_cfg, "ZONE_TOUCH_MODE", "full")
+                if _zt_mode == "near_2pip":
+                    _zone_tol += 2 * pip
+                elif _zt_mode == "near_5pip":
+                    _zone_tol += 5 * pip
+                elif _zt_mode == "wide":
+                    _zone_tol *= 2.0
                 _level      = matching_pattern.neckline
                 _lookback   = min(_cfg.ZONE_TOUCH_LOOKBACK_BARS, len(df_1h))
                 _recent     = df_1h.iloc[-_lookback:]
@@ -1435,7 +1444,6 @@ class SetAndForgetStrategy:
                     for _, row in _recent.iterrows()
                 )
                 if not _touched:
-                    pip = 0.01 if "JPY" in pair else 0.0001
                     failed_filters.append("no_zone_touch")
 
                     # ── Zone proximity telemetry (observability only) ─────────

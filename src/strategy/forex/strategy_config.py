@@ -420,6 +420,16 @@ ZONE_TOUCH_ATR_MULT: float = 0.35    # majors (EUR/USD, GBP/USD, USD/JPY, etc.)
 ZONE_TOUCH_ATR_MULT_CROSS: float = 0.50  # crosses (GBP/JPY, GBP/CHF, EUR/CAD, etc.)
 ZONE_TOUCH_LOOKBACK_BARS: int = 5    # look back this many 1H bars for a zone touch
 
+# ── Zone-touch gate mode (ablation research only) ─────────────────────────────
+# Controls tolerance applied to the zone-touch gate in FILTER 4.5.
+# Production value MUST remain "full" — any other value is for offline replay only.
+#   "full"      → ATR × ZONE_TOUCH_ATR_MULT[_CROSS]  (current production behaviour)
+#   "near_2pip" → ATR tolerance + 2 fixed pips        (relaxes gate by 2p)
+#   "near_5pip" → ATR tolerance + 5 fixed pips        (relaxes gate by 5p)
+#   "wide"      → ATR tolerance × 2.0                 (wick-touch: any approach ≤ 2×ATR)
+# atexit in ablation scripts MUST reset this to "full".
+ZONE_TOUCH_MODE: str = "full"
+
 # ── Drawdown circuit breaker ───────────────────────────────────────────────
 # Graduated risk caps when account draws down from peak equity.
 # Does NOT replace the 40% REGROUP killswitch — works alongside it.
@@ -746,6 +756,9 @@ def get_model_tags(trail_arm: str = "", pairs_hash: str = "") -> list:
         tags.append("no_zone_touch")
     else:
         tags.append(f"zone_{m.ZONE_TOUCH_ATR_MULT:.2f}atr")
+    _zt_mode = getattr(m, "ZONE_TOUCH_MODE", "full")
+    if _zt_mode != "full":
+        tags.append(f"zt_{_zt_mode}")   # e.g. zt_near_2pip, zt_near_5pip, zt_wide
 
     # ── DD circuit breaker ──────────────────────────────────────────────────
     if m.DD_CIRCUIT_BREAKER_ENABLED:
