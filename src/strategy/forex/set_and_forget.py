@@ -756,7 +756,8 @@ class SetAndForgetStrategy:
         bullish_count = sum([w_bullish, d_bullish, h4_bullish])
         bearish_count = sum([w_bearish, d_bearish, h4_bearish])
 
-        _reversal_context = False   # weekly opposing = price at extreme
+        _reversal_context  = False   # weekly opposing = price at extreme
+        _pending_trend_gate = False  # deferred gate for reversal_bypass mode
 
         if bullish_count >= 2:
             # Standard: trend continuation or early-trend long
@@ -778,7 +779,14 @@ class SetAndForgetStrategy:
             _reversal_context = True
         else:
             trade_direction = None
-            failed_filters.append("trend_alignment")
+            _ta_mode = getattr(_cfg, "TREND_ALIGNMENT_GATE_MODE", "full")
+            if _ta_mode == "full":
+                failed_filters.append("trend_alignment")
+            elif _ta_mode == "reversal_bypass":
+                # Defer gate decision until pattern is known.
+                # Reversal patterns (DT/DB/H&S/IH&S) bypass; others are still blocked.
+                _pending_trend_gate = True
+            # "disabled": never block on trend_alignment
             logger.debug(f"{pair}: Trends not aligned. W={trend_w.value} D={trend_d.value} 4H={trend_4.value}")
 
         # ─────────────────────────────────────────────────────────────────
@@ -1188,6 +1196,19 @@ class SetAndForgetStrategy:
                 trend_daily=trend_d,
                 trend_4h=trend_4,
             )
+
+        # ── Deferred trend_alignment gate (reversal_bypass mode only) ────────
+        # For "reversal_bypass" mode the trend_alignment was NOT added in the
+        # else-branch above; we now decide based on the matched pattern type.
+        # Reversal patterns (DT/DB/H&S/IH&S) → pass through (no block added).
+        # All other pattern types                → add trend_alignment now.
+        if _pending_trend_gate and matching_pattern is not None:
+            _TA_REVERSAL_TYPES = frozenset({
+                'double_top', 'double_bottom',
+                'head_and_shoulders', 'inverted_head_and_shoulders',
+            })
+            if not any(k in matching_pattern.pattern_type for k in _TA_REVERSAL_TYPES):
+                failed_filters.append("trend_alignment")
 
         # ─────────────────────────────────────────────
         # FILTER 3.5: HTF trend alignment gate

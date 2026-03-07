@@ -83,6 +83,14 @@ MAX_TRADES_PER_WEEK_STANDARD: int = 2   # equity ≥ SMALL_ACCOUNT_THRESHOLD
 # Default True here for measurement; production default may differ after backtests.
 REQUIRE_HTF_TREND_ALIGNMENT:  bool = True
 
+# Ablation study gate for trend_alignment filter.
+# "full"            — production behaviour: gate fires when W/D/4H disagree (default)
+# "disabled"        — gate removed entirely; patterns enter regardless of macro alignment
+# "reversal_bypass" — gate bypassed for reversal patterns (DT/DB/H&S/IH&S) only;
+#                     break-retest and continuation patterns still gated
+# NOTE: Only change this in offline research scripts. Never set in production.
+TREND_ALIGNMENT_GATE_MODE: str = "full"
+
 # Pro-trend-only entry gate (W2 diagnostic / LOW risk-mode behavior).
 # When True: require Weekly AND Daily bias to agree with trade direction.
 # 4H is exempt — Alex often enters during 4H retracements.
@@ -798,6 +806,9 @@ def get_model_tags(trail_arm: str = "", pairs_hash: str = "") -> list:
     if getattr(m, "NO_SUNDAY_TRADES_ENABLED",    False): tags.append("no_sun")
     if getattr(m, "NO_THU_FRI_TRADES_ENABLED",   False): tags.append("no_thu_fri")
     if getattr(m, "REQUIRE_HTF_TREND_ALIGNMENT",  False): tags.append("htf_gate")
+    _gate_mode = getattr(m, "TREND_ALIGNMENT_GATE_MODE", "full")
+    if _gate_mode != "full":
+        tags.append(f"ta_gate_{_gate_mode}")
     _wk_small = getattr(m, "MAX_TRADES_PER_WEEK_SMALL", 999)
     if _wk_small < 999:
         _wk_std = getattr(m, "MAX_TRADES_PER_WEEK_STANDARD", 999)
