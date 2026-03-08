@@ -44,7 +44,8 @@ class TestConfigDefaults:
         assert hasattr(_sc, "ENTRY_TRIGGER_MODE")
 
     def test_entry_trigger_mode_is_engulf_only(self):
-        assert _sc.ENTRY_TRIGGER_MODE == "engulf_only"
+        # Promoted to B-Prime 2026-03-07
+        assert _sc.ENTRY_TRIGGER_MODE == "engulf_or_strict_pin_at_level"
 
     def test_lookback_exists(self):
         assert hasattr(_sc, "ENGULF_CONFIRM_LOOKBACK_BARS")
@@ -53,7 +54,8 @@ class TestConfigDefaults:
         assert _sc.ENGULF_CONFIRM_LOOKBACK_BARS == 2
 
     def test_engulfing_only_flag_true(self):
-        assert _sc.ENGULFING_ONLY is True
+        # False — B-Prime (strict_pin_at_level) is active
+        assert _sc.ENGULFING_ONLY is False
 
     def test_strict_pin_mode_valid(self):
         assert hasattr(_sc, "ENTRY_TRIGGER_MODE")  # mode validated by strategy
@@ -617,10 +619,11 @@ class TestScriptStructure:
         assert "atexit.register" in src
 
     def test_reset_config_restores_production_values(self):
-        _sc.ENTRY_TRIGGER_MODE           = "engulf_or_strict_pin_at_level"
+        _sc.ENTRY_TRIGGER_MODE           = "engulf_only"   # force a temporary change
         _sc.ENGULF_CONFIRM_LOOKBACK_BARS = 99
         self.m._reset_config()
-        assert _sc.ENTRY_TRIGGER_MODE           == "engulf_only"
+        # Restores to B-Prime production values (promoted 2026-03-07)
+        assert _sc.ENTRY_TRIGGER_MODE           == "engulf_or_strict_pin_at_level"
         assert _sc.ENGULF_CONFIRM_LOOKBACK_BARS == 2
 
     def test_no_live_trading_calls_in_source(self):

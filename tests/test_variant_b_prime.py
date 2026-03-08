@@ -47,12 +47,15 @@ class TestConfigDefaults:
         assert hasattr(_sc, "STRICT_PIN_PATTERN_WHITELIST")
 
     def test_whitelist_default_none(self):
-        assert _sc.STRICT_PIN_PATTERN_WHITELIST is None, (
-            "STRICT_PIN_PATTERN_WHITELIST must be None in production"
-        )
+        # Promoted to B-Prime 2026-03-07 — whitelist is now the H&S list
+        assert _sc.STRICT_PIN_PATTERN_WHITELIST == [
+            "head_and_shoulders",
+            "inverted_head_and_shoulders",
+        ], "STRICT_PIN_PATTERN_WHITELIST must be HNS list (B-Prime LIVE_PAPER)"
 
     def test_entry_trigger_mode_still_engulf_only(self):
-        assert _sc.ENTRY_TRIGGER_MODE == "engulf_only"
+        # Promoted to B-Prime 2026-03-07
+        assert _sc.ENTRY_TRIGGER_MODE == "engulf_or_strict_pin_at_level"
 
     def test_lookback_still_2(self):
         assert _sc.ENGULF_CONFIRM_LOOKBACK_BARS == 2

@@ -35,8 +35,9 @@ class TestConfigDefaults:
         assert hasattr(_sc, "ENGULF_CONFIRM_LOOKBACK_BARS")
 
     def test_entry_trigger_mode_default(self):
-        assert _sc.ENTRY_TRIGGER_MODE == "engulf_only", (
-            "ENTRY_TRIGGER_MODE must be 'engulf_only' in production"
+        # Promoted to B-Prime (engulf_or_strict_pin_at_level) 2026-03-07
+        assert _sc.ENTRY_TRIGGER_MODE == "engulf_or_strict_pin_at_level", (
+            "ENTRY_TRIGGER_MODE must be 'engulf_or_strict_pin_at_level' (B-Prime LIVE_PAPER)"
         )
 
     def test_lookback_default_is_2(self):
@@ -45,8 +46,8 @@ class TestConfigDefaults:
         )
 
     def test_engulfing_only_derived_flag(self):
-        """ENGULFING_ONLY must be True at default trigger mode."""
-        assert _sc.ENGULFING_ONLY is True
+        """ENGULFING_ONLY is False — B-Prime mode active (strict_pin_at_level)."""
+        assert _sc.ENGULFING_ONLY is False
 
 
 # ──────────────────────────────────────────────────────────────────────────────

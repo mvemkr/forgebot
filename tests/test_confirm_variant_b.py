@@ -46,8 +46,9 @@ class TestConfigDefaults:
         assert hasattr(_sc, "ENTRY_TRIGGER_MODE")
 
     def test_entry_trigger_mode_is_engulf_only(self):
-        assert _sc.ENTRY_TRIGGER_MODE == "engulf_only", (
-            "ENTRY_TRIGGER_MODE must be 'engulf_only' in production"
+        # Promoted to B-Prime 2026-03-07
+        assert _sc.ENTRY_TRIGGER_MODE == "engulf_or_strict_pin_at_level", (
+            "ENTRY_TRIGGER_MODE must be 'engulf_or_strict_pin_at_level' (B-Prime LIVE_PAPER)"
         )
 
     def test_engulf_confirm_lookback_exists(self):
@@ -59,7 +60,8 @@ class TestConfigDefaults:
         )
 
     def test_engulfing_only_derived_flag_true(self):
-        assert _sc.ENGULFING_ONLY is True
+        # False — B-Prime (strict_pin_at_level) is active
+        assert _sc.ENGULFING_ONLY is False
 
     def test_strict_pin_mode_is_valid(self):
         """engulf_or_strict_pin_at_level must be a recognised trigger mode."""
@@ -558,11 +560,12 @@ class TestScriptStructure:
         assert "atexit.register" in src
 
     def test_reset_config_restores_production_values(self):
-        """_reset_config() must restore production defaults."""
-        _sc.ENTRY_TRIGGER_MODE           = "engulf_or_strict_pin_at_level"
+        """_reset_config() must restore the values captured at module import."""
+        _sc.ENTRY_TRIGGER_MODE           = "engulf_only"   # force a temporary change
         _sc.ENGULF_CONFIRM_LOOKBACK_BARS = 99
         self.m._reset_config()
-        assert _sc.ENTRY_TRIGGER_MODE           == "engulf_only"
+        # Restores to whatever was set at import time (now B-Prime production values)
+        assert _sc.ENTRY_TRIGGER_MODE           == "engulf_or_strict_pin_at_level"
         assert _sc.ENGULF_CONFIRM_LOOKBACK_BARS == 2
 
     def test_no_live_trading_in_source(self):

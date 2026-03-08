@@ -196,14 +196,22 @@ BLOCK_ENTRY_WHILE_WINNER_RUNNING: bool = False
 #
 # To compare: run backtester with ENTRY_TRIGGER_MODE overridden per arm.
 # Never change this to "engulf_or_pin" in production without data supporting it.
-ENTRY_TRIGGER_MODE: str = "engulf_only"
+# ── LIVE_PAPER promotion 2026-03-07: Variant B-Prime ─────────────────────
+# Promoted from "engulf_only" after three-way A/B/B-Prime ablation confirmed:
+#   - 0 degraded windows across Q1–Q4 2025 + Jan-Feb-2026 + W1/W2
+#   - Q1 regression eliminated (B-Prime = A exactly), Jan-Feb +3.8%, W1 +1.5%
+#   - H&S unlocked trades: 80% WR +0.45R avg (5 trades)
+#   - Non-H&S strict-pin blocked by STRICT_PIN_PATTERN_WHITELIST below
+# Applies to LIVE_PAPER only (ACCOUNT_MODE=LIVE_PAPER in .env).
+# LIVE_REAL requires a separate explicit decision before this changes.
+ENTRY_TRIGGER_MODE: str = "engulf_or_strict_pin_at_level"
 # Valid modes (sourced from Alex's confirmed "daily driver" confirmations):
 #   "engulf_only"                         — baseline: engulfing only (Alex #1 rule)
 #   "engulf_or_pin"                       — engulfing OR loose pin bar
 #   "engulf_or_star_at_level"             — engulfing OR Morning/Evening Star at tested level
-#   "engulf_or_strict_pin_at_level"       — engulfing OR strict hammer/shooting star at level
+#   "engulf_or_strict_pin_at_level"       — engulfing OR strict hammer/shooting star at level ← ACTIVE
 #   "engulf_or_star_or_strict_pin_at_level" — all three at-level confirmations
-# PRODUCTION DEFAULT: engulf_only.  Do NOT change without backtest support.
+# To revert: set back to "engulf_only" and STRICT_PIN_PATTERN_WHITELIST = None.
 
 # Backward-compatible derived flag — all existing call sites work unchanged.
 # Do not set ENGULFING_ONLY directly; change ENTRY_TRIGGER_MODE instead.
@@ -228,12 +236,14 @@ ENGULF_CONFIRM_LOOKBACK_BARS: int = 2
 # list  — strict-pin is ONLY allowed if matching_pattern.pattern_type is in
 #          the list.  All other patterns fall back to engulf-only.
 #
-# Research use (Variant B-Prime):
-#   STRICT_PIN_PATTERN_WHITELIST = ["head_and_shoulders", "inverted_head_and_shoulders"]
-#
-# Production default: None (no gate; whitelist only applied when explicitly set
-# by ablation scripts via atexit-guarded mutation).
-STRICT_PIN_PATTERN_WHITELIST: list = None  # type: ignore[assignment]
+# LIVE_PAPER active (2026-03-07, Variant B-Prime promotion):
+#   Strict-pin fires ONLY at H&S and IH&S necklines.
+#   double_top, double_bottom, break_retest_* remain engulf-only.
+# To revert: set to None.
+STRICT_PIN_PATTERN_WHITELIST: list = [  # type: ignore[assignment]
+    "head_and_shoulders",
+    "inverted_head_and_shoulders",
+]
 
 # ── Pin bar entry spec ─────────────────────────────────────────────────────
 # Only active when ENTRY_TRIGGER_MODE == "engulf_or_pin".
