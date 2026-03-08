@@ -1551,6 +1551,27 @@ class SetAndForgetStrategy:
                 if _sig_reason_4h and _sig_reason_4h not in _sig_reason:
                     _sig_reason = f"{_sig_reason}|{_sig_reason_4h}"
 
+        # ── FILTER 5b: Strict-pin pattern whitelist (Variant B-Prime gate) ────
+        # When STRICT_PIN_PATTERN_WHITELIST is set (not None), a strict-pin
+        # signal is only accepted if matching_pattern.pattern_type is in the
+        # whitelist.  Any other pattern falls back to engulf-only (same as if
+        # the strict-pin branch had never fired).
+        #
+        # Production default: STRICT_PIN_PATTERN_WHITELIST = None → gate is
+        # completely inactive; no behaviour change.
+        _sp_wl = getattr(_cfg, "STRICT_PIN_PATTERN_WHITELIST", None)
+        if (
+            has_signal
+            and signal is not None
+            and _sp_wl is not None
+        ):
+            _st = signal.signal_type.lower()
+            _is_sp_signal = "shooting_star" in _st or "hammer_strict" in _st
+            if _is_sp_signal and matching_pattern.pattern_type not in _sp_wl:
+                has_signal = False
+                signal = None
+                failed_filters.append("strict_pin_pattern_blocked")
+
         if not has_signal or signal is None:
             # Setup is valid but we're waiting for the candle
             # This is the correct state 90% of the time

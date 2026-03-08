@@ -217,6 +217,24 @@ ENGULFING_ONLY: bool = (ENTRY_TRIGGER_MODE == "engulf_only")
 # atexit in ablation scripts MUST reset this to 2.
 ENGULF_CONFIRM_LOOKBACK_BARS: int = 2
 
+# ── Strict-pin pattern whitelist (B-Prime gate) ───────────────────────────
+# Controls which pattern types are allowed to use the strict-pin trigger when
+# ENTRY_TRIGGER_MODE == "engulf_or_strict_pin_at_level" (or any mode that
+# includes strict-pin).
+#
+# None  — no restriction; strict-pin fires on any pattern (Variant B behaviour,
+#          current production default for ENTRY_TRIGGER_MODE == "engulf_only"
+#          means this has zero effect in production).
+# list  — strict-pin is ONLY allowed if matching_pattern.pattern_type is in
+#          the list.  All other patterns fall back to engulf-only.
+#
+# Research use (Variant B-Prime):
+#   STRICT_PIN_PATTERN_WHITELIST = ["head_and_shoulders", "inverted_head_and_shoulders"]
+#
+# Production default: None (no gate; whitelist only applied when explicitly set
+# by ablation scripts via atexit-guarded mutation).
+STRICT_PIN_PATTERN_WHITELIST: list = None  # type: ignore[assignment]
+
 # ── Pin bar entry spec ─────────────────────────────────────────────────────
 # Only active when ENTRY_TRIGGER_MODE == "engulf_or_pin".
 PIN_BAR_MIN_WICK_BODY_RATIO: float = 2.0   # wick ≥ 2× body
@@ -751,6 +769,9 @@ def get_model_tags(trail_arm: str = "", pairs_hash: str = "") -> list:
     _engulf_lb = getattr(m, "ENGULF_CONFIRM_LOOKBACK_BARS", 2)
     if _engulf_lb != 2:
         tags.append(f"engulf_lb{_engulf_lb}")   # e.g. engulf_lb3
+    _sp_wl = getattr(m, "STRICT_PIN_PATTERN_WHITELIST", None)
+    if _sp_wl is not None:
+        tags.append("sp_hns_only")              # strict-pin gated to H&S family
 
     # ── Zone touch gate ──────────────────────────────────────────────────────
     if not m.ZONE_REQUIRE_TOUCH:
