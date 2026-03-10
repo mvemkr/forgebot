@@ -24,6 +24,7 @@ data/orderbook_snapshots/
 data/models/
 data/state/
 backtesting/results/
+!backtesting/results/ablation_structure_stops.md
 
 # Jupyter
 .ipynb_checkpoints/
