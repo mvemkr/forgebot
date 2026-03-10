@@ -115,9 +115,11 @@ RECOVERY_WEEKLY_CAP:          int   = 1      # Part B: max trades per ISO-week
 ATR_STOP_MULTIPLIER: float = 8.0
 
 # Stop must be ≥ ATR_MIN_MULTIPLIER × 14-day ATR.
-# Rejects micro-stops from 4H patterns that would be killed by daily noise.
-# Set conservatively — Alex's real 4H stops are typically 0.15-0.50× daily ATR.
-ATR_MIN_MULTIPLIER: float = 0.15
+# C8 structural stop (PR #19): floor protection is now provided by the hard
+# 8-pip minimum in targeting.get_structure_stop() (_MIN_ABS_PIPS = 8.0).
+# The ATR-fraction gate is disabled (set to 0.0) so valid tight structural
+# stops on H&S / IH&S neckline retests are not blocked by this secondary gate.
+ATR_MIN_MULTIPLIER: float = 0.0
 
 # Lookback window for ATR calculation (calendar days of daily candles).
 ATR_LOOKBACK: int = 14
