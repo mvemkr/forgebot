@@ -360,16 +360,16 @@ class WindowResult:
 
     @property
     def total_r(self) -> float:
-        return sum(t.get("realized_r", 0.0) for t in self.trades)
+        return sum(t.get("r", 0.0) for t in self.trades)
 
     @property
     def expectancy(self) -> float:
-        rs = [t.get("realized_r", 0.0) for t in self.trades]
+        rs = [t.get("r", 0.0) for t in self.trades]
         return sum(rs) / len(rs) if rs else 0.0
 
     @property
     def worst3(self) -> List[float]:
-        rs = sorted(t.get("realized_r", 0.0) for t in self.trades)
+        rs = sorted(t.get("r", 0.0) for t in self.trades)
         return rs[:3]
 
     @property
@@ -417,7 +417,7 @@ class WindowQuad:
 # ─────────────────────────────────────────────────────────────────────────────
 def _trade_key(t: dict) -> Tuple[str, str, str]:
     """Canonical key: (pair, direction, entry_ts rounded to hour)."""
-    ts = t.get("entry_time") or t.get("entry_ts") or ""
+    ts = t.get("entry_ts") or ""
     pair = t.get("pair", "")
     direction = t.get("direction", "")
     return (pair, direction, str(ts)[:13])
@@ -683,13 +683,13 @@ def _build_report(quads: List[WindowQuad]) -> str:
             ret_sum += wr.ret
             dd_sum  += wr.max_dd
             for t in wr.trades:
-                r = t.get("realized_r", 0.0)
+                r = t.get("r", 0.0)
                 if r >= 0:
                     n_wins += 1
                 else:
                     n_losses += 1
         n = len(all_trades)
-        sum_r = sum(t.get("realized_r", 0.0) for t in all_trades)
+        sum_r = sum(t.get("r", 0.0) for t in all_trades)
         avg_r = sum_r / n if n > 0 else 0.0
         wr_frac = n_wins / n if n > 0 else 0.0
         avg_dd = dd_sum / len(quads) if quads else 0.0
@@ -719,8 +719,8 @@ def _build_report(quads: List[WindowQuad]) -> str:
         if not all_unlocked:
             W("No trades unlocked by this variant.\n")
         else:
-            wr_u = sum(1 for t in all_unlocked if t.get("realized_r", 0) >= 0) / len(all_unlocked)
-            sum_r_u = sum(t.get("realized_r", 0.0) for t in all_unlocked)
+            wr_u = sum(1 for t in all_unlocked if t.get("r", 0) >= 0) / len(all_unlocked)
+            sum_r_u = sum(t.get("r", 0.0) for t in all_unlocked)
             avg_mae_u = _avg([t.get("mae_r", 0.0) for t in all_unlocked if t.get("mae_r") is not None])
             avg_mfe_u = _avg([t.get("mfe_r", 0.0) for t in all_unlocked if t.get("mfe_r") is not None])
 
@@ -734,15 +734,15 @@ def _build_report(quads: List[WindowQuad]) -> str:
 
             W(f"| Window | Pair | Dir | Pattern | StopPips | TargetPips | R | MAE | MFE | StopType |")
             W(f"|--------|------|-----|---------|:--------:|:----------:|:-:|:---:|:---:|----------|")
-            for t in sorted(all_unlocked, key=lambda x: x.get("entry_time") or ""):
-                pattern = t.get("pattern_type", t.get("pattern", "—"))
+            for t in sorted(all_unlocked, key=lambda x: x.get("entry_ts") or ""):
+                pattern = t.get("pattern", "—")
                 stop_p  = t.get("initial_stop_pips", 0.0)
-                tgt_p   = t.get("target_pips", "—")
+                tgt_p   = f"{t.get("planned_rr", 0.0):.1f}R target"
                 W(
-                    f"| {str(t.get('entry_time',''))[:10]} "
+                    f"| {str(t.get('entry_ts',''))[:10]} "
                     f"| {t.get('pair','—')} | {t.get('direction','—')} "
                     f"| {pattern} | {stop_p:.0f}p | {tgt_p} "
-                    f"| {_fmt_r(t.get('realized_r'))} "
+                    f"| {_fmt_r(t.get('r'))} "
                     f"| {_fmt_r(t.get('mae_r'))} | {_fmt_r(t.get('mfe_r'))} "
                     f"| {t.get('stop_type','—')} |"
                 )
@@ -766,12 +766,12 @@ def _build_report(quads: List[WindowQuad]) -> str:
 
             net_total = 0.0
             for d, u in disp_map:
-                dr = d.get("realized_r", 0.0) if d else 0.0
-                ur = u.get("realized_r", 0.0) if u else 0.0
+                dr = d.get("r", 0.0) if d else 0.0
+                ur = u.get("r", 0.0) if u else 0.0
                 net = ur - dr
                 net_total += net
-                d_label = f"{d.get('pair','?')} {d.get('direction','?')} {str(d.get('entry_time',''))[:10]}" if d else "—"
-                u_label = f"{u.get('pair','?')} {u.get('direction','?')} {str(u.get('entry_time',''))[:10]}" if u else "—"
+                d_label = f"{d.get('pair','?')} {d.get('direction','?')} {str(d.get('entry_ts',''))[:10]}" if d else "—"
+                u_label = f"{u.get('pair','?')} {u.get('direction','?')} {str(u.get('entry_ts',''))[:10]}" if u else "—"
                 W(f"| {d_label} | {_fmt_r(dr)} | {u_label} | {_fmt_r(ur)} | {_fmt_r(net)} |")
 
             sign = "+" if net_total >= 0 else ""
@@ -789,9 +789,9 @@ def _build_report(quads: List[WindowQuad]) -> str:
         du = _find_unlocked(quad.result_a.trades, quad.result_d.trades)
         W(
             f"| {quad.window} "
-            f"| {len(bu)} | {_fmt_r(sum(t.get('realized_r',0) for t in bu))} | {quad.result_b.counters['structural_stop_floor_rejections']} "
-            f"| {len(cu)} | {_fmt_r(sum(t.get('realized_r',0) for t in cu))} | {quad.result_c.counters['structural_stop_floor_rejections']} "
-            f"| {len(du)} | {_fmt_r(sum(t.get('realized_r',0) for t in du))} | {quad.result_d.counters['structural_stop_floor_rejections']} |"
+            f"| {len(bu)} | {_fmt_r(sum(t.get('r',0) for t in bu))} | {quad.result_b.counters['structural_stop_floor_rejections']} "
+            f"| {len(cu)} | {_fmt_r(sum(t.get('r',0) for t in cu))} | {quad.result_c.counters['structural_stop_floor_rejections']} "
+            f"| {len(du)} | {_fmt_r(sum(t.get('r',0) for t in du))} | {quad.result_d.counters['structural_stop_floor_rejections']} |"
         )
     W("")
 
@@ -808,11 +808,11 @@ def _build_report(quads: List[WindowQuad]) -> str:
         pair_ctr = Counter(t.get("pair", "?") for t in all_unlocked)
         for pair, cnt in pair_ctr.most_common():
             pts = [t for t in all_unlocked if t.get("pair") == pair]
-            sr  = sum(t.get("realized_r", 0.0) for t in pts)
+            sr  = sum(t.get("r", 0.0) for t in pts)
             W(f"  - {pair}: {cnt} trades, SumR {_fmt_r(sr)}")
         W("")
         W(f"### {vname}-Unlocked: Pattern Distribution")
-        pat_ctr = Counter(t.get("pattern_type", t.get("pattern", "?")) for t in all_unlocked)
+        pat_ctr = Counter(t.get("pattern", "?") for t in all_unlocked)
         for pat, cnt in pat_ctr.most_common():
             W(f"  - {pat}: {cnt}")
         W("")
@@ -832,11 +832,11 @@ def _build_report(quads: List[WindowQuad]) -> str:
     # Compute total SumR improvement vs baseline
     for vname in ["B", "C", "D"]:
         a_sum = sum(
-            sum(t.get("realized_r", 0.0) for t in quad.by_variant("A").trades)
+            sum(t.get("r", 0.0) for t in quad.by_variant("A").trades)
             for quad in quads
         )
         v_sum = sum(
-            sum(t.get("realized_r", 0.0) for t in quad.by_variant(vname).trades)
+            sum(t.get("r", 0.0) for t in quad.by_variant(vname).trades)
             for quad in quads
         )
         delta = v_sum - a_sum
@@ -891,8 +891,8 @@ def main() -> None:
         for quad in quads:
             all_trades.extend(quad.by_variant(var_id).trades)
         n = len(all_trades)
-        sum_r = sum(t.get("realized_r", 0.0) for t in all_trades)
-        nw = sum(1 for t in all_trades if t.get("realized_r", 0.0) >= 0)
+        sum_r = sum(t.get("r", 0.0) for t in all_trades)
+        nw = sum(1 for t in all_trades if t.get("r", 0.0) >= 0)
         wr = nw / n if n > 0 else 0.0
         print(f"  Var {var_id}: {n:3d} trades  WR={_fmt_wr(wr)}  SumR={_fmt_r(sum_r)}"
               f"  ({var_label})")

@@ -459,8 +459,8 @@ class TestStructAnchor(unittest.TestCase):
 class TestTradeKey(unittest.TestCase):
 
     def _trade(self, pair="GBP/JPY", direction="short", ts="2025-01-15 09:00"):
-        return {"pair": pair, "direction": direction, "entry_time": ts,
-                "realized_r": 2.5, "initial_stop_pips": 50}
+        return {"pair": pair, "direction": direction, "entry_ts": ts,
+                "r": 2.5, "initial_stop_pips": 50}
 
     def test_key_uniqueness(self):
         t1 = self._trade("GBP/JPY", "short", "2025-01-15 09:00")
@@ -523,8 +523,8 @@ class TestWindowResult(unittest.TestCase):
         for i in range(n):
             r = 1.0 if i < win else -1.0
             trades.append({"pair": "GBP/JPY", "direction": "short",
-                           "entry_time": f"2025-01-0{i+1} 09:00",
-                           "realized_r": r,
+                           "entry_ts": f"2025-01-0{i+1} 09:00",
+                           "r": r,
                            "mae_r": -0.3, "mfe_r": 1.5,
                            "initial_stop_pips": 50.0,
                            "stop_type": "structural_anchor"})
@@ -798,8 +798,8 @@ class TestRunAblationSmoke(unittest.TestCase):
                                                win_rate=1.0, avg_r=1.5,
                                                max_dd_pct=2.0, trades=[
                                                    {"pair": "GBP/JPY", "direction": "short",
-                                                    "entry_time": "2025-01-10 09:00",
-                                                    "realized_r": 1.5,
+                                                    "entry_ts": "2025-01-10 09:00",
+                                                    "r": 1.5,
                                                     "mae_r": -0.2, "mfe_r": 2.0,
                                                     "initial_stop_pips": 45.0,
                                                     "stop_type": "b_struct_raw"}
