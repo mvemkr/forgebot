@@ -45,13 +45,23 @@ if TYPE_CHECKING:
     from .pattern_detector import PatternResult
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stop bounds constants
+# Stop bounds constants  (C8 structural stop geometry — feat/c8-structural-stop)
 # ─────────────────────────────────────────────────────────────────────────────
-# Minimum stop as fraction of 1H ATR (below this = micro-stop, noise will hit it)
-_MIN_FRAC_ATR: float = 0.15   # 0.15 × ATR(1H, 14)
-_MIN_ABS_PIPS: float = 8.0    # hard floor regardless of ATR (avoids zero-ATR edge cases)
-# Maximum stop as fraction of 1H ATR (above this = oversized; try next candidate)
-_MAX_FRAC_ATR: float = 10.0   # generous cap — only blocks truly degenerate stops
+# C8 formula: stop_dist = max(min(structural_dist, 3×ATR_1H), 8×pip_size)
+#
+# Floor: hard 8-pip minimum + retain 0.15×ATR_1H guard (match ablation).
+#   At current vol (Feb–Mar 2026), 0.15×ATR_1H = 1.1–5.3p across all 12
+#   watchlist pairs — always below 8p, so the pip floor wins in practice.
+#   The fraction is kept so news-driven ATR spikes (1H ATR → 60+p) still
+#   gate micro-stops: max(8p, 0.15×60p=9p) = 9p, not 8p.
+_MIN_FRAC_ATR: float = 0.15   # 0.15×ATR_1H — retained for high-vol guard
+_MIN_ABS_PIPS: float = 8.0    # hard floor: stop must be ≥ 8 pips
+#
+# Ceiling: 3×ATR_1H — tightened from 10× (C8 spec).
+#   Structural candidates >3×ATR fall through to the ATR fallback (3×ATR).
+#   The fallback is exempt from the ceiling check in _stop_side so it always
+#   passes — see NOTE inside _stop_side.
+_MAX_FRAC_ATR: float = 3.0    # ceiling: structural stop must be ≤ 3×ATR_1H
 
 
 def select_target(
@@ -320,10 +330,11 @@ def get_structure_stop(
     buf = _stop_buffer(pip_size, is_jpy_or_cross, spread)
     atr = _compute_atr_1h(df_1h)
 
-    # Compute bounds in price terms for fast comparison
+    # Compute bounds in price terms for fast comparison.
+    # C8 formula: stop_dist = max(min(structural_dist, 3×ATR_1H), 8×pip_size)
     min_dist = max(_MIN_ABS_PIPS * pip_size,
                    _MIN_FRAC_ATR * atr if atr > 0 else _MIN_ABS_PIPS * pip_size)
-    max_dist = _MAX_FRAC_ATR * atr if atr > 0 else 1e9
+    max_dist = _MAX_FRAC_ATR * atr if atr > 0 else 1e9      # 3×ATR_1H ceiling (structural only)
 
     def _log(label: str, price: float, reason: str) -> None:
         if stop_log is not None:
@@ -353,7 +364,9 @@ def get_structure_stop(
         if dist < min_dist:
             _log(label, price, f"STOP_CANDIDATE_REJECTED:too_tight({dist/pip_size:.1f}p)")
             return None
-        if dist > max_dist:
+        # NOTE: ATR fallback sits at exactly 3×ATR (== max_dist). Exempt it from
+        # the ceiling check so it always passes cleanly regardless of float rounding.
+        if dist > max_dist and "fallback" not in label:
             _log(label, price, f"STOP_CANDIDATE_REJECTED:too_wide({dist/pip_size:.1f}p)")
             return None
 
