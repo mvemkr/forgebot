@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 load_dotenv(REPO / ".env")
 
 import src.strategy.forex.strategy_config as _sc
-from backtesting.oanda_backtest_v2 import run_backtest, BacktestResult
+from backtesting.oanda_backtest_v2 import run_backtest, BacktestResult, STARTING_BAL
 
 # ── Capture production values at import time ──────────────────────────────
 _ORIG_MIN_RR              = _sc.MIN_RR
@@ -92,10 +92,12 @@ WINDOWS: List[Tuple[str, datetime, datetime]] = [
     ("live-parity",  datetime(2026, 2, 28, tzinfo=_UTC), datetime(2026, 3,  6, tzinfo=_UTC)),
 ]
 
-PAIRS = [
-    "GBP/JPY", "USD/JPY", "USD/CHF", "GBP/CHF",
-    "USD/CAD", "EUR/USD", "GBP/USD",
-]
+CAPITAL = STARTING_BAL   # 8_000.0 — matches backtester default
+
+# Informational only — backtester uses its internal WATCHLIST.
+# Alex's 7 pairs are enforced via logs/whitelist_backtest.json when enabled.
+PAIRS_NOTE = ["GBP/JPY", "USD/JPY", "USD/CHF", "GBP/CHF",
+              "USD/CAD", "EUR/USD", "GBP/USD"]
 
 # ── Data classes ──────────────────────────────────────────────────────────
 
@@ -287,10 +289,14 @@ def _run_variant(
     candle_data = None
     try:
         result: BacktestResult = run_backtest(
-            pairs=PAIRS,
-            start_dt=start,
-            end_dt=end,
-            preloaded_candle_data=preloaded_candle_data,
+            start_dt              = start,
+            end_dt                = end,
+            starting_bal          = CAPITAL,
+            notes                 = f"minrr_{variant}_{window}",
+            trail_arm_key         = f"rr_{variant}_{window}",
+            preloaded_candle_data = preloaded_candle_data,
+            use_cache             = True,
+            quiet                 = True,
         )
         candle_data = getattr(result, "candle_data", None)
         wr = WindowResult(
@@ -670,7 +676,7 @@ def main() -> None:
     print("MIN_RR Ablation Study")
     print(f"B-Prime trigger active: {_sc.ENTRY_TRIGGER_MODE}")
     print(f"Whitelist: {_sc.STRICT_PIN_PATTERN_WHITELIST}")
-    print(f"Pairs: {PAIRS}")
+    print(f"Pairs: backtester WATCHLIST (Alex 7 via whitelist_backtest.json when enabled)")
     print(f"Variants: {[v[0] for v in VARIANTS]}")
     print(f"Windows:  {[w[0] for w in WINDOWS]}")
     print()

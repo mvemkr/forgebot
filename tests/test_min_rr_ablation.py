@@ -148,10 +148,10 @@ class TestWindowDefinitions:
         w = next(w for w in _m.WINDOWS if w[0] == "live-parity")
         assert w[1].year == 2026
 
-    def test_pairs_list_has_7_alex_pairs(self):
-        assert len(_m.PAIRS) == 7
-        assert "GBP/JPY" in _m.PAIRS
-        assert "USD/JPY" in _m.PAIRS
+    def test_pairs_note_has_7_alex_pairs(self):
+        assert len(_m.PAIRS_NOTE) == 7
+        assert "GBP/JPY" in _m.PAIRS_NOTE
+        assert "USD/JPY" in _m.PAIRS_NOTE
 
 
 # ─────────────────────────────────────────────────────────────────────────
