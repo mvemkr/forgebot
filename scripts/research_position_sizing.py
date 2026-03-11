@@ -63,9 +63,20 @@ CAPITAL     = 8_000.0
 REPORT_PATH = REPO / "backtesting/results/research_position_sizing.md"
 UTC = timezone.utc
 
-# Single continuous window: full 15-month study period
+# Sequential non-overlapping windows — run in order with balance carry-forward.
+# W1/W2 are sub-windows of Jan-Feb-2026, so we use the 5 quarterly windows
+# + live-parity for a clean 15-month non-overlapping series.
 STUDY_START = datetime(2025,  1,  1, tzinfo=UTC)
 STUDY_END   = datetime(2026,  3,  8, tzinfo=UTC)
+
+SEQ_WINDOWS: List[Tuple[str, datetime, datetime]] = [
+    ("Q1-2025",      datetime(2025, 1, 1,  tzinfo=UTC), datetime(2025, 3, 31, tzinfo=UTC)),
+    ("Q2-2025",      datetime(2025, 4, 1,  tzinfo=UTC), datetime(2025, 6, 30, tzinfo=UTC)),
+    ("Q3-2025",      datetime(2025, 7, 1,  tzinfo=UTC), datetime(2025, 9, 30, tzinfo=UTC)),
+    ("Q4-2025",      datetime(2025, 10, 1, tzinfo=UTC), datetime(2025, 12, 31, tzinfo=UTC)),
+    ("Jan-Feb-2026", datetime(2026, 1, 1,  tzinfo=UTC), datetime(2026, 2, 28, tzinfo=UTC)),
+    ("live-parity",  datetime(2026, 3, 2,  tzinfo=UTC), datetime(2026, 3, 8,  tzinfo=UTC)),
+]
 
 # Milestones to track
 MILESTONES = [27_000.0, 100_000.0]
@@ -225,34 +236,57 @@ def _months_elapsed(start_month: str, target_month: str) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_study(verbose: bool = False) -> Dict[str, Dict]:
-    """Run 4 variants, return analysis dict per variant."""
+    """
+    Run 4 variants using sequential non-overlapping windows with balance carry-forward.
+    Each window starts at the ending balance of the previous one, giving realistic
+    compounding while reusing the pre-cached candle data from prior ablation runs.
+    """
     results: Dict[str, Dict] = {}
-    preloaded: Optional[Dict] = None
+
+    # Pre-load candle cache from first Variant A run of first window,
+    # then reuse across all variants and windows.
+    window_candle_cache: Dict[str, Optional[Dict]] = {w: None for w, _, _ in SEQ_WINDOWS}
 
     for vlabel, risk_pct, desc in VARIANTS:
-        print(f"\n  Variant {vlabel} — {risk_pct*100:.0f}% risk…", flush=True)
-        result = run_backtest(
-            STUDY_START, STUDY_END,
-            starting_bal=CAPITAL,
-            notes=f"pos_size_{vlabel}_{int(risk_pct*100)}pct",
-            trail_arm_key="A",
-            flat_risk_pct=risk_pct,
-            preloaded_candle_data=preloaded,
-            use_cache=True,
-            quiet=not verbose,
-        )
-        if preloaded is None:
-            preloaded = result.candle_data
+        print(f"\n  ── Variant {vlabel} — {risk_pct*100:.0f}% risk ──────────────")
+        balance    = CAPITAL
+        all_trades: List[Dict] = []
+        n_wins_total = 0
+        n_total    = 0
 
-        trades  = result.trades
-        curve   = _build_equity_curve(trades, CAPITAL)
+        for win_name, win_start, win_end in SEQ_WINDOWS:
+            print(f"    {win_name}  bal=${balance:,.0f}…", end=" ", flush=True)
+            result = run_backtest(
+                win_start, win_end,
+                starting_bal=balance,
+                notes=f"pos_size_{vlabel}_{int(risk_pct*100)}pct_{win_name}",
+                trail_arm_key="A",
+                flat_risk_pct=risk_pct,
+                preloaded_candle_data=window_candle_cache[win_name],
+                use_cache=True,
+                quiet=not verbose,
+            )
+            # Cache candle data for reuse by subsequent variants
+            if window_candle_cache[win_name] is None and result.candle_data:
+                window_candle_cache[win_name] = result.candle_data
+
+            # Carry forward the ending balance
+            balance = result.balance if result.balance > 0 else balance
+            all_trades.extend(result.trades)
+            n_wins_total += sum(1 for t in result.trades if t.get("r", 0) > 0)
+            n_total      += result.n_trades
+            print(f"{result.n_trades}T  bal=${balance:,.0f}")
+
+        # Build equity analysis from full trade list
+        curve   = _build_equity_curve(all_trades, CAPITAL)
         monthly = _monthly_equity(curve)
         dd_pct, dd_usd = _max_drawdown(curve)
-        streak_len, streak_usd = _losing_streak(trades)
-        final_eq = curve[-1][1] if curve else CAPITAL
-        peak_eq  = max(eq for _, eq in curve) if curve else CAPITAL
-        ret_pct  = (final_eq - CAPITAL) / CAPITAL * 100
+        streak_len, streak_usd = _losing_streak(all_trades)
+        final_eq  = curve[-1][1] if curve else CAPITAL
+        peak_eq   = max(eq for _, eq in curve) if curve else CAPITAL
+        ret_pct   = (final_eq - CAPITAL) / CAPITAL * 100
         sharpe_eq = ret_pct / dd_pct if dd_pct > 0 else float("inf")
+        win_rate  = n_wins_total / n_total if n_total > 0 else 0.0
 
         # Milestones
         milestone_data = {}
@@ -266,8 +300,7 @@ def run_study(verbose: bool = False) -> Dict[str, Dict]:
                 milestone_data[m_thr] = None
 
         results[vlabel] = {
-            "result":      result,
-            "trades":      trades,
+            "trades":      all_trades,
             "curve":       curve,
             "monthly":     monthly,
             "dd_pct":      dd_pct,
@@ -280,11 +313,11 @@ def run_study(verbose: bool = False) -> Dict[str, Dict]:
             "sharpe_eq":   sharpe_eq,
             "milestones":  milestone_data,
             "risk_pct":    risk_pct,
-            "n_trades":    result.n_trades,
-            "win_rate":    result.win_rate,
+            "n_trades":    n_total,
+            "win_rate":    win_rate,
         }
-        print(f"    → {result.n_trades}T  WR={result.win_rate*100:.0f}%  "
-              f"Final=${final_eq:,.0f}  MaxDD={dd_pct:.1f}%  "
+        print(f"  → TOTAL: {n_total}T  WR={win_rate*100:.0f}%  "
+              f"Final=${final_eq:,.0f}  MaxDD={dd_pct:.1f}%({dd_usd:,.0f}$)  "
               f"StreakLoss=${streak_usd:,.0f}")
 
     return results
