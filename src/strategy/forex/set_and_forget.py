@@ -577,6 +577,13 @@ class SetAndForgetStrategy:
                     bar timestamps so session/news filters see the right time.
                     Defaults to datetime.now() when None (live trading).
         """
+        # Reset sub-threshold pattern cache for this pair on every call.
+        # Must be the first statement — guarantees the orchestrator never reads
+        # stale PRE_CANDIDATE data from a previous in-session scan when the
+        # current call returns early (session filter, stop cooldown, etc.).
+        # See: fix/pre-candidate-stale-reset — Issue B diagnosis.
+        self._pre_candidate_data[pair] = []
+
         if current_price is None:
             current_price = df_1h['close'].iloc[-1]
 
