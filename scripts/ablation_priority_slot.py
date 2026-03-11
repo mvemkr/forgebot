@@ -40,7 +40,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
@@ -238,7 +238,6 @@ def run_ablation(verbose: bool = False) -> Dict:
         _sc.MAX_TRADES_PER_WEEK_STANDARD = 10
 
         results: Dict[str, Dict] = {}
-        preloaded: Optional[Dict] = None
 
         print(f"\n{'═'*60}")
         print("  PRIORITY SLOT ABLATION — UNCAPPED DATA COLLECTION")
@@ -253,12 +252,9 @@ def run_ablation(verbose: bool = False) -> Dict:
                 starting_bal=8_000.0,
                 notes=f"priority_slot_uncapped_{win_name}",
                 trail_arm_key="A",
-                preloaded_candle_data=preloaded,
                 use_cache=True,
                 quiet=not verbose,
             )
-            if preloaded is None and result.candle_data:
-                preloaded = result.candle_data
 
             all_trades = result.trades
 
