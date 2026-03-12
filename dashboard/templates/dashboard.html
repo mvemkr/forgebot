@@ -296,6 +296,11 @@
            {% if page == 'whitelist' %}bg-base-100 border-base-300 text-base-content{% else %}border-transparent text-base-content/40 hover:text-base-content/70{% endif %}">
     <i class="ph ph-funnel mr-1"></i> Whitelist
   </a>
+  <a href="/futures"
+    class="px-5 py-2 text-sm font-semibold rounded-t-lg border border-b-0 transition-colors
+           {% if page == 'futures' %}bg-base-100 border-base-300 text-base-content{% else %}border-transparent text-base-content/40 hover:text-base-content/70{% endif %}">
+    <i class="ph ph-chart-line-up mr-1"></i> Futures
+  </a>
 </div>
 
 <!-- ── MAIN GRID ──────────────────────────────────────────── -->
@@ -1709,5 +1714,123 @@ function dashboard() {
         :class="state.regime_score?.regime_score >= 3.0 ? 'text-success' : ''"
         x-text="state.regime_score ? 'market state: ' + (state.regime_score.risk_mode || state.regime_score.regime_score?.toFixed(1) || '—') + (state.risk_mode_mult && state.risk_mode_mult !== 1 ? ' ' + state.risk_mode_mult + '×' : '') : ''"></span>
 </div>
+
+<!-- ── FUTURES PAGE ───────────────────────────────────────────────────── -->
+{% if page == 'futures' %}
+<div class="p-6 space-y-5" x-data="futuresDashboard()" x-init="init()">
+
+  <!-- Heartbeat row -->
+  <div class="flex items-center gap-3">
+    <span class="text-xl font-bold">ES Futures</span>
+    <span class="badge badge-ghost font-mono text-xs"
+          x-text="state.heartbeat?.status_emoji + ' ' + (state.heartbeat?.age_label || 'not started')"></span>
+    <span class="badge font-mono text-xs"
+          :class="state.state?.mode === 'LIVE' ? 'badge-error' : 'badge-warning'"
+          x-text="state.state?.mode || 'DRY RUN'"></span>
+  </div>
+
+  <!-- ORB + Session stats row -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="stat bg-base-200 rounded-xl p-4">
+      <div class="stat-title text-xs">ORB High</div>
+      <div class="stat-value text-lg font-mono"
+           x-text="state.state?.orb_high ? state.state.orb_high.toFixed(2) : '—'"></div>
+      <div class="stat-desc" x-text="state.state?.orb_set ? (state.state?.orb_fired ? 'Fired' : 'Watching') : 'Pending'"></div>
+    </div>
+    <div class="stat bg-base-200 rounded-xl p-4">
+      <div class="stat-title text-xs">ORB Low</div>
+      <div class="stat-value text-lg font-mono"
+           x-text="state.state?.orb_low ? state.state.orb_low.toFixed(2) : '—'"></div>
+      <div class="stat-desc"
+           x-text="state.state?.orb_high && state.state?.orb_low ? 'Range: ' + (state.state.orb_high - state.state.orb_low).toFixed(1) + 'pts' : ''"></div>
+    </div>
+    <div class="stat bg-base-200 rounded-xl p-4">
+      <div class="stat-title text-xs">5-Day High</div>
+      <div class="stat-value text-lg font-mono"
+           x-text="state.state?.session_high ? state.state.session_high.toFixed(2) : '—'"></div>
+      <div class="stat-desc">Fade level</div>
+    </div>
+    <div class="stat bg-base-200 rounded-xl p-4">
+      <div class="stat-title text-xs">5-Day Low</div>
+      <div class="stat-value text-lg font-mono"
+           x-text="state.state?.session_low ? state.state.session_low.toFixed(2) : '—'"></div>
+      <div class="stat-desc">Fade level</div>
+    </div>
+  </div>
+
+  <!-- Daily P&L + open positions -->
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div class="bg-base-200 rounded-xl p-4">
+      <div class="text-sm font-semibold mb-2">Daily P&L</div>
+      <div class="text-2xl font-mono font-bold"
+           :class="(state.state?.daily_pnl || 0) >= 0 ? 'stat-up' : 'stat-down'"
+           x-text="'$' + ((state.state?.daily_pnl || 0) >= 0 ? '+' : '') + (state.state?.daily_pnl || 0).toFixed(2)"></div>
+    </div>
+    <div class="bg-base-200 rounded-xl p-4">
+      <div class="text-sm font-semibold mb-2">Open Positions</div>
+      <template x-if="!state.state?.open_positions?.length">
+        <div class="text-base-content/40 text-sm">No open positions</div>
+      </template>
+      <template x-for="pos in (state.state?.open_positions || [])" :key="pos.opened_at">
+        <div class="text-sm font-mono bg-base-300 rounded p-2 mb-1">
+          <span :class="pos.direction === 'long' ? 'text-success' : 'text-error'"
+                x-text="pos.direction.toUpperCase() + ' ' + pos.contracts + '× | Entry: ' + pos.entry_price?.toFixed(2) + ' | Stop: ' + pos.stop_price?.toFixed(2) + ' | Target: ' + pos.target_price?.toFixed(2)"></span>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- Recent decisions table -->
+  <div class="bg-base-200 rounded-xl p-4">
+    <div class="text-sm font-semibold mb-3">Recent Decisions</div>
+    <template x-if="!state.decisions?.length">
+      <div class="text-base-content/40 text-sm">No decisions yet</div>
+    </template>
+    <table class="table table-sm w-full" x-show="state.decisions?.length">
+      <thead>
+        <tr class="text-xs text-base-content/50">
+          <th>Time (ET)</th><th>Strategy</th><th>Dir</th>
+          <th>Entry</th><th>Stop</th><th>Target</th><th>RR</th><th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="d in (state.decisions || [])" :key="d.ts">
+          <tr class="text-xs font-mono">
+            <td x-text="d.ts ? new Date(d.ts).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit'}) : '—'"></td>
+            <td x-text="d.strategy || '—'"></td>
+            <td :class="d.direction === 'long' ? 'text-success' : 'text-error'"
+                x-text="(d.direction || '—').toUpperCase()"></td>
+            <td x-text="d.entry ? d.entry.toFixed(2) : '—'"></td>
+            <td x-text="d.stop  ? d.stop.toFixed(2)  : '—'"></td>
+            <td x-text="d.target? d.target.toFixed(2): '—'"></td>
+            <td x-text="d.rr    ? d.rr.toFixed(1)+'R' : '—'"></td>
+            <td>
+              <span class="badge badge-sm"
+                    :class="d.status === 'executed' ? 'badge-success' : d.status === 'blocked' ? 'badge-error' : 'badge-ghost'"
+                    x-text="d.status || '—'"></span>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+</div>
+
+<script>
+function futuresDashboard() {
+  return {
+    state: { state: {}, decisions: [], heartbeat: {} },
+    init() { this.refresh(); setInterval(() => this.refresh(), 10000); },
+    async refresh() {
+      try {
+        const r = await fetch('/api/futures_status');
+        if (r.ok) this.state = await r.json();
+      } catch(e) { console.warn('futures status fetch failed', e); }
+    }
+  }
+}
+</script>
+{% endif %}
 </body>
 </html>

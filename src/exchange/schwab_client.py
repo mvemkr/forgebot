@@ -384,6 +384,232 @@ class SchwabClient:
             return {"success": False, "error": str(e)}
 
 
+    # ------------------------------------------------------------------ #
+    # ES / MES Futures
+    # ------------------------------------------------------------------ #
+
+    # Active front-month contracts — update each rollover
+    ES_SYMBOL  = "/ESM26"
+    MES_SYMBOL = "/MESM26"
+
+    # Futures-compatible timeframe → (frequencyType, frequency) pairs
+    _FUTURES_FREQ = {
+        "5m":  (_PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_FIVE_MINUTES),
+        "15m": (_PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_FIFTEEN_MINUTES),
+        "1h":  (_PH.FrequencyType.MINUTE, _PH.Frequency.EVERY_THIRTY_MINUTES),  # resample
+        "1D":  (_PH.FrequencyType.DAILY,  None),
+    }
+
+    def get_es_candles(
+        self,
+        timeframe: str = "15m",
+        lookback:  int = 100,
+    ) -> pd.DataFrame:
+        """
+        Fetch OHLCV candles for /MESM26 (Micro ES).
+
+        Parameters
+        ----------
+        timeframe : "5m" | "15m" | "1h" | "1D"
+        lookback  : number of candles to return
+
+        Returns
+        -------
+        pd.DataFrame  columns: open, high, low, close, volume  (UTC index)
+        """
+        resample = None
+        if timeframe == "1h":
+            resample = "1h"
+            freq_type, freq = self._FUTURES_FREQ["15m"]  # fetch 15m then resample
+        elif timeframe in self._FUTURES_FREQ:
+            freq_type, freq = self._FUTURES_FREQ[timeframe]
+        else:
+            raise ValueError(f"Unsupported futures timeframe: {timeframe}. Use 5m/15m/1h/1D")
+
+        period_type = (_PH.PeriodType.DAY if timeframe != "1D" else _PH.PeriodType.YEAR)
+        period      = (_P.TEN_DAYS        if timeframe != "1D" else _P.ONE_DAY)
+
+        try:
+            if freq is not None:
+                resp = self._client.get_price_history(
+                    symbol=self.MES_SYMBOL,
+                    period_type=period_type,
+                    period=period,
+                    frequency_type=freq_type,
+                    frequency=freq,
+                    need_extended_hours_data=True,   # futures trade nearly 24h
+                )
+            else:
+                resp = self._client.get_price_history(
+                    symbol=self.MES_SYMBOL,
+                    period_type=period_type,
+                    period=period,
+                    frequency_type=freq_type,
+                    need_extended_hours_data=True,
+                )
+
+            if resp.status_code != 200:
+                logger.error(f"ES candle request failed {timeframe}: {resp.status_code}")
+                return pd.DataFrame()
+
+            data    = resp.json()
+            candles = data.get("candles", [])
+            if not candles:
+                logger.warning(f"No ES candles for {timeframe}")
+                return pd.DataFrame()
+
+            df = pd.DataFrame(candles)
+            df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
+            df = df.set_index("datetime")
+            df = df[["open", "high", "low", "close", "volume"]].astype(float)
+            df = df.sort_index()
+
+            if resample:
+                df = _resample_ohlcv(df, resample)
+
+            return df.iloc[-lookback:]
+
+        except Exception as e:
+            logger.error(f"Error fetching ES candles ({timeframe}): {e}")
+            return pd.DataFrame()
+
+    def get_es_quote(self) -> Dict:
+        """
+        Get current bid/ask/mid/last for /ESM26.
+
+        Returns
+        -------
+        dict  {"bid": float, "ask": float, "mid": float, "last": float}
+              Values are 0.0 on failure — never raises.
+        """
+        try:
+            resp = self._client.get_quote(self.ES_SYMBOL)
+            if resp.status_code == 200:
+                data  = resp.json()
+                quote = data.get(self.ES_SYMBOL, {}).get("quote", {})
+                bid  = float(quote.get("bidPrice",  0) or 0)
+                ask  = float(quote.get("askPrice",  0) or 0)
+                last = float(quote.get("lastPrice", 0) or 0)
+                mid  = (bid + ask) / 2 if (bid and ask) else last
+                return {"bid": bid, "ask": ask, "mid": mid, "last": last}
+        except Exception as e:
+            logger.error(f"ES quote fetch failed: {e}")
+        return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0}
+
+    def place_futures_order(
+        self,
+        direction:    str,                    # "long" or "short"
+        quantity:     int,                    # number of contracts
+        order_type:   str = "LIMIT",          # "LIMIT" or "MARKET"
+        limit_price:  Optional[float] = None,
+        stop_price:   Optional[float] = None,
+        account_hash: Optional[str]   = None,
+        dry_run:      bool             = True,
+    ) -> Dict:
+        """
+        Place a futures order for /ESM26 or /MESM26 with optional attached stop.
+
+        Parameters
+        ----------
+        direction   : "long"  → BUY to open, SELL to stop
+                      "short" → SELL to open, BUY to stop
+        quantity    : integer number of contracts
+        order_type  : "LIMIT" or "MARKET"
+        limit_price : required when order_type="LIMIT"
+        stop_price  : if provided, attached as childOrderStrategy stop
+        dry_run     : True (default) — logs without submitting
+
+        Safety
+        ------
+        dry_run=True by default.  Must be explicitly False to submit live.
+        """
+        if account_hash is None:
+            account_hash = os.getenv("SCHWAB_ACCOUNT_HASH")
+
+        import os as _os
+        use_mes = _os.getenv("ES_USE_MES", "true").lower() != "false"
+        symbol  = self.MES_SYMBOL if use_mes else self.ES_SYMBOL
+
+        instruction       = "BUY_TO_OPEN"  if direction == "long"  else "SELL_TO_OPEN"
+        stop_instruction  = "SELL_TO_CLOSE" if direction == "long"  else "BUY_TO_CLOSE"
+
+        leg = {
+            "instruction": instruction,
+            "quantity": quantity,
+            "instrument": {
+                "symbol":    symbol,
+                "assetType": "FUTURE",
+            },
+        }
+
+        order: Dict = {
+            "orderType":         order_type,
+            "session":           "NORMAL",
+            "duration":          "DAY",
+            "orderStrategyType": "SINGLE" if stop_price is None else "TRIGGER",
+            "orderLegCollection": [leg],
+        }
+
+        if order_type == "LIMIT":
+            if limit_price is None:
+                raise ValueError("limit_price required for LIMIT orders")
+            order["price"] = str(round(limit_price, 2))
+
+        if stop_price is not None:
+            order["orderStrategyType"] = "TRIGGER"
+            order["childOrderStrategies"] = [{
+                "orderType":         "STOP",
+                "session":           "NORMAL",
+                "duration":          "DAY",
+                "orderStrategyType": "SINGLE",
+                "stopPrice":         str(round(stop_price, 2)),
+                "orderLegCollection": [{
+                    "instruction": stop_instruction,
+                    "quantity":    quantity,
+                    "instrument":  {
+                        "symbol":    symbol,
+                        "assetType": "FUTURE",
+                    },
+                }],
+            }]
+
+        log_msg = (
+            f"FUTURES ORDER: {instruction} {quantity}× {symbol}  "
+            f"type={order_type}  "
+            + (f"limit={limit_price:.2f}  " if limit_price else "")
+            + (f"stop={stop_price:.2f}" if stop_price else "")
+        )
+
+        if dry_run:
+            logger.info(f"[DRY RUN] {log_msg}")
+            return {"dry_run": True, "order": order, "symbol": symbol}
+
+        logger.info(f"[LIVE] Submitting: {log_msg}")
+        try:
+            resp = self._client.place_order(account_hash, order)
+            if resp.status_code in (200, 201):
+                logger.info("Futures order placed successfully")
+                return {"success": True, "status": resp.status_code, "order": order}
+            else:
+                logger.error(f"Futures order failed: {resp.status_code} {resp.text[:300]}")
+                return {"success": False, "status": resp.status_code, "error": resp.text}
+        except Exception as e:
+            logger.error(f"Futures order exception: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_futures_positions(self, account_hash: Optional[str] = None) -> list:
+        """
+        Return open futures positions only (assetType == 'FUTURE').
+
+        Filters get_positions() to futures instruments.
+        """
+        all_positions = self.get_positions(account_hash=account_hash)
+        return [
+            p for p in all_positions
+            if p.get("instrument", {}).get("assetType", "").upper() == "FUTURE"
+        ]
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     try:
