@@ -33,6 +33,11 @@ WHITELIST_BACKTEST_FILE  = LOG_DIR / "whitelist_backtest.json"
 # Legacy path alias (for any code that may still reference the old name)
 WHITELIST_FILE           = WHITELIST_LIVE_FILE
 
+# ── Futures paths ──────────────────────────────────────────────────────────
+FUTURES_STATE     = LOG_DIR / "futures_bot_state.json"
+FUTURES_DECISIONS = LOG_DIR / "futures_decision_log.jsonl"
+FUTURES_HEARTBEAT = LOG_DIR / "futures_orchestrator.heartbeat"
+
 # ── Pair universe ──────────────────────────────────────────────────────────
 ALL_KNOWN_PAIRS = [
     "GBP/JPY", "USD/JPY", "USD/CHF", "GBP/CHF", "USD/CAD",
@@ -190,6 +195,51 @@ def page_backtests():
 @app.route("/whitelist")
 def page_whitelist():
     return render_template("dashboard.html", page="whitelist")
+
+@app.route("/futures")
+def page_futures():
+    return render_template("dashboard.html", page="futures")
+
+@app.route("/api/futures_status")
+def api_futures_status():
+    """Futures bot state, recent decisions, and heartbeat age."""
+    state: dict = {}
+    if FUTURES_STATE.exists():
+        try:
+            state = json.loads(FUTURES_STATE.read_text())
+        except Exception:
+            state = {"error": "state parse error"}
+
+    decisions: list = []
+    if FUTURES_DECISIONS.exists():
+        try:
+            lines = FUTURES_DECISIONS.read_text().splitlines()
+            for line in lines[-20:]:
+                line = line.strip()
+                if line:
+                    decisions.append(json.loads(line))
+            decisions = list(reversed(decisions))
+        except Exception:
+            pass
+
+    heartbeat: dict = {"status": "not_started"}
+    if FUTURES_HEARTBEAT.exists():
+        try:
+            hb  = json.loads(FUTURES_HEARTBEAT.read_text())
+            age = (datetime.now(timezone.utc) -
+                   datetime.fromisoformat(hb["timestamp"])).total_seconds()
+            hb["age_seconds"] = int(age)
+            hb["age_label"]   = _age_label(age)
+            hb["status_emoji"] = "🟢" if age < 120 else "🟡" if age < 600 else "🔴"
+            heartbeat = hb
+        except Exception:
+            heartbeat = {"status": "error"}
+
+    return jsonify({
+        "state":     state,
+        "decisions": decisions,
+        "heartbeat": heartbeat,
+    })
 
 @app.route("/api/status")
 def api_status():
