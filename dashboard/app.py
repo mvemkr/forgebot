@@ -241,6 +241,30 @@ def api_futures_status():
         "heartbeat": heartbeat,
     })
 
+@app.route("/api/schwab/token_status")
+def api_schwab_token_status():
+    """Schwab token health — access token age + refresh token expiry."""
+    try:
+        from src.exchange.schwab_token_manager import SchwabTokenManager, TOKEN_PATH
+        mgr    = SchwabTokenManager()
+        status = mgr.status()
+
+        # Also pull raw timestamps from file for completeness
+        raw = {}
+        if TOKEN_PATH.exists():
+            try:
+                tok = json.loads(TOKEN_PATH.read_text())
+                raw['has_access_token']  = bool(tok.get('access_token'))
+                raw['has_refresh_token'] = bool(tok.get('refresh_token'))
+                raw['scope']             = tok.get('scope')
+            except Exception:
+                pass
+
+        status.update(raw)
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({"error": str(e), "health": "unknown"}), 500
+
 @app.route("/api/status")
 def api_status():
     heartbeat     = load_heartbeat()
