@@ -483,7 +483,8 @@ class SchwabClient:
               Values are 0.0 on failure — never raises.
         """
         try:
-            resp = self._client.get_quote(self.ES_SYMBOL)
+            # get_quote() (singular) returns 404 for futures — must use get_quotes()
+            resp = self._client.get_quotes([self.ES_SYMBOL])
             if resp.status_code == 200:
                 data  = resp.json()
                 quote = data.get(self.ES_SYMBOL, {}).get("quote", {})

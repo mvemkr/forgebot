@@ -38,7 +38,15 @@ if resp.status_code != 200:
     print(f"❌ {resp.status_code}: {resp.text}"); sys.exit(1)
 
 token = resp.json()
-TOKEN_PATH.write_text(json.dumps(token, indent=2))
+# Wrap in schwab-py's expected nested format
+from datetime import datetime, timezone, timedelta
+wrapped = {
+    "creation_timestamp":       int(__import__("time").time()),
+    "token":                    token,
+    "refresh_token_expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
+    "last_refreshed_at":        datetime.now(timezone.utc).isoformat(),
+}
+TOKEN_PATH.write_text(json.dumps(wrapped, indent=2))
 TOKEN_PATH.chmod(0o600)
 print(f"✅ Token saved! Expires in {token.get('expires_in')}s")
 

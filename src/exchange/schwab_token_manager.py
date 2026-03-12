@@ -85,8 +85,11 @@ class SchwabTokenManager:
     def do_refresh(self) -> bool:
         """Perform an access token refresh. Returns True on success."""
         try:
-            token = json.loads(TOKEN_PATH.read_text())
-            rt    = token.get('refresh_token')
+            stored = json.loads(TOKEN_PATH.read_text())
+            # Support both schwab-py nested format {"creation_timestamp":..,"token":{..}}
+            # and flat format {"access_token":..,"refresh_token":..}
+            inner = stored.get('token', stored)
+            rt    = inner.get('refresh_token')
             if not rt:
                 logger.error("TokenManager: No refresh token found — manual re-auth required")
                 return False
@@ -98,29 +101,36 @@ class SchwabTokenManager:
             }, data={"grant_type": "refresh_token", "refresh_token": rt}, timeout=15)
 
             if resp.status_code == 200:
-                new_token = resp.json()
-                new_token['_accounts'] = token.get('_accounts', [])
+                new_inner = resp.json()
 
                 # If Schwab issued a new refresh token, reset clock and timestamps
-                if new_token.get('refresh_token') and new_token['refresh_token'] != rt:
+                if new_inner.get('refresh_token') and new_inner['refresh_token'] != rt:
                     self._meta['refresh_token_issued_at'] = time.time()
                     self._save_meta()
                     logger.info("TokenManager: New refresh token issued — clock reset")
-                    # Stamp new expiry on the token file
-                    new_token['refresh_token_expires_at'] = (
+                    rt_expires = (
                         datetime.now(timezone.utc) + timedelta(seconds=REFRESH_TOKEN_TTL)
                     ).isoformat()
                 else:
-                    # Preserve existing expiry stamp if present
-                    if token.get('refresh_token_expires_at'):
-                        new_token['refresh_token_expires_at'] = token['refresh_token_expires_at']
+                    rt_expires = stored.get('refresh_token_expires_at')
 
-                # Always stamp last_refreshed
                 now_iso = datetime.now(timezone.utc).isoformat()
-                new_token['last_refreshed_at'] = now_iso
                 self._last_refresh_ts = time.time()
 
-                TOKEN_PATH.write_text(json.dumps(new_token, indent=2))
+                # Preserve schwab-py nested format
+                if 'token' in stored:
+                    wrapped = {
+                        'creation_timestamp':        stored.get('creation_timestamp', int(time.time())),
+                        'token':                     new_inner,
+                        'refresh_token_expires_at':  rt_expires,
+                        'last_refreshed_at':         now_iso,
+                    }
+                else:
+                    wrapped = new_inner
+                    wrapped['refresh_token_expires_at'] = rt_expires
+                    wrapped['last_refreshed_at']        = now_iso
+
+                TOKEN_PATH.write_text(json.dumps(wrapped, indent=2))
                 TOKEN_PATH.chmod(0o600)
                 logger.info("TokenManager: Access token refreshed ✅")
                 return True
