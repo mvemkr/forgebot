@@ -33,7 +33,6 @@ def cmd_url():
         "response_type": "code",
         "client_id": APP_KEY,
         "redirect_uri": CALLBACK_URL,
-        "scope": "readonly",
         "state": state,
     }
     url = AUTH_URL + "?" + urllib.parse.urlencode(params)

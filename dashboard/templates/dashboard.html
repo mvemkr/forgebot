@@ -1719,6 +1719,22 @@ function dashboard() {
 {% if page == 'futures' %}
 <div class="p-6 space-y-5" x-data="futuresDashboard()" x-init="init()">
 
+  <!-- Schwab token health banner -->
+  <div x-show="token.health"
+       class="rounded-xl px-4 py-3 flex items-center gap-3 text-sm font-semibold"
+       :class="{
+         'bg-success/20 text-success':   token.health === 'ok',
+         'bg-warning/20 text-warning':   token.health === 'warning',
+         'bg-error/20 text-error':        token.health === 'critical' || token.health === 'expired',
+         'bg-base-200 text-base-content/50': !token.health || token.health === 'unknown'
+       }">
+    <span x-text="tokenBannerIcon()"></span>
+    <span x-text="tokenBannerText()"></span>
+    <span class="ml-auto text-xs font-mono opacity-70"
+          x-show="token.last_refreshed_at"
+          x-text="'last refresh: ' + (token.last_refreshed_at ? new Date(token.last_refreshed_at).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit'}) : '—')"></span>
+  </div>
+
   <!-- Heartbeat row -->
   <div class="flex items-center gap-3">
     <span class="text-xl font-bold">ES Futures</span>
@@ -1821,13 +1837,38 @@ function dashboard() {
 function futuresDashboard() {
   return {
     state: { state: {}, decisions: [], heartbeat: {} },
+    token: {},
     init() { this.refresh(); setInterval(() => this.refresh(), 10000); },
     async refresh() {
       try {
-        const r = await fetch('/api/futures_status');
-        if (r.ok) this.state = await r.json();
+        const [fs, ts] = await Promise.all([
+          fetch('/api/futures_status'),
+          fetch('/api/schwab/token_status'),
+        ]);
+        if (fs.ok) this.state = await fs.json();
+        if (ts.ok) this.token = await ts.json();
       } catch(e) { console.warn('futures status fetch failed', e); }
-    }
+    },
+    tokenBannerIcon() {
+      const h = this.token.health;
+      if (h === 'ok')       return '🟢';
+      if (h === 'warning')  return '⚠️';
+      if (h === 'critical') return '🔴';
+      if (h === 'expired')  return '🔴';
+      return '⚪';
+    },
+    tokenBannerText() {
+      const h = this.token.health;
+      const d = this.token.refresh_token_days_left;
+      if (h === 'ok')       return `Schwab connected — token valid for ${d ? d.toFixed(1) : '?'} days`;
+      if (h === 'warning')  return `⚠️ Re-auth needed in ${d ? d.toFixed(1) : '?'} days — run scripts/schwab_direct_auth.py`;
+      if (h === 'critical') {
+        const hrs = this.token.refresh_token_expires_in_s ? (this.token.refresh_token_expires_in_s/3600).toFixed(1) : '?';
+        return `Re-auth in ${hrs}h — run scripts/schwab_direct_auth.py NOW`;
+      }
+      if (h === 'expired')  return 'Schwab token expired — bot running blind. Re-auth required.';
+      return 'Schwab token status unknown';
+    },
   }
 }
 </script>
